@@ -65,9 +65,7 @@ sandbox_ensure() {
 
   local args=( sandbox create --name "$name" --from "$image" --cpu "$cpu" --memory "$memory" --upload ".:/agentbox/work" --no-tty )
   [ -n "$policy" ] && args+=( --policy "$policy" )
-  # Pre-create the renamed home subdirs so claude can write into ~/.claude
-  # (resolved as /agentbox/.claude once HOME is exported at launch).
-  args+=( -- /bin/sh -c "mkdir -p /agentbox/.claude /agentbox/.local/bin /agentbox/work && chmod 755 /agentbox" )
+  args+=( -- /bin/true )
   openshell "${args[@]}" >/dev/null
 }
 
@@ -796,7 +794,7 @@ cmd_pull() {
 
 cmd_shell() {
   local name="${1:-$(workspace_sandbox_name)}"
-  exec openshell sandbox exec --name "$name" --tty --workdir /agentbox/work -- /bin/sh -lc 'export HOME=/agentbox; cd /agentbox/work; exec ${SHELL:-/bin/bash} -l'
+  exec openshell sandbox exec --name "$name" --tty --workdir /agentbox/work -- /bin/sh -lc 'exec ${SHELL:-/bin/bash} -l'
 }
 
 cmd_auth() {
@@ -1330,15 +1328,15 @@ if [ "$agb_want_tty" -eq 1 ]; then
   fi
   # Silence claude's "Native installation exists but ~/.local/bin is not in your
   # PATH" by ensuring the symlink and the PATH entry both exist inside the sandbox.
-  setup_prefix="export HOME=/agentbox && mkdir -p \$HOME/.local/bin \$HOME/.claude && ln -sf /usr/local/bin/claude \$HOME/.local/bin/claude 2>/dev/null; export PATH=\$HOME/.local/bin:\$PATH && "
+  setup_prefix="mkdir -p \$HOME/.local/bin && ln -sf /usr/local/bin/claude \$HOME/.local/bin/claude 2>/dev/null; export PATH=\$HOME/.local/bin:\$PATH && "
   exec ssh -t "$ssh_host" "${setup_prefix}${env_prefix}cd /agentbox/work && exec $agent$quoted"
 else
   log "launching $agent in $sandbox (via openshell exec --no-tty, workdir=/agentbox/work)"
   env_line=$(agent_env_token "$agent")
   if [ -n "$env_line" ]; then
     log "  injecting ${env_line%%=*} into sandbox (from host)"
-    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /agentbox/work -- /usr/bin/env HOME=/agentbox "$env_line" "$agent" "$@"
+    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /agentbox/work -- /usr/bin/env "$env_line" "$agent" "$@"
   else
-    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /agentbox/work -- /usr/bin/env HOME=/agentbox "$agent" "$@"
+    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /agentbox/work -- "$agent" "$@"
   fi
 fi
