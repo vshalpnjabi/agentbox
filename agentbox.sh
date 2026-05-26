@@ -693,6 +693,81 @@ cmd_shell() {
   exec openshell sandbox exec --name "$name" --tty --workdir /sandbox/work -- /bin/sh -lc 'exec ${SHELL:-/bin/bash} -l'
 }
 
+cmd_auth() {
+  # One-time setup of a long-lived claude OAuth token. Runs the host's real
+  # claude (bypassing the agentbox shim) so setup-token's interactive flow
+  # works against your host's keychain auth, then saves the resulting token
+  # to ~/.claude/.agentbox-oauth-token. All future agentbox sandbox claude
+  # launches auto-inject this as CLAUDE_CODE_OAUTH_TOKEN — no re-auth.
+  local sub="${1:-setup}"
+  [ "$#" -gt 0 ] && shift
+  local tok_file="$HOME/.claude/.agentbox-oauth-token"
+
+  case "$sub" in
+    setup)
+      local real_claude
+      real_claude=$(real_binary "claude")
+      [ -z "$real_claude" ] && err "no real claude binary recorded in $AGB_ORIGINALS (run install.sh)"
+      [ -x "$real_claude" ] || err "claude binary not executable at $real_claude"
+
+      mkdir -p "$(dirname "$tok_file")"
+      log "running '$real_claude setup-token' on host (interactive)..."
+      log "follow the prompts; the token will be saved to $tok_file"
+      echo >&2
+
+      # setup-token's URL/instruction text goes to stderr (visible); token
+      # to stdout. `tee` captures stdout to the file while still echoing.
+      if "$real_claude" setup-token | tee "$tok_file"; then
+        # Strip whitespace and re-write to be safe
+        if [ -s "$tok_file" ]; then
+          # Keep only the last non-empty line (the token), tidy whitespace
+          local cleaned
+          cleaned=$(grep -E "." "$tok_file" | tail -1 | tr -d "[:space:]")
+          if [ -n "$cleaned" ]; then
+            printf '%s\n' "$cleaned" > "$tok_file"
+            chmod 600 "$tok_file"
+            log "saved long-lived token to $tok_file (mode 600, ${#cleaned} chars)"
+            log "future agentbox sandbox claude launches will auto-inject CLAUDE_CODE_OAUTH_TOKEN"
+          else
+            warn "no token captured (setup-token returned empty); retry or save manually"
+            rm -f "$tok_file"
+          fi
+        else
+          warn "token file is empty — setup-token may have aborted"
+          rm -f "$tok_file"
+        fi
+      else
+        rm -f "$tok_file"
+        err "claude setup-token failed"
+      fi
+      ;;
+    status)
+      if [ -f "$tok_file" ]; then
+        local sz; sz=$(wc -c < "$tok_file" | tr -d " ")
+        echo "long-lived token: $tok_file ($sz bytes, $(stat -f "%Sm" "$tok_file" 2>/dev/null))"
+      else
+        echo "long-lived token: NOT SET   (run: agentbox auth setup)"
+      fi
+      if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        echo "ANTHROPIC_API_KEY: set in env (${#ANTHROPIC_API_KEY} chars)"
+      else
+        echo "ANTHROPIC_API_KEY: not set in env"
+      fi
+      ;;
+    clear|remove)
+      if [ -f "$tok_file" ]; then
+        rm -f "$tok_file"
+        log "removed $tok_file"
+      else
+        echo "(already cleared)"
+      fi
+      ;;
+    *)
+      err "usage: agentbox auth {setup|status|clear}"
+      ;;
+  esac
+}
+
 cmd_notifications() {
   # Opens macOS System Settings to Notifications → Terminal so the user can
   # switch the notification style from "Banners" to "Alerts" (banners slide in
@@ -839,6 +914,12 @@ Notification appearance (macOS):
                                          Terminal. Set "Notification style" to
                                          "Alerts" for persistent banner-style
                                          approval prompts with action buttons.
+
+Claude long-lived auth (one-time host setup so sandboxes auto-authenticate):
+  agentbox auth setup                    Run `claude setup-token` and save to
+                                         ~/.claude/.agentbox-oauth-token
+  agentbox auth status                   Show whether the token is configured
+  agentbox auth clear                    Remove the saved token
   agentbox destroy [NAME]      Delete sandbox + ssh block (host state PRESERVED)
   agentbox destroy --purge [N] Also wipe ~/.local/share/agentbox/state/<sandbox>/
 
@@ -928,6 +1009,7 @@ if [ "$self_name" = "agentbox" ]; then
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
     notifications) cmd_notifications "$@" ;;
+    auth)          cmd_auth "$@" ;;
     destroy) cmd_destroy "$@" ;;
     __watch) cmd_watch_internal "$@" ;;
     help|-h|--help) cmd_help ;;
