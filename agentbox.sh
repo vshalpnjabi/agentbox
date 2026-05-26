@@ -330,10 +330,11 @@ prompt_approval() {
   local subtitle="${bname} -> ${host}:${port}"
   local message="(sandbox: ${sandbox})"
 
-  # ntfy.sh backend (preferred when configured): cross-device push notification
-  # with proper two-button inline actions. Opt out per-invocation with
-  # AGENTBOX_NO_NTFY=1 (the watcher then falls through to alerter / osascript).
-  if [ "${AGENTBOX_NO_NTFY:-0}" != "1" ]; then
+  # ntfy.sh backend (cross-device push, two-button inline). STRICTLY opt-in:
+  # both AGENTBOX_NTFY=1 must be exported AND a topic must be configured via
+  # `agentbox notify setup`. Without the env var, alerter is used even if a
+  # topic is saved (so the topic file isn't a hidden on-switch).
+  if [ "${AGENTBOX_NTFY:-0}" = "1" ]; then
     local topic
     if topic=$(ntfy_get_topic) && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
       local result
@@ -342,8 +343,9 @@ prompt_approval() {
         echo "$result"
         return 0
       fi
-      # ntfy timed out or failed; fall through to local alerter
       echo "[watcher] ntfy returned no decision; falling back to alerter" >&2
+    elif ! topic=$(ntfy_get_topic); then
+      echo "[watcher] AGENTBOX_NTFY=1 set but no topic configured (agentbox notify setup)" >&2
     fi
   fi
 
@@ -1155,6 +1157,10 @@ cmd_notify() {
             "$AGB_NTFY_BASE/$topic" >/dev/null 2>&1; then
         echo "  test notification sent. Check your subscribed devices."
         echo "  If you do not see it: run 'agentbox notify open' or rescan the QR."
+        echo
+        echo "FINAL STEP: enable ntfy by exporting AGENTBOX_NTFY=1 in your shell:"
+        echo "  echo 'export AGENTBOX_NTFY=1' >> ~/.zshrc && exec zsh"
+        echo "(without this, agentbox still uses alerter even with the topic saved.)"
       else
         warn "  test notification POST failed (network issue?)"
       fi
@@ -1164,9 +1170,14 @@ cmd_notify() {
       if t=$(ntfy_get_topic); then
         echo "ntfy topic: $t"
         echo "URL:        $AGB_NTFY_BASE/$t"
-        echo "Opt-out:    AGENTBOX_NO_NTFY=1"
+        if [ "${AGENTBOX_NTFY:-0}" = "1" ]; then
+          echo "Enabled:    yes (AGENTBOX_NTFY=1 set in env)"
+        else
+          echo "Enabled:    NO  (set AGENTBOX_NTFY=1 in your shell to activate)"
+        fi
       else
         echo "ntfy: not configured  (run: agentbox notify setup)"
+        echo "Note: ntfy is opt-in. After setup, also export AGENTBOX_NTFY=1."
       fi
       ;;
     test)
@@ -1365,14 +1376,19 @@ Notification appearance (macOS):
                                          "Alerts" for persistent banner-style
                                          approval prompts with action buttons.
 
-ntfy.sh (cross-device push notifications with two-button inline actions):
-  agentbox notify setup                  Generate a random topic, save it,
-                                         send a test notification.
-  agentbox notify status                 Show the configured topic + URL.
+ntfy.sh (OPT-IN cross-device push with two-button inline actions):
+  agentbox notify setup                  Generate topic, offer to open ntfy app
+                                         or browser to subscribe, send a test.
+  agentbox notify status                 Topic + URL + enabled-or-not.
+  agentbox notify open                   Re-open subscribe target (app/browser).
+  agentbox notify browser                Re-open in browser specifically.
+  agentbox notify qr                     Re-print the subscribe QR.
   agentbox notify test                   Trigger a test Allow/Deny prompt.
   agentbox notify clear                  Remove the saved topic.
-  AGENTBOX_NO_NTFY=1 claude              Skip ntfy for one invocation (falls
-                                         back to alerter / osascript).
+
+  Enable: export AGENTBOX_NTFY=1 in your shell. Without that env var, ntfy
+  stays dormant and approval prompts go through alerter (the default).
+  Subscribe UX: AGENTBOX_NTFY_SUBSCRIBE=auto|app|browser|none
 
 Per-agent host-side auth setup (so sandboxes auto-authenticate):
   agentbox auth status                          Show which agents are set up
