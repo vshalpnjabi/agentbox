@@ -186,7 +186,7 @@ done
 ln -sf "$AGB_HOME/agentbox.sh" "$USER_BIN/agentbox"
 chmod +x "$REPO_DIR/agentbox.sh"
 
-ok "agentbox installed"
+ok "agentbox installed ()"
 log "running doctor for a final health check"
 echo
 "$AGB_BIN/agentbox" doctor || true
