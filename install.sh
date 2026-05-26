@@ -88,6 +88,7 @@ if [ "$MODE" = "bootstrap" ]; then
     "alerter:vjeantet/tap/alerter"
     "qrencode:qrencode"
     "jq:jq"
+    "tmux:tmux"
   )
 
   missing=()
@@ -151,6 +152,7 @@ command -v mutagen   >/dev/null 2>&1 || warn "mutagen missing — brew tap mutag
 command -v alerter   >/dev/null 2>&1 || warn "alerter missing (optional, for approval dialogs) — brew install vjeantet/tap/alerter"
 command -v qrencode  >/dev/null 2>&1 || warn "qrencode missing (optional, for ntfy QR) — brew install qrencode"
 command -v jq        >/dev/null 2>&1 || warn "jq missing — brew install jq"
+command -v tmux      >/dev/null 2>&1 || warn "tmux missing (default agent wrap; AGENTBOX_NO_TMUX=1 to skip) — brew install tmux"
 docker info >/dev/null 2>&1 || warn "docker daemon not reachable. Start Docker Desktop before using agentbox."
 
 log "scanning for installed agents"

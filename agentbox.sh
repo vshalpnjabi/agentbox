@@ -465,24 +465,77 @@ APPLESCRIPT
   echo "Deny"
 }
 
-# Type a retry prompt into the agent's TUI. The watcher path catches 403s
-# AFTER the agent has already seen them, so on Allow the agent needs to be told
-# to redo the failed action. The only realistic mechanism without an inside-the-
-# sandbox cooperative agent is OS-level keystroke injection into the frontmost
-# window:
-#   macOS  — osascript via System Events (needs Accessibility, already required
-#            for the alerter prompt UI; agentbox doctor checks for it).
+# ---- tmux wrap for interactive agent sessions ----
+# Each workspace's TTY agent launch is wrapped in a deterministic tmux session
+# (default-on; opt out with AGENTBOX_NO_TMUX=1). Two reasons:
+#   1. inject_retry_to_agent uses `tmux send-keys -t <session>` which delivers
+#      the retry prompt to the agent's pane regardless of which window has
+#      focus — fixing the "agent terminal not in focus" gap in the keystroke
+#      path.
+#   2. Detach/reattach for free: Ctrl-B d to detach, `agentbox attach` to
+#      come back. Survives terminal-window close.
+# Skipped automatically when already inside an outer tmux ($TMUX set) — nesting
+# is messy and we don't know which outer pane holds the agent.
+
+# Session name = sandbox name; sandbox names already start with "agentbox-".
+tmux_session_for_sandbox() { echo "$1"; }
+
+tmux_available() { command -v tmux >/dev/null 2>&1; }
+
+tmux_have_session() {
+  tmux_available || return 1
+  tmux has-session -t "$(tmux_session_for_sandbox "$1")" 2>/dev/null
+}
+
+# Should we wrap this launch in tmux? Returns 0 (yes) only when all three hold:
+#   - AGENTBOX_NO_TMUX isn't truthy
+#   - tmux is installed
+#   - we're not already inside someone else's tmux (TMUX env)
+tmux_should_wrap() {
+  is_truthy "${AGENTBOX_NO_TMUX:-}" && return 1
+  tmux_available || return 1
+  [ -n "${TMUX:-}" ] && return 1
+  return 0
+}
+
+tmux_kill_session() {
+  tmux_available || return 0
+  tmux kill-session -t "$(tmux_session_for_sandbox "$1")" 2>/dev/null || true
+}
+
+# Type a retry prompt into the agent's TUI. Preferred delivery path is
+# `tmux send-keys` (focus-independent, exact pane targeting). Falls back to
+# OS-level keystroke injection into the frontmost window for users who opted
+# out of the tmux wrap (or whose system lacks tmux):
+#   macOS  — osascript via System Events (Accessibility permission required).
 #   Linux  — xdotool type (X11 only; Wayland has no equivalent).
 #   other  — print the prompt and let the user paste it manually.
 #
-# Caveat: keystroke injection types into whatever has focus. A brief sleep
-# tries to let the alerter dialog finish dismissing so focus returns to the
-# terminal, but if the user has switched apps, the keystroke goes elsewhere.
-# Opt-in only (AGENTBOX_FORCE_RETRY=1) precisely because of this fragility.
+# Keystroke caveat: types into whatever has focus. A brief sleep lets the
+# alerter dialog finish dismissing so focus returns to the terminal, but if
+# the user switched apps, the keystroke goes elsewhere. The tmux path doesn't
+# have this fragility.
 inject_retry_to_agent() {
   local sandbox="$1" host="$2" port="$3" binary="$4"
   local prompt
   prompt="${AGENTBOX_RETRY_PROMPT:-The previous request to ${host}:${port} was just approved by the user. Please retry the action that failed.}"
+
+  # Preferred path: tmux send-keys to the agent's wrapped session. No focus
+  # dependency, no keystroke fragility, works on macOS/Linux/Wayland/Windows.
+  if tmux_have_session "$sandbox"; then
+    local session
+    session=$(tmux_session_for_sandbox "$sandbox")
+    sleep "${AGENTBOX_RETRY_DELAY:-1}"
+    # `-l` sends the literal string (no key-name interpretation), then a
+    # separate send-keys delivers the Enter key.
+    if tmux send-keys -t "$session" -l -- "$prompt" 2>/dev/null && \
+       tmux send-keys -t "$session" Enter 2>/dev/null; then
+      audit_emit "$sandbox" "retry" "INJECTED (tmux) $binary -> $host:$port"
+      echo "[watcher] retry injected via tmux send-keys (session: $session)" >&2
+      return 0
+    fi
+    echo "[watcher] tmux send-keys failed; falling back to OS keystroke" >&2
+  fi
 
   case "$(uname)" in
     Darwin)
@@ -1186,6 +1239,7 @@ cmd_stop() {
   log "stopping mutagen sync + watcher for $name (sandbox + state preserved)"
   watcher_stop "$name"
   decide_server_stop "$name"
+  tmux_kill_session "$name"
   mutagen sync terminate "$name" >/dev/null 2>&1 || true
   mutagen sync terminate "${name}-state" >/dev/null 2>&1 || true
 }
@@ -1207,6 +1261,7 @@ cmd_destroy() {
   fi
   watcher_stop "$name"
   decide_server_stop "$name"
+  tmux_kill_session "$name"
   mutagen sync terminate "$name" >/dev/null 2>&1 || true
   mutagen sync terminate "${name}-state" >/dev/null 2>&1 || true
   openshell sandbox delete "$name" >/dev/null 2>&1 || true
@@ -1360,6 +1415,23 @@ cmd_decide_test() {
 cmd_shell() {
   local name="${1:-$(workspace_sandbox_name)}"
   exec openshell sandbox exec --name "$name" --tty --workdir /sandbox/work -- /bin/sh -lc 'exec ${SHELL:-/bin/bash} -l'
+}
+
+cmd_attach() {
+  # Reattach to the tmux session for a workspace's agent (created when
+  # agentbox wraps the agent launch in tmux, default-on). Useful after
+  # detaching with Ctrl-B d or after closing the terminal window.
+  local name="${1:-$(workspace_sandbox_name)}"
+  tmux_available || err "tmux not installed (brew install tmux)"
+  local session
+  session=$(tmux_session_for_sandbox "$name")
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    err "no tmux session '$session' (run 'claude' / 'codex' / 'opencode' in this workspace to start one)"
+  fi
+  if [ -n "${TMUX:-}" ]; then
+    err "already inside tmux. Switch with: tmux switch-client -t $session"
+  fi
+  exec tmux attach -t "$session"
 }
 
 cmd_auth() {
@@ -1618,7 +1690,7 @@ cmd_doctor() {
   c_blue=$'\033[36m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_green=$'\033[32m'; c_reset=$'\033[0m'
 
   # ---- 1. CLI dependencies ----
-  for entry in "openshell:nvidia/openshell/openshell" "mutagen:mutagen-io/mutagen/mutagen" "alerter:vjeantet/tap/alerter" "qrencode:qrencode" "jq:jq" "git:git"; do
+  for entry in "openshell:nvidia/openshell/openshell" "mutagen:mutagen-io/mutagen/mutagen" "alerter:vjeantet/tap/alerter" "qrencode:qrencode" "jq:jq" "git:git" "tmux:tmux"; do
     cmd="${entry%%:*}"; spec="${entry##*:}"
     if command -v "$cmd" >/dev/null 2>&1; then
       _row ok "$cmd"
@@ -2103,6 +2175,8 @@ Management:
   agentbox stop [NAME]         Pause workspace + state sync (sandbox preserved)
   agentbox pull [NAME]         Force-flush both sync sessions (workspace + state)
   agentbox shell [NAME]        Open interactive shell in sandbox
+  agentbox attach [NAME]       Reattach to this workspace's tmux session
+                               (created automatically when an agent runs)
   agentbox policy show [NAME]  Print active policy on sandbox
   agentbox policy edit [NAME]  Edit .agentbox.policy.yaml in $EDITOR
   agentbox policy reload [N]   Push workspace policy to running sandbox
@@ -2198,19 +2272,32 @@ Approval prompts (macOS):
   in ~/.local/share/agentbox/state/<sandbox>/watcher-seen.txt so you're
   not asked again for the same tuple. Opt out with AGENTBOX_NO_WATCH=1.
 
+Tmux wrap (default-on; every TTY agent launch is wrapped in tmux so the
+watcher can deliver retry-prompts via send-keys regardless of focus, and
+you can detach/reattach without killing the agent):
+  Detach a session:           Ctrl-B then d (default tmux prefix)
+  Reattach:                   agentbox attach [NAME]
+  List active sessions:       tmux ls
+  Opt out for one shell:      export AGENTBOX_NO_TMUX=1
+  Auto-skipped when already inside a tmux session (TMUX env set) — agentbox
+  doesn't nest. Inside an outer tmux, retry-injection falls back to the
+  keystroke path (which IS focus-dependent — see Force-retry caveats below).
+
 Force-retry (auto-inject "retry the failed action" into the agent on Allow,
 so you don't have to type it yourself):
-  export AGENTBOX_FORCE_RETRY=1            Enable. macOS uses osascript
-                                           keystroke into the frontmost
-                                           window (Accessibility perm
-                                           required); Linux uses xdotool.
+  export AGENTBOX_FORCE_RETRY=1            Enable. Preferred path: tmux
+                                           send-keys (focus-independent,
+                                           requires the wrap above).
+                                           Fallback when not wrapped: macOS
+                                           osascript keystroke / Linux X11
+                                           xdotool, both focus-dependent.
   export AGENTBOX_RETRY_PROMPT="..."       Override the injected text.
-  export AGENTBOX_RETRY_DELAY=1            Seconds to wait before typing
-                                           (gives focus time to return to
-                                           the terminal after Allow click).
-  Caveat: typing goes to whatever window has focus. If you've switched apps,
-  the keystroke lands there. Default off; default behavior is a passive
-  notification "tell agent to retry" instead.
+  export AGENTBOX_RETRY_DELAY=1            Seconds to wait before sending
+                                           (gives the alerter dialog time
+                                           to dismiss in the keystroke path;
+                                           harmless on the tmux path).
+  Caveat (keystroke fallback only): typing goes to whatever window has
+  focus. The tmux send-keys path doesn't have this fragility.
 
 Session continuity:
   /sandbox/.claude/projects (claude conversation history) is live-synced to
@@ -2293,6 +2380,7 @@ if [ "$self_name" = "agentbox" ] || [ "$self_name" = "agentbox.sh" ]; then
     stop)    cmd_stop "$@" ;;
     pull)    cmd_pull "$@" ;;
     shell)   cmd_shell "$@" ;;
+    attach)  cmd_attach "$@" ;;
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
     audit)         cmd_audit "$@" ;;
@@ -2373,7 +2461,6 @@ if [ "$agb_want_tty" -eq 1 ]; then
   # path — openshell sandbox exec --tty's gRPC channel was observed to break
   # TUIs (each byte arrives line-buffered, terminal capability queries leak
   # through). SSH plumbs a real PTY end-to-end via the openshell ssh-proxy.
-  log "launching $agent in $sandbox (via ssh -t, workdir=/sandbox/work)"
   ssh_host="openshell-$sandbox"
   quoted=""
   for a in "$@"; do
@@ -2392,7 +2479,26 @@ if [ "$agb_want_tty" -eq 1 ]; then
   # Silence claude's "Native installation exists but ~/.local/bin is not in your
   # PATH" by ensuring the symlink and the PATH entry both exist inside the sandbox.
   setup_prefix="mkdir -p \$HOME/.local/bin && ln -sf /usr/local/bin/claude \$HOME/.local/bin/claude 2>/dev/null; export PATH=\$HOME/.local/bin:\$PATH && "
-  exec ssh -t "$ssh_host" "${setup_prefix}${env_prefix}cd /sandbox/work && exec $agent$quoted"
+  inner_cmd="${setup_prefix}${env_prefix}cd /sandbox/work && exec $agent$quoted"
+
+  if tmux_should_wrap; then
+    tmux_session=$(tmux_session_for_sandbox "$sandbox")
+    log "launching $agent in $sandbox (via tmux→ssh -t; session=$tmux_session)"
+    log "  detach: Ctrl-B then d   |   reattach: agentbox attach"
+    # Quote the ssh command for tmux's single-string command form.
+    ssh_invoke=$(printf 'ssh -t %q %q' "$ssh_host" "$inner_cmd")
+    # -A attaches to existing session if present; -s sets name; -D detaches
+    # any other clients first so a single window can re-take an orphaned session.
+    exec tmux new-session -A -D -s "$tmux_session" "$ssh_invoke"
+  else
+    if [ -n "${TMUX:-}" ]; then
+      warn "already inside tmux (TMUX=$TMUX); skipping agentbox tmux wrap (retry-injection will fall back to keystroke). Run from outside tmux to use the wrap."
+    elif ! tmux_available && ! is_truthy "${AGENTBOX_NO_TMUX:-}"; then
+      warn "tmux not installed; skipping wrap (retry-injection will fall back to keystroke). Install with: brew install tmux  (or set AGENTBOX_NO_TMUX=1 to silence)"
+    fi
+    log "launching $agent in $sandbox (via ssh -t, workdir=/sandbox/work)"
+    exec ssh -t "$ssh_host" "$inner_cmd"
+  fi
 else
   log "launching $agent in $sandbox (via openshell exec --no-tty, workdir=/sandbox/work)"
   env_line=$(agent_env_token "$agent")

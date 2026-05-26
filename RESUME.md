@@ -13,7 +13,8 @@ State of the project on pause. Pick this up next session.
   - `agentbox uninstall` (tiered: shims → sandboxes → ssh config → state → tokens)
 - **Auth status:** synthetic `.credentials.json` + `~/.claude.json` upload is working for `claude`. `codex` and `opencode` go through `agent_auth_mapping()` and per-agent install/auth helpers.
 - **Notification backends:** macOS `alerter` (dropdown UX, not side-by-side buttons — accepted that limitation), Linux `zenity`/`notify-send`/`/dev/tty` fallback, ntfy.sh as opt-in via `AGENTBOX_NTFY=1|true|yes|on`.
-- **Force-retry (watcher path):** opt-in `AGENTBOX_FORCE_RETRY=1` injects a retry prompt into the frontmost window (osascript on macOS / xdotool on Linux X11) after Allow, so the user doesn't have to type "try again" themselves. Default off because keystroke-targeting is fragile (whatever has focus wins). Overridable text via `AGENTBOX_RETRY_PROMPT`, delay via `AGENTBOX_RETRY_DELAY`. See CLAUDE.md rule 11.
+- **Force-retry (watcher path):** opt-in `AGENTBOX_FORCE_RETRY=1` injects a retry prompt after Allow. Preferred delivery path is `tmux send-keys` (focus-independent, see below). Falls back to osascript/xdotool keystroke when not wrapped or inside outer tmux. Overridable via `AGENTBOX_RETRY_PROMPT` / `AGENTBOX_RETRY_DELAY`. See CLAUDE.md rule 11.
+- **Tmux wrap (default-on):** every TTY agent launch goes through `tmux new-session -A -D -s <sandbox>`. Enables focus-independent retry-injection, detach (Ctrl-B d) / reattach (`agentbox attach`) survival across terminal close, and a stable target for the watcher. Opt out via `AGENTBOX_NO_TMUX=1`. Auto-skipped when already inside outer tmux. tmux added as a brew dep in install.sh + doctor row. See CLAUDE.md rule 12.
 
 ## Parked next steps (in priority order)
 

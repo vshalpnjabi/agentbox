@@ -168,6 +168,36 @@ Upstream does not yet send any traffic to it. Until openshell ships:
   `watcher-seen.txt` because the decide path must remember the *direction* (allow vs
   deny) while the watcher only needs the *fact* of a prior decision.
 
+### 12. Tmux wrap is default-on; retry-inject prefers `send-keys`
+
+Every TTY agent launch (claude/codex/opencode interactive) is wrapped in
+`tmux new-session -A -D -s <sandbox-name>`. The wrap is **default-on** and
+opt-out via `AGENTBOX_NO_TMUX=1`. Reasons it exists:
+
+- `inject_retry_to_agent` prefers `tmux send-keys -t <session> -l -- <prompt>`,
+  which delivers to the agent's pane regardless of which window has focus.
+  This is the fix for "what if the agent's terminal isn't focused?" The
+  keystroke path (osascript/xdotool) remains as fallback for users who
+  opt out of the wrap or are already inside someone else's tmux.
+- Detach/reattach for free — closing the terminal window doesn't kill the agent.
+  Reattach via `agentbox attach [NAME]`.
+
+Auto-skip rules in `tmux_should_wrap`:
+- `AGENTBOX_NO_TMUX=1` → don't wrap (user opt-out)
+- `tmux` not installed → don't wrap, warn at runtime, doctor flags it
+- `TMUX` env is set (already inside outer tmux) → don't wrap; nesting is messy
+  and we don't know which outer pane holds the agent.
+
+Inside the wrap, retry-injection works without focus. Outside the wrap,
+`AGENTBOX_FORCE_RETRY=1` falls back to the focus-dependent OS keystroke path.
+
+When changing the launch dispatch, do NOT remove the `-D` flag (detaches
+other clients) — without it, a second `claude` invocation in the same
+workspace creates a parallel client window that fights for the same TTY.
+
+`cmd_destroy` and `cmd_stop` BOTH `tmux_kill_session` — otherwise orphan
+sessions linger after the sandbox is gone.
+
 ### 11. Force-retry uses OS keystroke injection — keep it opt-in
 
 `AGENTBOX_FORCE_RETRY=1` makes the watcher's Allow branch type a retry prompt
@@ -237,6 +267,11 @@ without needing openshell Interactive upstream.
 
 - **Approval prompts (notifications)**: `prompt_approval()` + `ntfy_prompt()` / `alerter` fallback.
 - **Watcher main loop**: `cmd_watch_internal()`.
+- **Tmux wrap (lifecycle + send-keys helpers)**: `tmux_session_for_sandbox()`,
+  `tmux_should_wrap()`, `tmux_kill_session()`, `cmd_attach()`. Launch wrap
+  lives at the end of agentbox.sh in the `if tmux_should_wrap` branch.
+- **Retry injection**: `inject_retry_to_agent()` — tmux send-keys is the
+  preferred path; osascript/xdotool keystroke is the fallback.
 - **Decide-server (host-side HTTP endpoint)**: `decide_server_*` lifecycle functions +
   `cmd_decide_handler_internal()` (per-request) + `bin/agentbox-decide.py` (Python).
 - **Sandbox lifecycle**: `sandbox_ensure()`, `cmd_destroy()`, `cmd_stop()`, `cmd_pull()`.
