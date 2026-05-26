@@ -155,11 +155,16 @@ docker info >/dev/null 2>&1 || warn "docker daemon not reachable. Start Docker D
 
 log "scanning for installed agents"
 mkdir -p "$AGB_HOME" "$AGB_BIN" "$USER_BIN" "$AGB_HOME/state"
-: > "$AGB_HOME/originals.conf"
 
+# Strip $AGB_BIN from PATH for discovery so we find the REAL agent binaries
+# (not our own shims, which are already first in PATH on a re-install).
+CLEAN_PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vFx "$AGB_BIN" | tr '\n' ':' | sed 's/:$//')
+
+: > "$AGB_HOME/originals.conf"
 found=()
 for agent in claude codex opencode gemini; do
-  if path=$(command -v "$agent" 2>/dev/null); then
+  if path=$(PATH="$CLEAN_PATH" command -v "$agent" 2>/dev/null); then
+    # Also skip if somehow the cleaned PATH still returns our shim (shouldn't happen)
     case "$path" in
       "$AGB_BIN"/*) continue ;;
     esac
