@@ -16,8 +16,8 @@ err()  { printf '\033[31minstall:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---- dep checks ----
 log "checking dependencies"
-command -v openshell >/dev/null || err "openshell not found. Install: brew install nvidia/openshell/openshell"
-command -v mutagen   >/dev/null || err "mutagen not found. Install: brew tap mutagen-io/mutagen && brew install mutagen"
+command -v openshell >/dev/null || warn "openshell not found. Install: brew install nvidia/openshell/openshell"
+command -v mutagen   >/dev/null || warn "mutagen not found. Install: brew tap mutagen-io/mutagen && brew install mutagen"
 command -v docker    >/dev/null || warn "docker CLI not found; the openshell gateway needs a compute driver (docker/podman/k8s/vm)"
 docker info >/dev/null 2>&1 || warn "docker daemon not reachable. Start Docker Desktop (or your driver) before using agentbox."
 

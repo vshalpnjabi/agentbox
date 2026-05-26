@@ -33,19 +33,40 @@ End-to-end: type `claude` in any folder, get a fully-authenticated, sandboxed ag
 
 ## Install
 
+**One-liner (recommended):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/bootstrap.sh | bash
+```
+
+The bootstrap script checks the platform, installs any missing Homebrew deps (openshell, mutagen, alerter, qrencode, jq), clones the repo to `~/src/agentbox`, and runs the installer. Add to your shell rc and you're done.
+
+**Or manually:**
+
 ```bash
 git clone https://github.com/vshlpunjabi/agentbox.git ~/src/agentbox
 ~/src/agentbox/install.sh
 ```
 
-The installer detects which agents you have, creates shim symlinks, and prints the PATH lines for your shell. After install:
+Either way, add this to your shell config so the shim takes priority over the real agent binaries:
 
 ```bash
-# zsh / bash:
+# zsh / bash (~/.zshrc or ~/.bashrc):
 export PATH="$HOME/.local/share/agentbox/bin:$PATH"
 
 # nushell (env.nu):
 $env.PATH = ($env.PATH | prepend $"($env.HOME)/.local/share/agentbox/bin")
+```
+
+Then open a new shell, and `claude` / `codex` / `opencode` will route through agentbox.
+
+### Bootstrap knobs
+
+```bash
+AGENTBOX_PREFIX=~/code curl -fsSL .../bootstrap.sh | bash   # clone target (default ~/src)
+AGENTBOX_YES=1         curl -fsSL .../bootstrap.sh | bash   # don't prompt before brew installs
+AGENTBOX_SKIP_BREW=1   curl -fsSL .../bootstrap.sh | bash   # don't auto-install deps; just check
+AGENTBOX_BRANCH=dev    curl -fsSL .../bootstrap.sh | bash   # check out a different branch
 ```
 
 ## One-time host setup
