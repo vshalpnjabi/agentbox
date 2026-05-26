@@ -295,6 +295,7 @@ cmd_watch_internal() {
         local key="${binary}|${host}|${port}"
 
         if grep -Fxq "$key" "$seen_file"; then
+          echo "[watcher] suppressed (already in seen-list): $key" >&2
           continue
         fi
         echo "$key" >> "$seen_file"
