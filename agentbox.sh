@@ -317,22 +317,73 @@ agent_ensure_installed() {
     || err "failed to install $agent in sandbox $sandbox"
 }
 
-upload_claude_credentials() {
-  # Seed sandbox claude with host OAuth token so the agent is auto-authenticated.
-  # /sandbox is the sandbox user's home, so /sandbox/.claude/.credentials.json is
-  # what claude looks for. Idempotent: safe to call on every invocation; re-uploads
-  # in case the host token was refreshed.
-  local sandbox="$1"
-  local src="$HOME/.claude/.credentials.json"
-  [ -f "$src" ] || return 0
-  [ "${AGENTBOX_NO_CLAUDE_AUTH:-0}" = "1" ] && return 0
+agent_auth_mapping() {
+  # echoes "<host-source-file>::<sandbox-dest-file>" for the agent, or empty.
+  case "$1" in
+    claude)   echo "$HOME/.claude/.credentials.json::/sandbox/.claude/.credentials.json" ;;
+    codex)    echo "$HOME/.codex/auth.json::/sandbox/.codex/auth.json" ;;
+    opencode) echo "$HOME/.local/share/opencode/auth.json::/sandbox/.local/share/opencode/auth.json" ;;
+    *) return 1 ;;
+  esac
+}
 
-  openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude >/dev/null 2>&1 || true
-  if openshell sandbox upload "$sandbox" "$src" /sandbox/.claude/ >/dev/null 2>&1; then
-    openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json >/dev/null 2>&1 || true
-    log "synced host claude credentials into sandbox (~/.claude/.credentials.json)"
+agent_skip_flag() {
+  # echoes the permission-skip flag for the agent, or empty if none.
+  case "$1" in
+    claude)   echo "--dangerously-skip-permissions" ;;
+    codex)    echo "--dangerously-bypass-approvals-and-sandbox" ;;
+    opencode) echo "--dangerously-skip-permissions" ;;
+    *) echo "" ;;
+  esac
+}
+
+agent_env_token() {
+  # Echoes "<ENV_VAR_NAME>=<TOKEN_VALUE>" for the agent (one line) or empty.
+  # On macOS, claude code stores OAuth tokens in the system Keychain and only
+  # rarely writes the on-disk .credentials.json — so the file uploaded into the
+  # sandbox usually has an EXPIRED access token, and the refresh flow inside the
+  # sandbox fails. The portable answer is a long-lived token from `claude
+  # setup-token` saved to a known file; agentbox passes it via env var.
+  case "$1" in
+    claude)
+      local f="$HOME/.claude/.agentbox-oauth-token"
+      if [ -f "$f" ]; then
+        local tok
+        tok=$(tr -d "[:space:]" < "$f")
+        [ -n "$tok" ] && printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$tok"
+      elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
+      fi
+      ;;
+    codex)
+      [ -n "${OPENAI_API_KEY:-}" ] && printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY"
+      ;;
+    opencode)
+      : ;;
+  esac
+}
+
+upload_agent_credentials() {
+  # Seed sandbox with the host's auth file for the given agent so it's
+  # auto-authenticated (no browser/device-code flow inside the sandbox).
+  # Idempotent: re-uploads on every invocation so a host-refreshed token stays current.
+  local sandbox="$1" agent="$2"
+  [ "${AGENTBOX_NO_AGENT_AUTH:-0}" = "1" ] && return 0
+
+  local mapping src dest dest_dir
+  mapping=$(agent_auth_mapping "$agent") || return 0
+  [ -z "$mapping" ] && return 0
+  src="${mapping%%::*}"
+  dest="${mapping##*::}"
+  [ -f "$src" ] || return 0
+  dest_dir=$(dirname "$dest")
+
+  openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p "$dest_dir" >/dev/null 2>&1 || true
+  if openshell sandbox upload "$sandbox" "$src" "$dest" >/dev/null 2>&1; then
+    openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 "$dest" >/dev/null 2>&1 || true
+    log "synced host $agent credentials into sandbox ($dest)"
   else
-    warn "credential upload failed; claude inside sandbox will require browser auth"
+    warn "$agent credential upload failed; agent inside sandbox will require interactive auth"
   fi
 }
 
@@ -539,19 +590,32 @@ ensure_workspace_policy
 sandbox=$(workspace_sandbox_name)
 sandbox_ensure "$sandbox" "$AGB_IMAGE" "$AGB_CPU" "$AGB_MEMORY" "$AGB_POLICY"
 
-# Always seed claude credentials (set AGENTBOX_NO_CLAUDE_AUTH=1 to opt out)
-upload_claude_credentials "$sandbox"
+# Always seed agent credentials (set AGENTBOX_NO_AGENT_AUTH=1 to opt out)
+upload_agent_credentials "$sandbox" "$agent"
 
-# Default claude to --dangerously-skip-permissions when running inside an agentbox sandbox
-# (the sandbox itself enforces policy; permission prompts become redundant friction).
-# Opt out per-invocation with AGENTBOX_PERMISSIONS=on, or by passing the flag yourself.
-if [ "$agent" = "claude" ] && [ "${AGENTBOX_PERMISSIONS:-off}" != "on" ]; then
+# Default to the agent's permission-skip flag. The openshell sandbox itself enforces
+# policy (network + filesystem), so per-tool-call approval prompts become redundant
+# friction. Opt out: AGENTBOX_PERMISSIONS=on, or pass the flag yourself.
+agb_skip_flag=$(agent_skip_flag "$agent")
+if [ -n "$agb_skip_flag" ] && [ "${AGENTBOX_PERMISSIONS:-off}" != "on" ]; then
   has_skip=0
   for a in "$@"; do
-    case "$a" in --dangerously-skip-permissions) has_skip=1; break ;; esac
+    [ "$a" = "$agb_skip_flag" ] && { has_skip=1; break; }
   done
   if [ "$has_skip" -eq 0 ]; then
-    set -- --dangerously-skip-permissions "$@"
+    case "$agent" in
+      claude|codex)
+        # Top-level flag; prepend.
+        set -- "$agb_skip_flag" "$@"
+        ;;
+      opencode)
+        # Only supported on the `run` subcommand; inject after it.
+        if [ "${1:-}" = "run" ]; then
+          sub="$1"; shift
+          set -- "$sub" "$agb_skip_flag" "$@"
+        fi
+        ;;
+    esac
   fi
 fi
 
@@ -578,8 +642,24 @@ if [ "$agb_want_tty" -eq 1 ]; then
   for a in "$@"; do
     quoted+=" $(printf '%q' "$a")"
   done
-  exec ssh -t "$ssh_host" "cd /sandbox/work && exec $agent$quoted"
+  # Inject auth env (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY)
+  # if the host has it. Properly shell-quoted for the remote shell.
+  env_prefix=""
+  env_line=$(agent_env_token "$agent")
+  if [ -n "$env_line" ]; then
+    env_var="${env_line%%=*}"
+    env_val="${env_line#*=}"
+    env_prefix="export $env_var=$(printf '%q' "$env_val") && "
+    log "  injecting $env_var into sandbox (from host)"
+  fi
+  exec ssh -t "$ssh_host" "${env_prefix}cd /sandbox/work && exec $agent$quoted"
 else
   log "launching $agent in $sandbox (via openshell exec --no-tty, workdir=/sandbox/work)"
-  exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /sandbox/work -- "$agent" "$@"
+  env_line=$(agent_env_token "$agent")
+  if [ -n "$env_line" ]; then
+    log "  injecting ${env_line%%=*} into sandbox (from host)"
+    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /sandbox/work -- /usr/bin/env "$env_line" "$agent" "$@"
+  else
+    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /sandbox/work -- "$agent" "$@"
+  fi
 fi

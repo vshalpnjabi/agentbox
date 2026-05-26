@@ -33,6 +33,19 @@ git clone <this-repo> ~/src/agentbox
 
 The installer detects which agents you have, creates shim symlinks, and prints the PATH lines to add to your shell config.
 
+## One-time auth setup (claude on macOS only)
+
+Claude Code on macOS stores OAuth tokens in the system Keychain — the on-disk `~/.claude/.credentials.json` only holds an expired/cached snapshot, and refresh tokens are bound to the host installation. To run claude inside a sandbox with persistent auth, you need a long-lived token:
+
+```bash
+claude setup-token > ~/.claude/.agentbox-oauth-token
+chmod 600 ~/.claude/.agentbox-oauth-token
+```
+
+agentbox auto-detects this file and injects it as `CLAUDE_CODE_OAUTH_TOKEN` into every sandbox claude invocation. Falls back to `ANTHROPIC_API_KEY` from your env if the token file is absent. If neither is set, claude inside the sandbox will prompt for browser auth on first use (and re-auth periodically as tokens refresh).
+
+For codex / opencode the host's `~/.codex/auth.json` and `~/.local/share/opencode/auth.json` are uploaded automatically and don't need the same dance.
+
 ## Usage
 
 ```bash
