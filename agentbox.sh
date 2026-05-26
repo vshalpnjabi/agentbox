@@ -531,4 +531,9 @@ mutagen_state_ensure "$sandbox"
 agent_ensure_installed "$sandbox" "$agent"
 
 log "launching $agent in $sandbox (workdir=/sandbox/work)"
-exec openshell sandbox exec --name "$sandbox" --workdir /sandbox/work -- "$agent" "$@"
+# Explicit TTY decision (openshell's auto-detect can miss our case after exec chain).
+if [ -t 0 ] && [ -t 1 ]; then
+  exec openshell sandbox exec --name "$sandbox" --tty --workdir /sandbox/work -- "$agent" "$@"
+else
+  exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /sandbox/work -- "$agent" "$@"
+fi
