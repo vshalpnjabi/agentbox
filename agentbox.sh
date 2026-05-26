@@ -232,8 +232,8 @@ filesystem_policy:
 # Endpoint defaults to TCP passthrough; add protocol: rest + access: <preset> for L7 inspection.
 # Hot-reload changes here with `agentbox policy reload`.
 #
-# Default: claude is allowed to reach Anthropic so the agent works out of the box.
-# Uncomment the codex / opencode / github examples below to enable those.
+# Defaults: agents allowed to reach their APIs + GitHub open to git/curl/agents.
+# Add/remove blocks to taste; `agentbox policy reload` hot-applies network changes.
 network_policies:
   claude_code:
     name: claude-code
@@ -245,27 +245,41 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/claude }
 
-  # codex:
-  #   name: codex
-  #   endpoints:
-  #     - { host: api.openai.com, port: 443 }
-  #   binaries:
-  #     - { path: /usr/local/bin/codex }
-  #
-  # opencode:
-  #   name: opencode
-  #   endpoints:
-  #     - { host: opencode.ai, port: 443 }
-  #   binaries:
-  #     - { path: /usr/local/bin/opencode }
-  #
-  # L7 example with read-only GitHub REST API:
-  # github_api:
-  #   name: github-rest
-  #   endpoints:
-  #     - { host: api.github.com, port: 443, protocol: rest, access: read-only }
-  #   binaries:
-  #     - { path: /usr/local/bin/claude }
+  codex:
+    name: codex
+    endpoints:
+      - { host: api.openai.com, port: 443 }
+      - { host: chatgpt.com, port: 443 }
+      - { host: auth.openai.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/codex }
+
+  opencode:
+    name: opencode
+    endpoints:
+      - { host: opencode.ai, port: 443 }
+      - { host: api.opencode.ai, port: 443 }
+    binaries:
+      - { path: /usr/bin/opencode }
+
+  github:
+    name: github
+    endpoints:
+      - { host: github.com, port: 443 }
+      - { host: api.github.com, port: 443 }
+      - { host: raw.githubusercontent.com, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      - { host: codeload.github.com, port: 443 }
+      - { host: gist.github.com, port: 443 }
+      - { host: ghcr.io, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/codex }
+      - { path: /usr/bin/opencode }
+      - { path: /usr/bin/git }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+      - { path: /usr/bin/ssh }
 YAML
 }
 
