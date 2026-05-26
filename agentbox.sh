@@ -18,6 +18,13 @@ log()  { printf '\033[36magentbox:\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33magentbox:\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[31magentbox:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Accept any of: 1, true, yes, on (case-insensitive). Anything else = false.
+is_truthy() {
+  local v
+  v=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "$v" in 1|true|yes|on|y|t) return 0 ;; *) return 1 ;; esac
+}
+
 real_binary() {
   awk -F= -v a="$1" '$1==a {print $2; exit}' "$AGB_ORIGINALS" 2>/dev/null
 }
@@ -198,7 +205,7 @@ watcher_running() {
 
 watcher_ensure() {
   local sandbox="$1"
-  if [ "${AGENTBOX_NO_WATCH:-0}" = "1" ]; then
+  if is_truthy "${AGENTBOX_NO_WATCH:-}"; then
     log "watcher disabled (AGENTBOX_NO_WATCH=1)"
     return 0
   fi
@@ -334,7 +341,7 @@ prompt_approval() {
   # both AGENTBOX_NTFY=1 must be exported AND a topic must be configured via
   # `agentbox notify setup`. Without the env var, alerter is used even if a
   # topic is saved (so the topic file isn't a hidden on-switch).
-  if [ "${AGENTBOX_NTFY:-0}" = "1" ]; then
+  if is_truthy "${AGENTBOX_NTFY:-}"; then
     local topic
     if topic=$(ntfy_get_topic) && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
       local result
@@ -679,7 +686,7 @@ upload_agent_credentials() {
   #
   # For codex/opencode: just upload the host's auth.json verbatim.
   local sandbox="$1" agent="$2"
-  [ "${AGENTBOX_NO_AGENT_AUTH:-0}" = "1" ] && return 0
+  is_truthy "${AGENTBOX_NO_AGENT_AUTH:-}" && return 0
 
   if [ "$agent" = "claude" ]; then
     upload_claude_credentials_synthetic "$sandbox"
@@ -1170,7 +1177,7 @@ cmd_notify() {
       if t=$(ntfy_get_topic); then
         echo "ntfy topic: $t"
         echo "URL:        $AGB_NTFY_BASE/$t"
-        if [ "${AGENTBOX_NTFY:-0}" = "1" ]; then
+        if is_truthy "${AGENTBOX_NTFY:-}"; then
           echo "Enabled:    yes (AGENTBOX_NTFY=1 set in env)"
         else
           echo "Enabled:    NO  (set AGENTBOX_NTFY=1 in your shell to activate)"
@@ -1473,7 +1480,7 @@ if inside_sandbox && [ "$self_name" != "agentbox" ]; then
 fi
 
 # Explicit bypass
-if [ "${AGENTBOX_BYPASS:-0}" = "1" ] && [ "$self_name" != "agentbox" ]; then
+if is_truthy "${AGENTBOX_BYPASS:-}" && [ "$self_name" != "agentbox" ]; then
   real=$(real_binary "$self_name")
   [ -z "$real" ] && err "no real binary recorded for $self_name in $AGB_ORIGINALS"
   exec "$real" "$@"
@@ -1523,7 +1530,7 @@ upload_agent_credentials "$sandbox" "$agent"
 # policy (network + filesystem), so per-tool-call approval prompts become redundant
 # friction. Opt out: AGENTBOX_PERMISSIONS=on, or pass the flag yourself.
 agb_skip_flag=$(agent_skip_flag "$agent")
-if [ -n "$agb_skip_flag" ] && [ "${AGENTBOX_PERMISSIONS:-off}" != "on" ]; then
+if [ -n "$agb_skip_flag" ] && ! is_truthy "${AGENTBOX_PERMISSIONS:-}"; then
   has_skip=0
   for a in "$@"; do
     [ "$a" = "$agb_skip_flag" ] && { has_skip=1; break; }
