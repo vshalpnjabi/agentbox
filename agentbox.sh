@@ -170,6 +170,12 @@ mutagen_state_ensure() {
 }
 
 # ---- Approval watcher (macOS) ----
+# TODO: hold-and-ask enforcement mode. Today the watcher reacts AFTER the
+# proxy has 403'd the request, so the agent must be told to retry. A clean
+# fix requires extending openshell's proxy with a third enforcement mode
+# (e.g., "interactive") that holds the connection open while consulting
+# an external decision endpoint. This file's prompt_approval would then
+# serve that endpoint via a unix socket or HTTP. Deferred per user.
 # Background process that tails openshell logs for NET:OPEN DENIED events and
 # prompts the user (osascript display dialog) on the first occurrence of each
 # (binary, host:port) tuple. Approval adds the endpoint to the workspace policy
@@ -364,7 +370,10 @@ cmd_watch_internal() {
               --binary "$binary" \
               --wait >/dev/null 2>&1; then
             echo "[watcher] approved: $host:$port for $binary (policy hot-reloaded)" >&2
-            osascript -e "display notification \"Allowed $host:$port for $binary\" with title \"agentbox\"" 2>/dev/null || true
+            # Nudge: the agent already saw the 403 before approval. Until openshell
+            # gets a hold-and-ask enforcement mode (deferred — see TODO), the user
+            # has to tell the agent to retry the failed action.
+            osascript -e "display notification \"$host:$port allowed. Tell agent to retry.\" with title \"agentbox\"" 2>/dev/null || true
           else
             echo "[watcher] approval failed: openshell policy update returned non-zero" >&2
           fi
