@@ -1095,6 +1095,17 @@ cmd_auth_clear() {
   esac
 }
 
+cmd_uninstall() {
+  # Locate uninstall.sh (next to agentbox.sh, since they ship together) and exec it.
+  local repo_dir
+  repo_dir=$(dirname "$(readlink -f "$AGB_ROOT/agentbox.sh" 2>/dev/null || echo "$AGB_ROOT/agentbox.sh")")
+  local script="$repo_dir/uninstall.sh"
+  if [ ! -x "$script" ]; then
+    err "uninstall.sh not found at $script — fetch it: curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.sh | bash"
+  fi
+  exec "$script" "$@"
+}
+
 cmd_doctor() {
   # Health check: walk through every prerequisite agentbox needs and report
   # which are good / missing / unknown. Offer to open the right macOS settings
@@ -1586,6 +1597,13 @@ Management:
   agentbox policy reload [N]   Push workspace policy to running sandbox
   agentbox policy reset [N]    Restore default policy + wipe approval seen-list
 
+Uninstall:
+  agentbox uninstall                       Interactive tiered uninstall (asks
+                                           per-tier: shims, sandboxes, ssh
+                                           config, state, tokens, workspace files)
+  agentbox uninstall --all                 Remove EVERYTHING (one summary prompt)
+  agentbox uninstall --yes                 Non-interactive; remove default tier
+
 Health check:
   agentbox doctor                          Walk every prerequisite + report
                                            pass/fail/warn (deps, Docker, gateway,
@@ -1734,6 +1752,7 @@ if [ "$self_name" = "agentbox" ]; then
     approve)       cmd_approve "$@" ;;
     audit)         cmd_audit "$@" ;;
     doctor)        cmd_doctor "$@" ;;
+    uninstall)     cmd_uninstall "$@" ;;
     notifications) cmd_notifications "$@" ;;
     notify)        cmd_notify "$@" ;;
     auth)          cmd_auth "$@" ;;

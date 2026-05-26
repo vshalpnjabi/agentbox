@@ -60,6 +60,33 @@ $env.PATH = ($env.PATH | prepend $"($env.HOME)/.local/share/agentbox/bin")
 
 Then open a new shell, and `claude` / `codex` / `opencode` will route through agentbox.
 
+## Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.sh | bash
+```
+
+Or from your local checkout:
+
+```bash
+~/src/agentbox/uninstall.sh           # interactive; asks tier-by-tier
+~/src/agentbox/uninstall.sh --all     # remove everything (one summary prompt)
+agentbox uninstall --yes              # non-interactive; removes the default tier (shims only)
+```
+
+Tiered removal — you pick which to remove:
+
+| Tier | What it touches |
+|---|---|
+| `shims` (always) | `~/.local/share/agentbox/bin/*`, `~/.local/bin/agentbox`, `~/.local/share/agentbox/agentbox.sh` |
+| `sandboxes` | Every `agentbox-*` openshell sandbox + its mutagen sync sessions |
+| `ssh config` | `# agentbox:start/end` blocks in `~/.ssh/config` |
+| `state` | `~/.local/share/agentbox/state/` (audit logs, watcher state, session history) |
+| `tokens` | `~/.claude/.agentbox-oauth-token`, ntfy topic |
+| `workspaces` (off by default) | `.agentbox.policy.yaml` + `.agentbox.toml` under `~` (you usually want to keep these — they're in version control) |
+
+NOT touched: Homebrew deps (run `brew uninstall ...` yourself), macOS Accessibility/Notification permissions (manual), and the PATH lines you added to your shell rc (uninstall prints them; you remove).
+
 ### Bootstrap knobs
 
 ```bash
