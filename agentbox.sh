@@ -701,6 +701,16 @@ EOF
 }
 
 # Dispatch
+# Hidden subcommand: the approval watcher background process. Invoked by
+# watcher_ensure via `nohup "$AGB_ROOT/agentbox.sh" __watch <sandbox>`, where
+# $0 is the .sh file (not the agentbox symlink), so this needs to fire before
+# any $0-based dispatch.
+if [ "${1:-}" = "__watch" ]; then
+  shift
+  cmd_watch_internal "$@"
+  exit 0
+fi
+
 self_name=$(basename "$0")
 
 # Inside the sandbox, the shim shouldn't recurse. Just exec real binary.
