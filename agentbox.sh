@@ -454,47 +454,43 @@ filesystem_policy:
 # Endpoint defaults to TCP passthrough; add protocol: rest + access: <preset> for L7 inspection.
 # Hot-reload changes here with `agentbox policy reload`.
 #
-# Defaults: agents allowed to reach their APIs + GitHub open to git/curl/agents.
-# Add/remove blocks to taste; `agentbox policy reload` hot-applies network changes.
+# Defaults: permissive — broad wildcards on common dev infrastructure so most
+# workflows "just work" without prompts. Lock down per-workspace by editing this
+# file and `agentbox policy reload`. The sandbox itself is still the safety
+# boundary (filesystem + process isolation); these are NETWORK rules only.
 network_policies:
   claude_code:
     name: claude-code
     endpoints:
-      - { host: api.anthropic.com, port: 443 }
-      - { host: platform.claude.com, port: 443 }
+      - { host: '*.anthropic.com', port: 443 }
+      - { host: '*.claude.ai', port: 443 }
       - { host: claude.ai, port: 443 }
-      - { host: downloads.claude.ai, port: 443 }
-      - { host: statsig.anthropic.com, port: 443 }
-      - { host: mcp-proxy.anthropic.com, port: 443 }
+      - { host: '*.datadoghq.com', port: 443 }
     binaries:
       - { path: /usr/local/bin/claude }
 
   codex:
     name: codex
     endpoints:
-      - { host: api.openai.com, port: 443 }
+      - { host: '*.openai.com', port: 443 }
       - { host: chatgpt.com, port: 443 }
-      - { host: auth.openai.com, port: 443 }
     binaries:
       - { path: /usr/bin/codex }
 
   opencode:
     name: opencode
     endpoints:
+      - { host: '*.opencode.ai', port: 443 }
       - { host: opencode.ai, port: 443 }
-      - { host: api.opencode.ai, port: 443 }
     binaries:
       - { path: /usr/bin/opencode }
 
   github:
     name: github
     endpoints:
+      - { host: '*.github.com', port: 443 }
       - { host: github.com, port: 443 }
-      - { host: api.github.com, port: 443 }
-      - { host: raw.githubusercontent.com, port: 443 }
-      - { host: objects.githubusercontent.com, port: 443 }
-      - { host: codeload.github.com, port: 443 }
-      - { host: gist.github.com, port: 443 }
+      - { host: '*.githubusercontent.com', port: 443 }
       - { host: ghcr.io, port: 443 }
     binaries:
       - { path: /usr/local/bin/claude }
@@ -504,6 +500,30 @@ network_policies:
       - { path: /usr/bin/curl }
       - { path: /usr/bin/wget }
       - { path: /usr/bin/ssh }
+
+  package_registries:
+    name: package-registries
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: '*.pythonhosted.org', port: 443 }
+      - { host: '*.npmjs.org', port: 443 }
+      - { host: '*.npmjs.com', port: 443 }
+      - { host: registry.npmjs.org, port: 443 }
+      - { host: '*.yarnpkg.com', port: 443 }
+      - { host: '*.crates.io', port: 443 }
+      - { host: crates.io, port: 443 }
+      - { host: '*.rubygems.org', port: 443 }
+      - { host: rubygems.org, port: 443 }
+      - { host: '*.docker.io', port: 443 }
+      - { host: '*.docker.com', port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/codex }
+      - { path: /usr/bin/opencode }
+      - { path: /usr/bin/git }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+      - { path: /sandbox/.uv/python/cpython-3.13.12-linux-aarch64-gnu/bin/python3.13 }
 YAML
 }
 
@@ -972,7 +992,10 @@ if [ "$agb_want_tty" -eq 1 ]; then
     env_prefix="export $env_var=$(printf '%q' "$env_val") && "
     log "  injecting $env_var into sandbox (from host)"
   fi
-  exec ssh -t "$ssh_host" "${env_prefix}cd /sandbox/work && exec $agent$quoted"
+  # Silence claude's "Native installation exists but ~/.local/bin is not in your
+  # PATH" by ensuring the symlink and the PATH entry both exist inside the sandbox.
+  local setup_prefix="mkdir -p \$HOME/.local/bin && ln -sf /usr/local/bin/claude \$HOME/.local/bin/claude 2>/dev/null; export PATH=\$HOME/.local/bin:\$PATH && "
+  exec ssh -t "$ssh_host" "${setup_prefix}${env_prefix}cd /sandbox/work && exec $agent$quoted"
 else
   log "launching $agent in $sandbox (via openshell exec --no-tty, workdir=/sandbox/work)"
   env_line=$(agent_env_token "$agent")
