@@ -252,13 +252,35 @@ watcher_stop() {
 freeze_sandbox_agents() {
   local sandbox="$1" pid="$2"
   local cmd="kill -STOP $pid 2>/dev/null; pkill -STOP -x claude 2>/dev/null; pkill -STOP -x codex 2>/dev/null; pkill -STOP -x opencode 2>/dev/null; true"
-  openshell sandbox exec --name "$sandbox" --no-tty -- /bin/sh -c "$cmd" >/dev/null 2>&1 || true
+  # </dev/null is required: without it, openshell exec inherits the while-read
+  # pipe as stdin and hangs forever waiting for it to close.
+  openshell sandbox exec --name "$sandbox" --no-tty -- /bin/sh -c "$cmd" </dev/null >/dev/null 2>&1 || true
 }
 
 unfreeze_sandbox_agents() {
   local sandbox="$1" pid="$2"
   local cmd="kill -CONT $pid 2>/dev/null; pkill -CONT -x claude 2>/dev/null; pkill -CONT -x codex 2>/dev/null; pkill -CONT -x opencode 2>/dev/null; true"
-  openshell sandbox exec --name "$sandbox" --no-tty -- /bin/sh -c "$cmd" >/dev/null 2>&1 || true
+  openshell sandbox exec --name "$sandbox" --no-tty -- /bin/sh -c "$cmd" </dev/null >/dev/null 2>&1 || true
+}
+
+# Prompt the user via osascript `display alert` (system-styled informational
+# alert with Allow/Deny buttons). `display notification` doesn't accept input;
+# terminal-notifier 2.0 dropped -actions. `display alert` is the closest thing
+# to a "notification" that supports buttons. Echos "Allow" / "Deny" / "".
+prompt_approval() {
+  local sandbox="$1" host="$2" port="$3" binary="$4"
+  local title="agentbox approval"
+  local bname; bname=$(basename "$binary")
+  local response
+  response=$(osascript 2>/dev/null <<APPLESCRIPT
+display alert "${title}" message "${bname} in sandbox ${sandbox}\n\nwants to reach ${host}:${port}\n\nAllow and add to workspace policy?" as informational buttons {"Deny", "Allow"} default button "Allow"
+APPLESCRIPT
+)
+  case "$response" in
+    *Allow*) echo "Allow" ;;
+    *Deny*)  echo "Deny" ;;
+    *)       echo "" ;;
+  esac
 }
 
 # The actual watcher loop, run in the background. Invoked as `agentbox __watch <sandbox>`.
@@ -300,24 +322,15 @@ cmd_watch_internal() {
         fi
         echo "$key" >> "$seen_file"
 
-        echo "[watcher] denied: $binary($pid) -> $host:$port — showing dialog" >&2
+        echo "[watcher] denied: $binary($pid) -> $host:$port — freezing + prompting" >&2
 
-        # NOTE: SIGSTOP-on-deny removed. From a nohup'd detached background process,
-        # `openshell sandbox exec --no-tty` hangs indefinitely (stdin handling — works
-        # from a foreground shell). The dialog still gates approval; the TUI just
-        # doesn't visibly freeze. Re-add when we have a non-blocking exec channel.
+        # Freeze the offender PID and all top-level agent processes inside the
+        # sandbox so the TUI visibly pauses until the user decides.
+        freeze_sandbox_agents "$sandbox" "$pid"
 
-        local response osa_err
-        osa_err=$(mktemp /tmp/agentbox-osa.XXXXXX) || osa_err=/dev/null
-        response=$(osascript 2>"$osa_err" <<APPLESCRIPT
-display dialog "Agent in sandbox \"$sandbox\" wants to reach:\n\n$host:$port\n\nFrom: $binary\n\nAllow and add to workspace policy?" buttons {"Deny", "Allow"} default button "Allow" with title "agentbox approval"
-APPLESCRIPT
-)
-        echo "[watcher] osascript exit=$?; response=[$response]" >&2
-        if [ -s "$osa_err" ]; then
-          echo "[watcher] osascript stderr: $(tr "\n" " " < "$osa_err")" >&2
-        fi
-        rm -f "$osa_err" 2>/dev/null
+        local response
+        response=$(prompt_approval "$sandbox" "$host" "$port" "$binary")
+        echo "[watcher] user response: [$response]" >&2
 
         if [[ "$response" == *"Allow"* ]]; then
           if openshell policy update "$sandbox" \
@@ -333,7 +346,8 @@ APPLESCRIPT
           echo "[watcher] denied by user: $host:$port for $binary (won't prompt again)" >&2
         fi
 
-        # (No unfreeze — freeze was removed; see note above.)
+        unfreeze_sandbox_agents "$sandbox" "$pid"
+        echo "[watcher] unfroze agents in $sandbox" >&2
       fi
     done
 
@@ -654,8 +668,29 @@ cmd_policy() {
       "${EDITOR:-vi}" "$WORKSPACE_POLICY_FILE"
       printf '\nRun "agentbox policy reload" to apply network changes to the running sandbox,\nor "agentbox destroy && claude" to apply static field changes.\n' >&2
       ;;
+    reset)
+      # Rewrite .agentbox.policy.yaml from the deny-all+defaults template, wipe
+      # the watcher seen-list, and hot-reload network rules on the running sandbox
+      # (if any). Static fields take effect on next `claude` (destroy + recreate
+      # is implied if you want a fully fresh sandbox).
+      log "resetting .agentbox.policy.yaml in $PWD to default template"
+      write_default_policy "$WORKSPACE_POLICY_FILE"
+      local state_dir
+      state_dir="$AGB_STATE_ROOT/$name"
+      if [ -f "$state_dir/watcher-seen.txt" ]; then
+        log "clearing watcher seen-list ($state_dir/watcher-seen.txt)"
+        : > "$state_dir/watcher-seen.txt"
+      fi
+      if openshell sandbox list 2>/dev/null | awk '{print $1}' | grep -qx "$name"; then
+        log "hot-reloading network policy on running sandbox $name"
+        openshell policy set "$name" --policy "$WORKSPACE_POLICY_FILE" --wait 2>&1 | tail -3
+      else
+        log "no running sandbox $name; next 'claude' will apply the reset policy"
+      fi
+      log "done. Run 'agentbox destroy && claude' if you want static fields (filesystem/landlock/process) re-applied."
+      ;;
     *)
-      err "usage: agentbox policy {show|reload|edit} [NAME]"
+      err "usage: agentbox policy {show|reload|edit|reset} [NAME]"
       ;;
   esac
 }
@@ -677,6 +712,7 @@ Management:
   agentbox policy show [NAME]  Print active policy on sandbox
   agentbox policy edit [NAME]  Edit .agentbox.policy.yaml in $EDITOR
   agentbox policy reload [N]   Push workspace policy to running sandbox
+  agentbox policy reset [N]    Restore default policy + wipe approval seen-list
   agentbox destroy [NAME]      Delete sandbox + ssh block (host state PRESERVED)
   agentbox destroy --purge [N] Also wipe ~/.local/share/agentbox/state/<sandbox>/
 
