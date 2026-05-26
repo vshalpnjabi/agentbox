@@ -268,6 +268,7 @@ cmd_watch_internal() {
       # Match: <binary>(<pid>) -> <host>:<port>
       if [[ "$line" =~ ([/A-Za-z0-9._-]+)\(([0-9]+)\)[[:space:]]*-\>[[:space:]]*([A-Za-z0-9.-]+):([0-9]+) ]]; then
         local binary="${BASH_REMATCH[1]}"
+        local pid="${BASH_REMATCH[2]}"
         local host="${BASH_REMATCH[3]}"
         local port="${BASH_REMATCH[4]}"
         local key="${binary}|${host}|${port}"
