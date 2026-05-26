@@ -43,19 +43,22 @@ confirm() {
 }
 
 # ---- detect mode ----
-SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
-# Resolve symlinks to get the real script location
-if command -v realpath >/dev/null 2>&1; then
-  SCRIPT_DIR=$(dirname "$(realpath "$SCRIPT_PATH")") 2>/dev/null || SCRIPT_DIR=""
-else
-  SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd) || SCRIPT_DIR=""
-fi
-
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/agentbox.sh" ]; then
-  MODE="local"
-  REPO_DIR="$SCRIPT_DIR"
-else
-  MODE="bootstrap"
+# We're in "local" mode IFF we were invoked as a real file (not via bash -c)
+# AND the file lives next to agentbox.sh. `bash -c "$(curl ...)"` sets
+# BASH_SOURCE[0] to "main" with no path, so we treat it as bootstrap.
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+MODE="bootstrap"
+REPO_DIR=""
+if [ -n "$SCRIPT_PATH" ] && [ "$SCRIPT_PATH" != "main" ] && [ -f "$SCRIPT_PATH" ]; then
+  if command -v realpath >/dev/null 2>&1; then
+    SCRIPT_DIR=$(dirname "$(realpath "$SCRIPT_PATH")")
+  else
+    SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)
+  fi
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/agentbox.sh" ]; then
+    MODE="local"
+    REPO_DIR="$SCRIPT_DIR"
+  fi
 fi
 
 log "mode: $MODE"
