@@ -539,25 +539,46 @@ inject_retry_to_agent() {
     local session
     session=$(tmux_session_for_sandbox "$sandbox")
     sleep "${AGENTBOX_RETRY_DELAY:-1}"
-    # `-l` sends the literal string (no key-name interpretation).
-    if tmux send-keys -t "$session" -l -- "$prompt" 2>/dev/null; then
-      # Pause so the agent's TUI finishes processing the burst of chars
-      # before we deliver Enter. Claude Code (and similar Ink-based TUIs)
-      # detect fast char-arrival as paste and switch to multi-line input
-      # mode; in that mode the first Enter inserts a newline instead of
-      # submitting. The delay below lets the paste-detect timeout clear.
-      sleep "${AGENTBOX_RETRY_SUBMIT_DELAY:-0.3}"
-      # Send Enter twice. Single-line mode: first Enter submits, second is
-      # an empty no-op. Multi-line mode: first Enter adds a newline, the
-      # second on the now-empty trailing line submits. Either way the
-      # message reaches the agent without the user having to touch anything.
-      if tmux send-keys -t "$session" Enter 2>/dev/null; then
-        sleep 0.1
-        tmux send-keys -t "$session" Enter 2>/dev/null || true
-        audit_emit "$sandbox" "retry" "INJECTED (tmux) $binary -> $host:$port"
-        echo "[watcher] retry injected via tmux send-keys (session: $session)" >&2
-        return 0
+
+    # Type char-by-char with a small per-char delay so the agent's TUI
+    # doesn't detect a paste burst. Claude Code (and similar Ink-based
+    # TUIs) switch to multi-line input mode when many chars arrive in a
+    # single read(), after which NO Enter combination submits — paste
+    # mode "swallows" subsequent newlines into the input. Pacing the
+    # injection like human typing avoids this entirely.
+    # Default per-char delay 0.02s → ~2s for a 100-char prompt.
+    local typing_delay="${AGENTBOX_RETRY_TYPING_DELAY:-0.02}"
+    echo "[watcher] typing retry prompt into $session ($(printf '%s' "$prompt" | wc -c | tr -d ' ') chars)" >&2
+    local i len=${#prompt}
+    local typed_ok=1
+    for ((i=0; i<len; i++)); do
+      if ! tmux send-keys -t "$session" -l -- "${prompt:$i:1}" 2>/dev/null; then
+        typed_ok=0; break
       fi
+      [ "$typing_delay" != "0" ] && sleep "$typing_delay"
+    done
+
+    if [ "$typed_ok" -eq 1 ]; then
+      sleep "${AGENTBOX_RETRY_SUBMIT_DELAY:-0.3}"
+      # Configurable submit-key sequence. Default Enter — works once
+      # char-by-char typing has kept us out of paste-detect mode.
+      # If the agent still doesn't submit, override:
+      #   AGENTBOX_RETRY_SUBMIT_KEY="Escape Enter"  # vim-style
+      #   AGENTBOX_RETRY_SUBMIT_KEY="C-Enter"       # Ctrl+Enter
+      #   AGENTBOX_RETRY_SUBMIT_KEY="M-Enter"       # Alt+Enter
+      #   AGENTBOX_RETRY_SUBMIT_KEY="none"          # don't submit;
+      #                                             # user presses Enter
+      local submit_spec="${AGENTBOX_RETRY_SUBMIT_KEY:-Enter}"
+      if [ "$submit_spec" != "none" ]; then
+        local k
+        for k in $submit_spec; do
+          tmux send-keys -t "$session" "$k" 2>/dev/null || true
+          sleep 0.05
+        done
+      fi
+      audit_emit "$sandbox" "retry" "INJECTED (tmux, typed) $binary -> $host:$port"
+      echo "[watcher] retry injected via tmux send-keys (session: $session, submit=$submit_spec)" >&2
+      return 0
     fi
     echo "[watcher] tmux send-keys failed; falling back to OS keystroke" >&2
   fi
@@ -2367,9 +2388,18 @@ so you don't have to type it yourself):
                                            xdotool, both focus-dependent.
   export AGENTBOX_RETRY_PROMPT="..."       Override the injected text.
   export AGENTBOX_RETRY_DELAY=1            Seconds to wait before sending
-                                           (gives the alerter dialog time
-                                           to dismiss in the keystroke path;
-                                           harmless on the tmux path).
+                                           (alerter dismiss + focus settle).
+  export AGENTBOX_RETRY_TYPING_DELAY=0.02  Per-char delay during the typing
+                                           (defeats paste-detect mode in
+                                           claude code; raising to 0.05 makes
+                                           it more obviously human-paced).
+  export AGENTBOX_RETRY_SUBMIT_DELAY=0.3   Pause after typing, before submit.
+  export AGENTBOX_RETRY_SUBMIT_KEY="Enter" Key(s) to send to submit.
+                                           Try if Enter doesn't submit:
+                                             "Escape Enter"  (vim-style)
+                                             "C-Enter"       (Ctrl+Enter)
+                                             "M-Enter"       (Alt+Enter)
+                                             "none"          (you press Enter)
   Caveat (keystroke fallback only): typing goes to whatever window has
   focus. The tmux send-keys path doesn't have this fragility.
 
