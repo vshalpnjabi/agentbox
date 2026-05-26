@@ -1809,7 +1809,7 @@ if is_truthy "${AGENTBOX_BYPASS:-}" && [ "$self_name" != "agentbox" ]; then
 fi
 
 # Management CLI
-if [ "$self_name" = "agentbox" ]; then
+if [ "$self_name" = "agentbox" ] || [ "$self_name" = "agentbox.sh" ]; then
   sub="${1:-help}"
   [ "$#" -gt 0 ] && shift
   case "$sub" in

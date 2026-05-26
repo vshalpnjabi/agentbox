@@ -184,7 +184,7 @@ chmod +x "$REPO_DIR/agentbox.sh"
 ok "agentbox installed"
 log "running doctor for a final health check"
 echo
-"$AGB_HOME/agentbox.sh" doctor || true
+"$AGB_BIN/agentbox" doctor || true
 echo
 
 cat <<EOF
