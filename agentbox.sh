@@ -743,24 +743,53 @@ cmd_auth_setup() {
       local tok_file="$HOME/.claude/.agentbox-oauth-token"
       mkdir -p "$(dirname "$tok_file")"
       log "claude: running '$real_claude setup-token' (interactive TUI)"
-      log "  sign in via the browser, then come back and paste the token below"
+      log "  follow the prompts; agentbox will auto-capture the token from setup-token's output"
       echo >&2
 
-      # Run setup-token with normal stdio so its interactive TUI works.
-      # Piping it would break the cursor positioning (the animation re-renders
-      # every frame as raw text).
-      "$real_claude" setup-token || err "claude setup-token failed (or was cancelled)"
+      # Wrap setup-token in `script` so it gets a real pty (TUI animation +
+      # cursor positioning work), while we silently capture the session
+      # transcript to a temp file. After exit, parse the transcript and
+      # extract the token via regex.
+      local session_file
+      session_file=$(mktemp -t agentbox-auth) || err "mktemp failed"
+      trap "rm -f \"$session_file\"" RETURN
 
-      echo >&2
-      echo >&2
-      printf 'Paste the long-lived token displayed above (or press Enter to skip): ' >&2
-      local tok
-      IFS= read -r tok
-      tok=$(printf '%s' "$tok" | tr -d "[:space:]")
-      if [ -z "$tok" ]; then
-        warn "claude: no token pasted; skipping save. Re-run 'agentbox auth setup claude' when ready."
-        return 0
+      if ! script -q "$session_file" "$real_claude" setup-token; then
+        err "claude setup-token failed or was cancelled"
       fi
+
+      echo >&2
+      # Extract the token: strip ANSI escapes, find long base64-ish strings,
+      # prefer ones that look like Anthropic OAuth tokens (often sk-ant-* or
+      # a long mixed-case alnum/underscore/dash blob). Take the last match.
+      local tok
+      tok=$(python3 - "$session_file" <<PYEXTRACT
+import re, sys
+data = open(sys.argv[1], "rb").read().decode("utf-8", errors="replace")
+# Strip ANSI CSI/OSC and other control chars
+data = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", data)
+data = re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\\\)", "", data)
+data = re.sub(r"[\x00-\x08\x0b-\x1f]", "", data)
+# Prefer sk-ant-* if present; fall back to long base64-ish strings
+m = re.findall(r"sk-ant-[A-Za-z0-9_-]{20,}", data)
+if not m:
+    m = [c for c in re.findall(r"[A-Za-z0-9_-]{50,}", data) if not c.lower().startswith("http")]
+print(m[-1] if m else "")
+PYEXTRACT
+)
+
+      if [ -z "$tok" ]; then
+        warn "claude: couldn't auto-extract token from setup-token output."
+        warn "  paste it manually (or Enter to skip):"
+        printf '  Token: ' >&2
+        IFS= read -r tok
+        tok=$(printf '%s' "$tok" | tr -d "[:space:]")
+      fi
+
+      if [ -z "$tok" ]; then
+        err "no token captured; nothing saved"
+      fi
+
       printf '%s\n' "$tok" > "$tok_file"
       chmod 600 "$tok_file"
       log "claude: saved long-lived token to $tok_file (${#tok} chars, mode 600)"
