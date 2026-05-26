@@ -1095,32 +1095,48 @@ cmd_notify() {
       chmod 600 "$AGB_NTFY_TOPIC_FILE"
       log "saved ntfy topic to $AGB_NTFY_TOPIC_FILE"
       echo
-      echo "Topic URL:    $AGB_NTFY_BASE/$topic"
+      echo "============================================================"
+      echo "Topic URL:  $AGB_NTFY_BASE/$topic"
+      echo "============================================================"
+      echo
+      echo "STEP 1: Subscribe to this topic on at least one device."
       echo
       if command -v qrencode >/dev/null 2>&1; then
-        echo "Scan this QR with the ntfy app to subscribe in one tap:"
+        echo "  Phone: scan this QR with the ntfy app to subscribe:"
         echo
         qrencode -t UTF8 -o - "$AGB_NTFY_BASE/$topic" 2>/dev/null
         echo
       else
-        echo "(install \`qrencode\` via \`brew install qrencode\` for a scannable QR)"
+        echo "  Phone: install qrencode (brew install qrencode) for a scannable QR."
         echo
       fi
-      echo "Or subscribe manually:"
-      echo "  iOS:     ntfy app -> + button -> paste topic '$topic'"
-      echo "  Android: ntfy app -> + button -> paste topic '$topic'"
-      echo "  Desktop: open $AGB_NTFY_BASE/$topic in a browser"
-      echo "  CLI:     curl -sS $AGB_NTFY_BASE/$topic/sse"
+      if [ "$(uname)" = "Darwin" ] && command -v open >/dev/null 2>&1; then
+        echo "  Mac:   opening $AGB_NTFY_BASE/$topic in your default browser."
+        echo "         Click 'Allow notifications' when the browser prompts."
+        echo "         For native Mac pushes: https://github.com/binwiederhier/ntfy/releases"
+        open "$AGB_NTFY_BASE/$topic" 2>/dev/null || true
+      else
+        echo "  Desktop: open $AGB_NTFY_BASE/$topic in a browser; allow notifications."
+      fi
+      echo "  Manual: paste topic '$topic' into the ntfy app's + button."
       echo
-      echo "Sending a test notification..."
-      curl -fsS -X POST \
-        -H "Title: agentbox: setup complete" \
-        -H "Priority: default" \
-        -H "Tags: white_check_mark" \
-        -d "approvals will arrive here. Opt-out: AGENTBOX_NO_NTFY=1" \
-        "$AGB_NTFY_BASE/$topic" >/dev/null 2>&1 \
-        && echo "  ✓ test notification sent (you should see it shortly)" \
-        || warn "  test notification failed (network issue?)"
+      echo "STEP 2: Once a device is subscribed, press Enter to send a test."
+      echo "        (Ctrl+C to skip)"
+      printf '       > ' >&2
+      IFS= read -r _ || true
+      echo
+      echo "Sending test notification..."
+      if curl -fsS -X POST \
+            -H "Title: agentbox: setup complete" \
+            -H "Priority: default" \
+            -H "Tags: white_check_mark" \
+            -d "approvals will arrive here. Opt-out: AGENTBOX_NO_NTFY=1" \
+            "$AGB_NTFY_BASE/$topic" >/dev/null 2>&1; then
+        echo "  test notification sent. Check your subscribed devices."
+        echo "  If you do not see it: run 'agentbox notify open' or rescan the QR."
+      else
+        warn "  test notification POST failed (network issue?)"
+      fi
       ;;
     status)
       local t
@@ -1148,8 +1164,23 @@ cmd_notify() {
         echo "(already cleared)"
       fi
       ;;
+    open|browser)
+      local t
+      t=$(ntfy_get_topic) || err "no topic configured (run: agentbox notify setup)"
+      command -v open >/dev/null 2>&1 || err "no 'open' command available"
+      log "opening $AGB_NTFY_BASE/$t in default browser"
+      open "$AGB_NTFY_BASE/$t" 2>/dev/null || err "could not open browser"
+      ;;
+    qr)
+      local t
+      t=$(ntfy_get_topic) || err "no topic configured (run: agentbox notify setup)"
+      command -v qrencode >/dev/null 2>&1 || err "qrencode not installed (brew install qrencode)"
+      qrencode -t UTF8 -o - "$AGB_NTFY_BASE/$t"
+      echo
+      echo "Topic URL: $AGB_NTFY_BASE/$t"
+      ;;
     *)
-      err "usage: agentbox notify {setup|status|test|clear}"
+      err "usage: agentbox notify {setup|status|test|open|qr|clear}"
       ;;
   esac
 }
