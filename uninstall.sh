@@ -2,7 +2,7 @@
 # agentbox uninstaller — tiered removal so users can do partial or full uninstall.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/uninstall.sh | bash
 #   ~/src/agentbox/uninstall.sh           # interactive, asks per-tier
 #   ~/src/agentbox/uninstall.sh --all     # remove everything (still asks for one final confirmation)
 #   ~/src/agentbox/uninstall.sh --yes     # non-interactive; remove default tier (shims + install dir)

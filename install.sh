@@ -2,10 +2,10 @@
 # agentbox installer — works either as:
 #
 #   1) A standalone curl-pipe-bash bootstrapper (no checkout needed):
-#        curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.sh | bash
+#        curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh | bash
 #
 #   2) A local install from an existing checkout:
-#        git clone https://github.com/vshlpunjabi/agentbox.git ~/src/agentbox
+#        git clone https://github.com/vshalpnjabi/agentbox.git ~/src/agentbox
 #        ~/src/agentbox/install.sh
 #
 # It auto-detects which mode it's in via the presence of agentbox.sh next to itself.
@@ -70,7 +70,7 @@ log "mode: $MODE"
 # ---- mode 1: bootstrap (curl-pipe-bash) — fetch the repo, then re-run self ----
 if [ "$MODE" = "bootstrap" ]; then
   PREFIX="${AGENTBOX_PREFIX:-$HOME/src}"
-  REPO_URL="${AGENTBOX_REPO:-https://github.com/vshlpunjabi/agentbox.git}"
+  REPO_URL="${AGENTBOX_REPO:-https://github.com/vshalpnjabi/agentbox.git}"
   BRANCH="${AGENTBOX_BRANCH:-main}"
   TARGET="$PREFIX/agentbox"
 
@@ -218,6 +218,6 @@ cat <<EOF
 
   Bypass agentbox for one invocation: AGENTBOX_BYPASS=1 claude
 
-  Source + docs: https://github.com/vshlpunjabi/agentbox
+  Source + docs: https://github.com/vshalpnjabi/agentbox
 
 EOF

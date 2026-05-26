@@ -37,18 +37,18 @@ agentbox runs natively on **macOS** and **Linux**. On **Windows** it runs inside
 
 | Platform | One-liner |
 |---|---|
-| **macOS** | `curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.sh \| bash` |
+| **macOS** | `curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh \| bash` |
 | **Linux** | same as macOS (alerter is replaced with zenity / notify-send fallbacks) |
 | **WSL (from inside Linux)** | same as Linux |
-| **Windows PowerShell** | `iwr https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.ps1 \| iex` |
-| **Windows CMD** | `curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.bat -o install.bat && install.bat` |
+| **Windows PowerShell** | `iwr https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.ps1 \| iex` |
+| **Windows CMD** | `curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.bat -o install.bat && install.bat` |
 
 The bootstrap auto-installs missing Homebrew/apt deps (openshell, mutagen, alerter or zenity, qrencode, jq), clones the repo to `~/src/agentbox`, and runs the local installer. Add the printed PATH line to your shell rc and you're done.
 
 **Or manually:**
 
 ```bash
-git clone https://github.com/vshlpunjabi/agentbox.git ~/src/agentbox
+git clone https://github.com/vshalpnjabi/agentbox.git ~/src/agentbox
 ~/src/agentbox/install.sh
 ```
 
@@ -74,9 +74,9 @@ Then open a new shell, and `claude` / `codex` / `opencode` will route through ag
 
 | Platform | One-liner |
 |---|---|
-| **macOS / Linux / WSL** | `curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.sh \| bash` |
-| **Windows PowerShell**  | `iwr https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.ps1 \| iex` |
-| **Windows CMD**         | `curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.bat -o uninstall.bat && uninstall.bat` |
+| **macOS / Linux / WSL** | `curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/uninstall.sh \| bash` |
+| **Windows PowerShell**  | `iwr https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/uninstall.ps1 \| iex` |
+| **Windows CMD**         | `curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/uninstall.bat -o uninstall.bat && uninstall.bat` |
 
 Or from your local checkout:
 

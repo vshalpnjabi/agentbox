@@ -1159,7 +1159,7 @@ cmd_uninstall() {
   repo_dir=$(dirname "$(readlink -f "$AGB_ROOT/agentbox.sh" 2>/dev/null || echo "$AGB_ROOT/agentbox.sh")")
   local script="$repo_dir/uninstall.sh"
   if [ ! -x "$script" ]; then
-    err "uninstall.sh not found at $script — fetch it: curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.sh | bash"
+    err "uninstall.sh not found at $script — fetch it: curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/uninstall.sh | bash"
   fi
   exec "$script" "$@"
 }

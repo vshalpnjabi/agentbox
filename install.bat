@@ -2,11 +2,11 @@
 REM agentbox installer for Windows CMD — invokes install.ps1.
 REM
 REM Usage:
-REM   curl -fsSL -o install.bat https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.bat
+REM   curl -fsSL -o install.bat https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.bat
 REM   install.bat
 REM
 REM Or directly:
-REM   curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.bat | cmd
+REM   curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.bat | cmd
 
 setlocal
 
@@ -18,7 +18,7 @@ if errorlevel 1 (
 
 echo install.bat: fetching install.ps1 and executing in PowerShell
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "iwr https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.ps1 -UseBasicParsing | iex"
+  "iwr https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.ps1 -UseBasicParsing | iex"
 
 if errorlevel 1 (
     echo install.bat: install.ps1 returned errorlevel %errorlevel%

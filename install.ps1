@@ -2,7 +2,7 @@
 # agentbox inside it.
 #
 # Usage (PowerShell, run as user):
-#   iwr https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.ps1 | iex
+#   iwr https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.ps1 | iex
 #
 # Or downloaded:
 #   .\install.ps1
@@ -73,7 +73,7 @@ Ok "WSL distro(s) found: $($distros -join ', ')"
 
 # Run agentbox install.sh inside the default WSL distro
 $yesArg = if ($Yes) { "AGENTBOX_YES=1 " } else { "" }
-$cmd = "${yesArg}bash -c `"`$(curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.sh)`""
+$cmd = "${yesArg}bash -c `"`$(curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh)`""
 
 Log "running agentbox install inside WSL..."
 Log "  $cmd"
@@ -111,6 +111,6 @@ Next steps (Windows):
       terminal prompt. Install zenity inside WSL for graphical Allow/Deny:
         wsl sudo apt install -y zenity libnotify-bin
 
-  Source + docs: https://github.com/vshlpunjabi/agentbox
+  Source + docs: https://github.com/vshalpnjabi/agentbox
 
 "@

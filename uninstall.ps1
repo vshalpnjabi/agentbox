@@ -1,7 +1,7 @@
 # agentbox uninstaller for Windows (PowerShell) — proxies through WSL.
 #
 # Usage:
-#   iwr https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.ps1 | iex
+#   iwr https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/uninstall.ps1 | iex
 
 param([switch]$All, [switch]$Yes)
 
@@ -14,6 +14,6 @@ $flag = ""
 if ($All) { $flag += " --all" }
 if ($Yes) { $flag += " --yes" }
 
-$cmd = "bash -c `"`$(curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.sh)`"$flag"
+$cmd = "bash -c `"`$(curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/uninstall.sh)`"$flag"
 Log "running uninstall inside WSL"
 wsl bash -c $cmd
