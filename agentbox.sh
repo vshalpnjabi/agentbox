@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Embedded version. Bump when cutting a release; tag the commit as v<version>.
+AGENTBOX_VERSION="0.1.0"
+
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"
 AGB_STATE_ROOT="$AGB_ROOT/state"
@@ -1153,6 +1156,27 @@ cmd_auth_clear() {
   esac
 }
 
+cmd_version() {
+  # Print agentbox version + git rev when running from a tracked checkout.
+  local rev=""
+  local repo_dir
+  repo_dir=$(dirname "$(readlink -f "$AGB_ROOT/agentbox.sh" 2>/dev/null || echo "$AGB_ROOT/agentbox.sh")")
+  if [ -d "$repo_dir/.git" ] && command -v git >/dev/null 2>&1; then
+    rev=$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || true)
+    local dirty=""
+    if [ -n "$rev" ] && ! git -C "$repo_dir" diff --quiet HEAD 2>/dev/null; then
+      dirty="-dirty"
+    fi
+    rev="${rev}${dirty}"
+  fi
+  if [ -n "$rev" ]; then
+    printf 'agentbox %s (%s)\n' "$AGENTBOX_VERSION" "$rev"
+  else
+    printf 'agentbox %s\n' "$AGENTBOX_VERSION"
+  fi
+  printf '  source: https://github.com/vshalpnjabi/agentbox\n'
+}
+
 cmd_uninstall() {
   # Locate uninstall.sh (next to agentbox.sh, since they ship together) and exec it.
   local repo_dir
@@ -1175,7 +1199,7 @@ cmd_doctor() {
   local pass=0 fail=0 unknown=0
   local maybe_open_pane=()
 
-  printf '\nagentbox doctor\n'
+  printf '\nagentbox doctor — version %s\n' "$AGENTBOX_VERSION"
   printf '%s\n' "---------------"
 
   _row() {
@@ -1650,8 +1674,8 @@ cmd_name() {
 }
 
 cmd_help() {
+  printf 'agentbox %s - per-workspace openshell sandboxes for AI coding agents\n' "$AGENTBOX_VERSION" >&2
   cat >&2 <<'EOF'
-agentbox - per-workspace openshell sandboxes for AI coding agents
 
 Management:
   agentbox status              List managed sandboxes, sync sessions, persisted state
@@ -1828,7 +1852,8 @@ if [ "$self_name" = "agentbox" ] || [ "$self_name" = "agentbox.sh" ]; then
     auth)          cmd_auth "$@" ;;
     destroy) cmd_destroy "$@" ;;
     __watch) cmd_watch_internal "$@" ;;
-    help|-h|--help) cmd_help ;;
+    help|-h|--help)        cmd_help ;;
+    version|-v|-V|--version) cmd_version ;;
     *) err "unknown subcommand '$sub' (try: agentbox help)" ;;
   esac
   exit 0
