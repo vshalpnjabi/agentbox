@@ -465,6 +465,78 @@ APPLESCRIPT
   echo "Deny"
 }
 
+# Type a retry prompt into the agent's TUI. The watcher path catches 403s
+# AFTER the agent has already seen them, so on Allow the agent needs to be told
+# to redo the failed action. The only realistic mechanism without an inside-the-
+# sandbox cooperative agent is OS-level keystroke injection into the frontmost
+# window:
+#   macOS  — osascript via System Events (needs Accessibility, already required
+#            for the alerter prompt UI; agentbox doctor checks for it).
+#   Linux  — xdotool type (X11 only; Wayland has no equivalent).
+#   other  — print the prompt and let the user paste it manually.
+#
+# Caveat: keystroke injection types into whatever has focus. A brief sleep
+# tries to let the alerter dialog finish dismissing so focus returns to the
+# terminal, but if the user has switched apps, the keystroke goes elsewhere.
+# Opt-in only (AGENTBOX_FORCE_RETRY=1) precisely because of this fragility.
+inject_retry_to_agent() {
+  local sandbox="$1" host="$2" port="$3" binary="$4"
+  local prompt
+  prompt="${AGENTBOX_RETRY_PROMPT:-The previous request to ${host}:${port} was just approved by the user. Please retry the action that failed.}"
+
+  case "$(uname)" in
+    Darwin)
+      if ! command -v osascript >/dev/null 2>&1; then
+        echo "[watcher] osascript missing; cannot auto-inject retry — paste this:" >&2
+        echo "  $prompt" >&2
+        return 0
+      fi
+      # Brief settle delay for window focus to return to the terminal after
+      # the alerter notification dismisses. Tunable via AGENTBOX_RETRY_DELAY.
+      sleep "${AGENTBOX_RETRY_DELAY:-1}"
+      # Escape backslashes and double-quotes for the AppleScript string literal.
+      local esc
+      esc=$(printf '%s' "$prompt" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+      # Type the prompt, then press Return (key code 36). System Events sends
+      # the keystrokes to the frontmost application.
+      if osascript \
+          -e "tell application \"System Events\" to keystroke \"$esc\"" \
+          -e 'tell application "System Events" to key code 36' \
+          2>/dev/null; then
+        audit_emit "$sandbox" "retry" "INJECTED (osascript) $binary -> $host:$port"
+        echo "[watcher] retry injected via keystroke (frontmost window)" >&2
+      else
+        echo "[watcher] retry injection failed (Accessibility permission?) — paste manually:" >&2
+        echo "  $prompt" >&2
+        audit_emit "$sandbox" "retry" "INJECT_FAILED (osascript) $binary -> $host:$port"
+      fi
+      ;;
+    Linux)
+      if command -v xdotool >/dev/null 2>&1; then
+        sleep "${AGENTBOX_RETRY_DELAY:-1}"
+        if xdotool type --delay 10 -- "$prompt" 2>/dev/null && \
+           xdotool key Return 2>/dev/null; then
+          audit_emit "$sandbox" "retry" "INJECTED (xdotool) $binary -> $host:$port"
+          echo "[watcher] retry injected via xdotool (X11 frontmost window)" >&2
+        else
+          echo "[watcher] xdotool failed (Wayland? not focused?) — paste manually:" >&2
+          echo "  $prompt" >&2
+          audit_emit "$sandbox" "retry" "INJECT_FAILED (xdotool) $binary -> $host:$port"
+        fi
+      else
+        echo "[watcher] xdotool not installed; copy/paste:" >&2
+        echo "  $prompt" >&2
+        audit_emit "$sandbox" "retry" "INJECT_SKIPPED (no xdotool) $binary -> $host:$port"
+      fi
+      ;;
+    *)
+      echo "[watcher] retry injection not supported on $(uname); copy/paste:" >&2
+      echo "  $prompt" >&2
+      audit_emit "$sandbox" "retry" "INJECT_SKIPPED ($(uname)) $binary -> $host:$port"
+      ;;
+  esac
+}
+
 # The actual watcher loop, run in the background. Invoked as `agentbox __watch <sandbox>`.
 cmd_watch_internal() {
   local sandbox="${1:-}"
@@ -524,10 +596,19 @@ cmd_watch_internal() {
               --wait >/dev/null 2>&1; then
             audit_emit "$sandbox" "decision" "ALLOW $binary -> $host:$port (policy hot-reloaded by user)"
             echo "[watcher] approved: $host:$port for $binary (policy hot-reloaded)" >&2
-            # Nudge: the agent already saw the 403 before approval. Until openshell
-            # gets a hold-and-ask enforcement mode (deferred — see TODO), the user
-            # has to tell the agent to retry the failed action.
-            osascript -e "display notification \"$host:$port allowed. Tell agent to retry.\" with title \"agentbox\"" 2>/dev/null || true
+            # The agent already saw the 403 before approval (this is the watcher
+            # path; the decide-server path doesn't have this problem). Two modes
+            # for telling the agent to retry:
+            #   AGENTBOX_FORCE_RETRY=1  → keystroke-inject a retry prompt into
+            #                             the frontmost window (Accessibility
+            #                             permission needed on macOS).
+            #   default                 → show a passive notification; user
+            #                             types the retry themselves.
+            if is_truthy "${AGENTBOX_FORCE_RETRY:-}"; then
+              inject_retry_to_agent "$sandbox" "$host" "$port" "$binary"
+            else
+              osascript -e "display notification \"$host:$port allowed. Tell agent to retry.\" with title \"agentbox\"" 2>/dev/null || true
+            fi
           else
             echo "[watcher] approval failed: openshell policy update returned non-zero" >&2
           fi
@@ -1555,6 +1636,17 @@ cmd_doctor() {
     _row info "python3" "optional (only needed for AGENTBOX_DECIDE_SERVER)"
   fi
 
+  # xdotool — only relevant for Linux force-retry keystroke injection.
+  if [ "$(uname)" = "Linux" ]; then
+    if command -v xdotool >/dev/null 2>&1; then
+      _row ok "xdotool"
+    elif is_truthy "${AGENTBOX_FORCE_RETRY:-}"; then
+      _row bad "xdotool" "required by AGENTBOX_FORCE_RETRY on Linux (X11); install xdotool"
+    else
+      _row info "xdotool" "optional (only needed for AGENTBOX_FORCE_RETRY on Linux)"
+    fi
+  fi
+
   # ---- 2. Docker / compute driver ----
   if command -v docker >/dev/null 2>&1; then
     if docker info >/dev/null 2>&1; then
@@ -2105,6 +2197,20 @@ Approval prompts (macOS):
   Deny → agent resumes and sees the 403. The (binary, host, port) is kept
   in ~/.local/share/agentbox/state/<sandbox>/watcher-seen.txt so you're
   not asked again for the same tuple. Opt out with AGENTBOX_NO_WATCH=1.
+
+Force-retry (auto-inject "retry the failed action" into the agent on Allow,
+so you don't have to type it yourself):
+  export AGENTBOX_FORCE_RETRY=1            Enable. macOS uses osascript
+                                           keystroke into the frontmost
+                                           window (Accessibility perm
+                                           required); Linux uses xdotool.
+  export AGENTBOX_RETRY_PROMPT="..."       Override the injected text.
+  export AGENTBOX_RETRY_DELAY=1            Seconds to wait before typing
+                                           (gives focus time to return to
+                                           the terminal after Allow click).
+  Caveat: typing goes to whatever window has focus. If you've switched apps,
+  the keystroke lands there. Default off; default behavior is a passive
+  notification "tell agent to retry" instead.
 
 Session continuity:
   /sandbox/.claude/projects (claude conversation history) is live-synced to

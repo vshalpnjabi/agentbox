@@ -168,6 +168,29 @@ Upstream does not yet send any traffic to it. Until openshell ships:
   `watcher-seen.txt` because the decide path must remember the *direction* (allow vs
   deny) while the watcher only needs the *fact* of a prior decision.
 
+### 11. Force-retry uses OS keystroke injection — keep it opt-in
+
+`AGENTBOX_FORCE_RETRY=1` makes the watcher's Allow branch type a retry prompt
+into the frontmost window (osascript on macOS, xdotool on Linux X11). It is
+fundamentally agent-agnostic because it goes through the OS, not the agent —
+no SDK hooks, no protocol coupling. The cost is **fragility**:
+
+- Typing targets whatever has focus. If the user switched apps after clicking
+  Allow, the prompt lands in the wrong place. Keep the default OFF.
+- Wayland and Windows have no equivalent without elevated privileges; the
+  helper degrades to "paste this prompt manually" on those.
+- The text is shell-escaped for AppleScript via sed; do NOT interpolate user-
+  controllable strings into the keystroke template without similar escaping,
+  or you create a local code-injection vector.
+- The 1-second delay (`AGENTBOX_RETRY_DELAY`) before typing is load-bearing —
+  it lets focus return to the terminal after the alerter dialog dismisses.
+  Don't drop it without testing.
+
+The decide-server path doesn't need retry-injection at all because openshell
+holds the connection open until /decide returns — the agent sees a clean 200
+on Allow, not a 403-then-retry. Force-retry is strictly a watcher-path bandaid
+until upstream Interactive enforcement lands.
+
 ## Building / testing
 
 There's no test suite. Iteration is manual:
