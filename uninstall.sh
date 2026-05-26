@@ -45,10 +45,14 @@ err()  { printf '%suninstall:%s %s\n' "$c_red"    "$c_reset" "$*" >&2; exit 1; }
 confirm() {
   local prompt="$1"
   [ "$YES" -eq 1 ] && return 0
-  [ ! -t 0 ] && return 1   # non-interactive: default NO for safety on uninstall
-  printf '%s [y/N] ' "$prompt"
-  local ans; read -r ans
-  case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  # Prefer /dev/tty so curl-pipe-bash still works interactively (stdin = pipe).
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf '%s [y/N] ' "$prompt" > /dev/tty
+    local ans
+    IFS= read -r ans < /dev/tty
+    case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  fi
+  return 1   # No tty at all: default NO for safety on uninstall
 }
 
 AGB_HOME="${AGB_HOME:-$HOME/.local/share/agentbox}"

@@ -36,10 +36,14 @@ esac
 confirm() {
   local prompt="$1"
   [ "${AGENTBOX_YES:-0}" = "1" ] && return 0
-  [ ! -t 0 ] && return 0
-  printf '%s [Y/n] ' "$prompt"
-  local ans; read -r ans
-  case "$ans" in n|N|no|NO) return 1 ;; *) return 0 ;; esac
+  # Prefer /dev/tty so curl-pipe-bash still asks interactively (stdin = pipe).
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf '%s [Y/n] ' "$prompt" > /dev/tty
+    local ans
+    IFS= read -r ans < /dev/tty
+    case "$ans" in n|N|no|NO) return 1 ;; *) return 0 ;; esac
+  fi
+  return 0   # No tty: default YES for install (the curl-pipe-bash assumption)
 }
 
 # ---- detect mode ----
