@@ -180,12 +180,16 @@ mutagen_state_ensure() {
 }
 
 # ---- Approval watcher (macOS) ----
-# TODO: hold-and-ask enforcement mode. Today the watcher reacts AFTER the
-# proxy has 403'd the request, so the agent must be told to retry. A clean
-# fix requires extending openshell's proxy with a third enforcement mode
-# (e.g., "interactive") that holds the connection open while consulting
-# an external decision endpoint. This file's prompt_approval would then
-# serve that endpoint via a unix socket or HTTP. Deferred per user.
+# Two orthogonal approval paths coexist:
+#   1. Watcher (this section): tails openshell logs and reacts AFTER a deny.
+#      Always on (macOS), independent of openshell version. The agent has
+#      already seen the 403 by the time the user clicks Allow, so retry is
+#      required.
+#   2. Decide-server (below cmd_watch_internal): host-side HTTP endpoint
+#      that openshell's Interactive enforcement mode (forthcoming, see
+#      vshalpnjabi/OpenShell `interactive-enforcement` branch) consults
+#      BEFORE denying. First attempt succeeds on Allow; no retry. Gated
+#      behind AGENTBOX_DECIDE_SERVER=1 since upstream support is pending.
 # Background process that tails openshell logs for NET:OPEN DENIED events and
 # prompts the user (osascript display dialog) on the first occurrence of each
 # (binary, host:port) tuple. Approval adds the endpoint to the workspace policy
@@ -540,6 +544,194 @@ cmd_watch_internal() {
     # Reconnect after brief pause
     sleep 2
   done
+}
+
+# ---- Decide-server (host-side HTTP endpoint for openshell Interactive mode) ----
+# Spec: github.com/vshalpnjabi/OpenShell `interactive-enforcement` branch,
+# docs/interactive-enforcement/DESIGN.md.
+#
+# Lifecycle is per-sandbox (mirrors the watcher): one HTTP server, deterministic
+# port from sandbox-name hash, pid/port/log files in the watcher state dir.
+# Currently opt-in via AGENTBOX_DECIDE_SERVER=1 — defaults off until openshell
+# Interactive mode actually exists upstream.
+
+decide_server_pid_file()  { echo "$(watcher_state_dir "$1")/decide-server.pid"; }
+decide_server_port_file() { echo "$(watcher_state_dir "$1")/decide-server.port"; }
+decide_server_log_file()  { echo "$(watcher_state_dir "$1")/decide-server.log"; }
+decide_server_seen_file() { echo "$(watcher_state_dir "$1")/decide-seen.txt"; }
+
+# Resolve the directory of agentbox.sh, following symlinks (portable across
+# macOS where readlink(1) lacks -f). $AGB_ROOT/agentbox.sh is a symlink into
+# this repo, so the python script lives alongside the resolved target.
+_resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  while [ -L "$src" ]; do
+    local dir
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  (cd -P "$(dirname "$src")" && pwd)
+}
+
+decide_server_python_script() {
+  echo "$(_resolve_script_dir)/bin/agentbox-decide.py"
+}
+
+# Map sandbox name → deterministic port in [49152, 65535] (IANA dynamic range).
+decide_server_port_for_sandbox() {
+  local h
+  h=$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)
+  echo $((16#$h % 16384 + 49152))
+}
+
+decide_server_running() {
+  local pf
+  pf=$(decide_server_pid_file "$1")
+  [ -f "$pf" ] || return 1
+  local pid
+  pid=$(cat "$pf" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+decide_server_ensure() {
+  local sandbox="$1"
+  is_truthy "${AGENTBOX_DECIDE_SERVER:-}" || return 0
+
+  local py
+  py=$(decide_server_python_script)
+  if [ ! -f "$py" ]; then
+    warn "decide-server script not found at $py; skipping"
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 not on PATH; decide-server skipped (install python3 or unset AGENTBOX_DECIDE_SERVER)"
+    return 0
+  fi
+
+  local pf port_file log_file
+  pf=$(decide_server_pid_file "$sandbox")
+  port_file=$(decide_server_port_file "$sandbox")
+  log_file=$(decide_server_log_file "$sandbox")
+  mkdir -p "$(dirname "$pf")"
+
+  if [ -f "$pf" ]; then
+    local existing_pid
+    existing_pid=$(cat "$pf" 2>/dev/null)
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      log "decide-server already running (pid $existing_pid) for $sandbox"
+      return 0
+    fi
+    log "removing stale decide-server pid file (pid $existing_pid not alive)"
+    rm -f "$pf"
+  fi
+
+  local port
+  port=$(decide_server_port_for_sandbox "$sandbox")
+
+  # Handler invokes agentbox.sh's __decide subcommand. The python server runs
+  # this via /bin/sh -c, so we hand it a single shell-quoted command line.
+  local self_path="${BASH_SOURCE[0]}"
+  local handler
+  handler=$(printf '%q __decide %q' "$self_path" "$sandbox")
+
+  log "starting decide-server for $sandbox on 127.0.0.1:$port"
+  nohup python3 "$py" \
+    --port "$port" \
+    --bind 127.0.0.1 \
+    --sandbox "$sandbox" \
+    --handler "$handler" \
+    --pid-file "$pf" \
+    >"$log_file" 2>&1 &
+  disown 2>/dev/null || true
+
+  printf '%s\n' "$port" > "$port_file"
+}
+
+decide_server_stop() {
+  local sandbox="$1"
+  local pf
+  pf=$(decide_server_pid_file "$sandbox")
+  if [ -f "$pf" ]; then
+    local pid
+    pid=$(cat "$pf" 2>/dev/null)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    rm -f "$pf"
+  fi
+  rm -f "$(decide_server_port_file "$sandbox")"
+}
+
+# Per-request handler. Reads request JSON on stdin (see DESIGN.md wire protocol),
+# returns response JSON on stdout. Invoked once per /decide call by the python
+# server subprocess. Cached decisions live in decide-seen.txt with KEY|DECISION
+# format, separate from the watcher's seen-list since the decide path needs to
+# remember the *direction* of the prior decision (allow vs deny).
+cmd_decide_handler_internal() {
+  local sandbox="${1:-${AGENTBOX_DECIDE_SANDBOX:-}}"
+  if [ -z "$sandbox" ]; then
+    printf '{"decision":"deny","reason":"no sandbox in handler invocation"}\n'
+    return 0
+  fi
+  local state_dir seen_file
+  state_dir=$(watcher_state_dir "$sandbox")
+  seen_file=$(decide_server_seen_file "$sandbox")
+  mkdir -p "$state_dir"
+  touch "$seen_file"
+
+  local body
+  body=$(cat)
+  local host port binary req_id
+  host=$(printf '%s' "$body"   | jq -r '.host // empty' 2>/dev/null || echo "")
+  port=$(printf '%s' "$body"   | jq -r '.port // empty' 2>/dev/null || echo "")
+  binary=$(printf '%s' "$body" | jq -r '.binary // empty' 2>/dev/null || echo "")
+  req_id=$(printf '%s' "$body" | jq -r '.request_id // empty' 2>/dev/null || echo "")
+
+  if [ -z "$host" ] || [ -z "$port" ] || [ -z "$binary" ]; then
+    audit_emit "$sandbox" "decide" "BAD_REQUEST ${req_id:-?}: host='$host' port='$port' binary='$binary'"
+    printf '{"decision":"deny","reason":"missing host/port/binary"}\n'
+    return 0
+  fi
+
+  local key="${binary}|${host}|${port}"
+  local cached=""
+  if [ -s "$seen_file" ]; then
+    cached=$(awk -F '|' -v k="$key" '$1"|"$2"|"$3 == k {d=$4} END{print d}' "$seen_file" || true)
+  fi
+  case "$cached" in
+    allow)
+      audit_emit "$sandbox" "decide" "CACHED_ALLOW ${req_id:-?}: $binary -> $host:$port"
+      printf '{"decision":"allow","reason":"cached"}\n'
+      return 0
+      ;;
+    deny)
+      audit_emit "$sandbox" "decide" "CACHED_DENY ${req_id:-?}: $binary -> $host:$port"
+      printf '{"decision":"deny","reason":"cached"}\n'
+      return 0
+      ;;
+  esac
+
+  audit_emit "$sandbox" "decide" "PROMPT ${req_id:-?}: $binary -> $host:$port"
+  local response
+  response=$(prompt_approval "$sandbox" "$host" "$port" "$binary")
+
+  case "$response" in
+    Allow)
+      printf '%s|allow\n' "$key" >> "$seen_file"
+      audit_emit "$sandbox" "decide" "USER_ALLOW ${req_id:-?}: $binary -> $host:$port"
+      printf '{"decision":"allow","reason":"user approved"}\n'
+      ;;
+    Deny)
+      printf '%s|deny\n' "$key" >> "$seen_file"
+      audit_emit "$sandbox" "decide" "USER_DENY ${req_id:-?}: $binary -> $host:$port"
+      printf '{"decision":"deny","reason":"user denied"}\n'
+      ;;
+    *)
+      # Timeout / no UI: deny but don't cache, so the next attempt re-prompts.
+      audit_emit "$sandbox" "decide" "TIMEOUT ${req_id:-?}: $binary -> $host:$port (fail-closed)"
+      printf '{"decision":"deny","reason":"prompt timed out"}\n'
+      ;;
+  esac
+  return 0
 }
 
 load_config() {
@@ -912,6 +1104,7 @@ cmd_stop() {
   local name="${1:-$(workspace_sandbox_name)}"
   log "stopping mutagen sync + watcher for $name (sandbox + state preserved)"
   watcher_stop "$name"
+  decide_server_stop "$name"
   mutagen sync terminate "$name" >/dev/null 2>&1 || true
   mutagen sync terminate "${name}-state" >/dev/null 2>&1 || true
 }
@@ -932,6 +1125,7 @@ cmd_destroy() {
     log "destroying $name (sandbox + sync + ssh block; host state preserved at $AGB_STATE_ROOT/$name)"
   fi
   watcher_stop "$name"
+  decide_server_stop "$name"
   mutagen sync terminate "$name" >/dev/null 2>&1 || true
   mutagen sync terminate "${name}-state" >/dev/null 2>&1 || true
   openshell sandbox delete "$name" >/dev/null 2>&1 || true
@@ -955,6 +1149,131 @@ cmd_pull() {
   log "flushing mutagen sync $name (workspace + state)"
   mutagen sync flush "$name" 2>/dev/null || true
   mutagen sync flush "${name}-state" 2>/dev/null || true
+}
+
+cmd_decide() {
+  # Subcommands under `agentbox decide`: status | test | logs | seen | start | stop.
+  local sub="${1:-status}"
+  [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    status) cmd_decide_status "$@" ;;
+    test)   cmd_decide_test "$@" ;;
+    logs)   cmd_decide_logs "$@" ;;
+    seen)   cmd_decide_seen "$@" ;;
+    start)  cmd_decide_start "$@" ;;
+    stop)   cmd_decide_stop "$@" ;;
+    *) err "unknown 'decide' subcommand '$sub' (try: agentbox decide status|test|logs|seen|start|stop)" ;;
+  esac
+}
+
+cmd_decide_status() {
+  local sandbox="${1:-$(workspace_sandbox_name)}"
+  printf 'sandbox: %s\n' "$sandbox"
+  if is_truthy "${AGENTBOX_DECIDE_SERVER:-}"; then
+    printf 'AGENTBOX_DECIDE_SERVER: enabled\n'
+  else
+    printf 'AGENTBOX_DECIDE_SERVER: disabled (export AGENTBOX_DECIDE_SERVER=1 to enable)\n'
+  fi
+  if decide_server_running "$sandbox"; then
+    local pid port
+    pid=$(cat "$(decide_server_pid_file "$sandbox")" 2>/dev/null)
+    port=$(cat "$(decide_server_port_file "$sandbox")" 2>/dev/null)
+    printf 'status: running\n'
+    printf 'pid: %s\n' "$pid"
+    printf 'port: %s\n' "$port"
+    printf 'endpoint (from host): http://127.0.0.1:%s/decide\n' "$port"
+    printf 'log: %s\n' "$(decide_server_log_file "$sandbox")"
+  else
+    printf 'status: not running\n'
+    local port
+    port=$(decide_server_port_for_sandbox "$sandbox")
+    printf 'would-use-port: %s (deterministic from sandbox hash)\n' "$port"
+  fi
+}
+
+cmd_decide_start() {
+  # Manual start (the agent dispatch starts this automatically when
+  # AGENTBOX_DECIDE_SERVER=1, but this lets you exercise the path without
+  # launching an agent).
+  local sandbox="${1:-$(workspace_sandbox_name)}"
+  if ! is_truthy "${AGENTBOX_DECIDE_SERVER:-}"; then
+    warn "AGENTBOX_DECIDE_SERVER is not set — starting anyway (this one-off invocation)"
+    AGENTBOX_DECIDE_SERVER=1 decide_server_ensure "$sandbox"
+  else
+    decide_server_ensure "$sandbox"
+  fi
+  # Python forks then writes pid+port; poll briefly so status shows the
+  # running server rather than "not running" immediately after start.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    decide_server_running "$sandbox" && break
+    sleep 0.2
+  done
+  cmd_decide_status "$sandbox"
+}
+
+cmd_decide_stop() {
+  local sandbox="${1:-$(workspace_sandbox_name)}"
+  decide_server_stop "$sandbox"
+  log "decide-server stopped for $sandbox"
+}
+
+cmd_decide_logs() {
+  local sandbox="${1:-$(workspace_sandbox_name)}"
+  local log
+  log=$(decide_server_log_file "$sandbox")
+  if [ ! -f "$log" ]; then
+    err "no decide-server log at $log"
+  fi
+  exec tail -n 200 -f "$log"
+}
+
+cmd_decide_seen() {
+  # Show cached decisions for the current sandbox's decide-server.
+  local sandbox="${1:-$(workspace_sandbox_name)}"
+  local seen
+  seen=$(decide_server_seen_file "$sandbox")
+  if [ ! -s "$seen" ]; then
+    printf '(no cached decisions yet for %s)\n' "$sandbox"
+    return 0
+  fi
+  printf 'cached decisions for %s (%s):\n' "$sandbox" "$seen"
+  awk -F '|' '{printf "  %-5s %s -> %s:%s\n", toupper($4), $1, $2, $3}' "$seen"
+}
+
+cmd_decide_test() {
+  # Send a synthetic /decide POST through the running server. Useful for
+  # exercising the prompt UI without needing openshell Interactive upstream.
+  local host="${1:-github.com}"
+  local port="${2:-443}"
+  local binary="${3:-/usr/local/bin/claude}"
+  local sandbox
+  sandbox=$(workspace_sandbox_name)
+
+  if ! decide_server_running "$sandbox"; then
+    err "decide-server not running for $sandbox — start with 'agentbox decide start' or AGENTBOX_DECIDE_SERVER=1 <agent>"
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    err "jq required for 'agentbox decide test' (brew install jq)"
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    err "curl required for 'agentbox decide test'"
+  fi
+
+  local srv_port
+  srv_port=$(cat "$(decide_server_port_file "$sandbox")")
+  local body
+  body=$(jq -n \
+    --arg host "$host" \
+    --argjson port "$port" \
+    --arg binary "$binary" \
+    --arg sb "$sandbox" \
+    --arg rid "test-$(date +%s)" \
+    '{schema_version:1, request_id:$rid, host:$host, port:$port, binary:$binary, pid:0, method:"GET", path:"/", protocol:"rest", policy_name:"manual_test", sandbox_name:$sb}')
+
+  log "POST http://127.0.0.1:$srv_port/decide  $binary -> $host:$port"
+  curl -fsS -X POST -H "Content-Type: application/json" --data "$body" "http://127.0.0.1:$srv_port/decide"
+  echo
 }
 
 cmd_shell() {
@@ -1226,6 +1545,15 @@ cmd_doctor() {
       _row bad "$cmd" "brew install $spec"
     fi
   done
+
+  # python3 — only required if AGENTBOX_DECIDE_SERVER is enabled. Warn otherwise.
+  if command -v python3 >/dev/null 2>&1; then
+    _row ok "python3" "$(python3 --version 2>&1)"
+  elif is_truthy "${AGENTBOX_DECIDE_SERVER:-}"; then
+    _row bad "python3" "required by AGENTBOX_DECIDE_SERVER=1; install python3"
+  else
+    _row info "python3" "optional (only needed for AGENTBOX_DECIDE_SERVER)"
+  fi
 
   # ---- 2. Docker / compute driver ----
   if command -v docker >/dev/null 2>&1; then
@@ -1720,6 +2048,18 @@ won't re-prompt for):
   agentbox approve forget <pattern> [N]  Remove matching entries (re-prompts next time)
   agentbox approve reset [N]             Clear the entire seen-list
 
+Decide-server (host-side HTTP endpoint for openshell Interactive enforcement;
+forthcoming upstream, OPT-IN via AGENTBOX_DECIDE_SERVER=1):
+  agentbox decide status                 Show running pid/port + endpoint URL
+  agentbox decide start [NAME]           Manually start the server (auto-started
+                                         on agent launch when env var is set)
+  agentbox decide stop [NAME]            Stop the running server
+  agentbox decide logs [NAME]            Tail the server log
+  agentbox decide seen [NAME]            Show cached allow/deny decisions
+  agentbox decide test [HOST [PORT [BIN]]]  Send a synthetic /decide POST
+                                            (drives the prompt UI end-to-end
+                                            without needing openshell upstream)
+
 Notification appearance (macOS):
   agentbox notifications                 Open System Settings → Notifications →
                                          Terminal. Set "Notification style" to
@@ -1811,6 +2151,11 @@ if [ "${1:-}" = "__watch" ]; then
   cmd_watch_internal "$@"
   exit 0
 fi
+if [ "${1:-}" = "__decide" ]; then
+  shift
+  cmd_decide_handler_internal "$@"
+  exit 0
+fi
 if [ "${1:-}" = "__backend" ]; then
   # Print which notification backend would be used. Useful for testing the
   # fallback chain (alerter → osascript → zenity → notify-send → /dev/tty).
@@ -1845,6 +2190,7 @@ if [ "$self_name" = "agentbox" ] || [ "$self_name" = "agentbox.sh" ]; then
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
     audit)         cmd_audit "$@" ;;
+    decide)        cmd_decide "$@" ;;
     doctor)        cmd_doctor "$@" ;;
     uninstall)     cmd_uninstall "$@" ;;
     notifications) cmd_notifications "$@" ;;
@@ -1906,6 +2252,7 @@ ssh_config_sync "$sandbox"
 mutagen_ensure "$sandbox" "$PWD"
 mutagen_state_ensure "$sandbox"
 watcher_ensure "$sandbox"
+decide_server_ensure "$sandbox"
 agent_ensure_installed "$sandbox" "$agent"
 
 # TTY: override > detect (stdout is a tty)

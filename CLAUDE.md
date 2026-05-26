@@ -150,6 +150,24 @@ Every `AGENTBOX_*` boolean env var accepts `1`, `true`, `yes`, `on`, `y`, `t` (c
 via the `is_truthy` helper. When adding new boolean knobs, use `is_truthy "${VAR:-}"`, never
 `[ "$VAR" = "1" ]`.
 
+### 10. Decide-server is purely additive; never wire it on by default
+
+The decide-server (`bin/agentbox-decide.py` + `__decide` handler + `decide_server_*` lifecycle
+in agentbox.sh) is the host side of openshell's *forthcoming* Interactive enforcement mode.
+Upstream does not yet send any traffic to it. Until openshell ships:
+
+- Keep it gated on `AGENTBOX_DECIDE_SERVER=1` (default off). Don't promote to default-on.
+- The classic watcher (POST-deny log tail) stays the always-on path. Don't remove it
+  thinking "the decide-server replaces this" — it doesn't, until upstream lands.
+- Bind to 127.0.0.1 ONLY. Cross-binding (0.0.0.0 or the docker bridge IP) requires the
+  HMAC auth story to be settled first (open question 2 in the upstream DESIGN.md).
+- The handler returns its decision as a single JSON object on stdout. Don't add stray
+  prints elsewhere in the handler path — `prompt_approval`'s `Allow`/`Deny`/`""` echo
+  must be captured into a variable, never let it stream through to the response.
+- Decide-server cache (`decide-seen.txt`) is intentionally separate from the watcher's
+  `watcher-seen.txt` because the decide path must remember the *direction* (allow vs
+  deny) while the watcher only needs the *fact* of a prior decision.
+
 ## Building / testing
 
 There's no test suite. Iteration is manual:
@@ -177,10 +195,27 @@ openshell sandbox exec --name <sandbox> --no-tty -- /usr/bin/curl --max-time 3 h
 
 Watch `~/.local/share/agentbox/state/<sandbox>/watcher.log` for the `[watcher] denied: ...` line.
 
+For the decide-server (host-side endpoint for openshell Interactive mode):
+
+```bash
+# In a workspace folder:
+AGENTBOX_DECIDE_SERVER=1 agentbox decide start
+agentbox decide status            # see pid + port
+agentbox decide test github.com   # POSTs synthetic /decide; UI prompt fires
+agentbox decide seen              # cached decisions
+agentbox decide logs              # tail server log
+agentbox decide stop
+```
+
+The cycle exercises the full host path (HTTP → handler → prompt UI → seen cache)
+without needing openshell Interactive upstream.
+
 ## Where to make changes
 
 - **Approval prompts (notifications)**: `prompt_approval()` + `ntfy_prompt()` / `alerter` fallback.
 - **Watcher main loop**: `cmd_watch_internal()`.
+- **Decide-server (host-side HTTP endpoint)**: `decide_server_*` lifecycle functions +
+  `cmd_decide_handler_internal()` (per-request) + `bin/agentbox-decide.py` (Python).
 - **Sandbox lifecycle**: `sandbox_ensure()`, `cmd_destroy()`, `cmd_stop()`, `cmd_pull()`.
 - **Mutagen sync**: `mutagen_ensure()` (workspace) + `mutagen_state_ensure()` (state).
 - **Credential synthesis**: `upload_agent_credentials()` + `upload_claude_credentials_synthetic()`.
@@ -210,5 +245,6 @@ Built collaboratively with Claude Code over many iterations. Major design decisi
 - Credential synthesis to bypass claude TUI's first-run prompts
 - ntfy.sh opt-in for cross-device approval notifications
 - `is_truthy` helper for consistent env-var booleans
+- Decide-server (host-side HTTP endpoint) for forthcoming openshell Interactive mode
 
 Full log: `git log --oneline`.

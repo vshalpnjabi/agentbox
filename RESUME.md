@@ -16,15 +16,23 @@ State of the project on pause. Pick this up next session.
 
 ## Parked next steps (in priority order)
 
-### 1. Decision-endpoint HTTP server inside agentbox
+### 1. ✅ Decision-endpoint HTTP server inside agentbox — landed on branch `decide-endpoint-server`
 
-The prep work for consuming openshell's future interactive-enforcement mode. From the earlier "1 then 3 then 2" priority list — items 1 (public + curl-pipe install) and 3 (install scripts across platforms) are done, item 2 is this.
+Host-side endpoint matching `docs/interactive-enforcement/DESIGN.md` from the openshell fork.
 
-**Scope:**
-- Local HTTP server (bind to 127.0.0.1, ephemeral port) inside `agentbox.sh` that openshell can POST decisions to.
-- Replace (or complement) the current log-tail watcher with this push-based model.
-- Endpoint contract should match what's specified in the openshell fork's `docs/interactive-enforcement/DESIGN.md`.
-- The existing `prompt_approval()` / `ntfy_prompt()` UI layer stays — only the trigger changes from log-tail to HTTP POST.
+**What shipped:**
+- `bin/agentbox-decide.py` — Python 3 stdlib HTTP server. Binds 127.0.0.1 only, POST `/decide` → handler subprocess → JSON response.
+- `cmd_decide_handler_internal` + `__decide` hidden subcommand in `agentbox.sh` — reads request JSON on stdin, hits cache (`decide-seen.txt`), otherwise drives `prompt_approval`, returns response JSON.
+- `decide_server_ensure` / `decide_server_stop` lifecycle (parallel to the watcher's), deterministic port from sandbox-hash, pid/port/log files in the state dir.
+- Hooked into the agent dispatch (after `watcher_ensure`) and into `cmd_destroy` / `cmd_stop`.
+- Management surface: `agentbox decide {status,start,stop,test,logs,seen}`.
+- Gated behind `AGENTBOX_DECIDE_SERVER=1` — default off until openshell Interactive mode actually exists upstream. The existing log-tail watcher stays the always-on path.
+- Doctor row + help text + `CLAUDE.md` rule 10 documenting the architecture.
+
+**Outstanding follow-ups (deferred until openshell upstream lands):**
+- HMAC auth for the wire protocol (open question 2 in DESIGN.md).
+- Bind to docker-bridge IP (or unix socket) instead of 127.0.0.1-only so the sandbox can actually reach the endpoint (open question 1).
+- Update `.agentbox.policy.yaml` template to emit the `enforcement: interactive` block referencing `http://host.openshell.internal:<port>/decide` once openshell parses it.
 
 ### 2. Implement openshell hold-and-ask enforcement (in the fork)
 
