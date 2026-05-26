@@ -503,6 +503,19 @@ tmux_kill_session() {
   tmux kill-session -t "$(tmux_session_for_sandbox "$1")" 2>/dev/null || true
 }
 
+# Apply agentbox's preferred session-level tmux settings. Idempotent — safe
+# to call on every attach. Customize via env vars before launching an agent.
+apply_agentbox_tmux_settings() {
+  local session="$1"
+  tmux_available || return 0
+  # Mouse on: scroll wheel scrolls the tmux history buffer instead of being
+  # translated to arrow keys (which agents misinterpret as navigation).
+  # Click-to-focus and pane resizing also start working.
+  tmux set-option -t "$session" mouse "${AGENTBOX_TMUX_MOUSE:-on}" >/dev/null 2>&1 || true
+  # Bigger scrollback than tmux's default of 2000 lines.
+  tmux set-option -t "$session" history-limit "${AGENTBOX_TMUX_HISTORY:-10000}" >/dev/null 2>&1 || true
+}
+
 # Type a retry prompt into the agent's TUI. Preferred delivery path is
 # `tmux send-keys` (focus-independent, exact pane targeting). Falls back to
 # OS-level keystroke injection into the frontmost window for users who opted
@@ -526,13 +539,25 @@ inject_retry_to_agent() {
     local session
     session=$(tmux_session_for_sandbox "$sandbox")
     sleep "${AGENTBOX_RETRY_DELAY:-1}"
-    # `-l` sends the literal string (no key-name interpretation), then a
-    # separate send-keys delivers the Enter key.
-    if tmux send-keys -t "$session" -l -- "$prompt" 2>/dev/null && \
-       tmux send-keys -t "$session" Enter 2>/dev/null; then
-      audit_emit "$sandbox" "retry" "INJECTED (tmux) $binary -> $host:$port"
-      echo "[watcher] retry injected via tmux send-keys (session: $session)" >&2
-      return 0
+    # `-l` sends the literal string (no key-name interpretation).
+    if tmux send-keys -t "$session" -l -- "$prompt" 2>/dev/null; then
+      # Pause so the agent's TUI finishes processing the burst of chars
+      # before we deliver Enter. Claude Code (and similar Ink-based TUIs)
+      # detect fast char-arrival as paste and switch to multi-line input
+      # mode; in that mode the first Enter inserts a newline instead of
+      # submitting. The delay below lets the paste-detect timeout clear.
+      sleep "${AGENTBOX_RETRY_SUBMIT_DELAY:-0.3}"
+      # Send Enter twice. Single-line mode: first Enter submits, second is
+      # an empty no-op. Multi-line mode: first Enter adds a newline, the
+      # second on the now-empty trailing line submits. Either way the
+      # message reaches the agent without the user having to touch anything.
+      if tmux send-keys -t "$session" Enter 2>/dev/null; then
+        sleep 0.1
+        tmux send-keys -t "$session" Enter 2>/dev/null || true
+        audit_emit "$sandbox" "retry" "INJECTED (tmux) $binary -> $host:$port"
+        echo "[watcher] retry injected via tmux send-keys (session: $session)" >&2
+        return 0
+      fi
     fi
     echo "[watcher] tmux send-keys failed; falling back to OS keystroke" >&2
   fi
@@ -1472,7 +1497,8 @@ cmd_attach() {
   if [ -n "${TMUX:-}" ]; then
     err "already inside tmux. Switch with: tmux switch-client -t $session"
   fi
-  exec tmux attach -t "$session"
+  apply_agentbox_tmux_settings "$session"
+  exec tmux attach -d -t "$session"
 }
 
 cmd_auth() {
@@ -2324,6 +2350,9 @@ you can detach/reattach without killing the agent):
   Reattach:                   agentbox attach [NAME]
   List active sessions:       tmux ls
   Opt out for one shell:      export AGENTBOX_NO_TMUX=1
+  Scrollback (mouse wheel):   enabled by default — scroll wheel scrolls the
+                              tmux history. Disable: AGENTBOX_TMUX_MOUSE=off
+  Scrollback depth:           AGENTBOX_TMUX_HISTORY=10000 (default)
   Auto-skipped when already inside a tmux session (TMUX env set) — agentbox
   doesn't nest. Inside an outer tmux, retry-injection falls back to the
   keystroke path (which IS focus-dependent — see Force-retry caveats below).
@@ -2533,9 +2562,16 @@ if [ "$agb_want_tty" -eq 1 ]; then
     log "  detach: Ctrl-B then d   |   reattach: agentbox attach"
     # Quote the ssh command for tmux's single-string command form.
     ssh_invoke=$(printf 'ssh -t %q %q' "$ssh_host" "$inner_cmd")
-    # -A attaches to existing session if present; -s sets name; -D detaches
-    # any other clients first so a single window can re-take an orphaned session.
-    exec tmux new-session -A -D -s "$tmux_session" "$ssh_invoke"
+    # Create the session detached if it doesn't exist, then apply our
+    # session-level settings (idempotent on every attach), then attach.
+    # Splitting into three steps lets us apply settings — `new-session -A`
+    # alone has no hook for that.
+    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+      tmux new-session -d -s "$tmux_session" "$ssh_invoke"
+    fi
+    apply_agentbox_tmux_settings "$tmux_session"
+    # -d detaches any other clients so a fresh window owns the session.
+    exec tmux attach -d -t "$tmux_session"
   else
     if [ -n "${TMUX:-}" ]; then
       warn "already inside tmux (TMUX=$TMUX); skipping agentbox tmux wrap (retry-injection will fall back to keystroke). Run from outside tmux to use the wrap."
