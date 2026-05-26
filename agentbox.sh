@@ -1111,10 +1111,31 @@ cmd_notify() {
         echo
       fi
       if [ "$(uname)" = "Darwin" ] && command -v open >/dev/null 2>&1; then
-        echo "  Mac:   opening $AGB_NTFY_BASE/$topic in your default browser."
-        echo "         Click 'Allow notifications' when the browser prompts."
-        echo "         For native Mac pushes: https://github.com/binwiederhier/ntfy/releases"
-        open "$AGB_NTFY_BASE/$topic" 2>/dev/null || true
+        # Prefer the installed ntfy macOS app when present (no URL scheme it
+        # exposes, so we copy the topic to clipboard and open the app — user
+        # taps + and pastes). Override with AGENTBOX_NTFY_SUBSCRIBE=browser|app|none.
+        local sub_mode="${AGENTBOX_NTFY_SUBSCRIBE:-auto}"
+        local ntfy_app_path="/Applications/ntfy.app"
+        if [ "$sub_mode" = "none" ]; then
+          echo "  Mac:   skipping auto-subscribe (AGENTBOX_NTFY_SUBSCRIBE=none)."
+        elif [ "$sub_mode" = "browser" ]; then
+          echo "  Mac:   opening $AGB_NTFY_BASE/$topic in your default browser."
+          open "$AGB_NTFY_BASE/$topic" 2>/dev/null || true
+        elif [ "$sub_mode" = "app" ] || { [ "$sub_mode" = "auto" ] && [ -d "$ntfy_app_path" ]; }; then
+          if printf '%s' "$topic" | pbcopy 2>/dev/null; then
+            echo "  Mac:   opening ntfy.app. Topic is now in your clipboard."
+            echo "         Tap the + button in the app, paste, subscribe."
+          else
+            echo "  Mac:   opening ntfy.app. Paste this topic in the + button:"
+            echo "           $topic"
+          fi
+          open -a ntfy 2>/dev/null || open "$ntfy_app_path" 2>/dev/null || true
+        else
+          echo "  Mac:   opening $AGB_NTFY_BASE/$topic in your default browser."
+          echo "         (install ntfy macOS app for native pushes, or set"
+          echo "          AGENTBOX_NTFY_SUBSCRIBE=app once you have it)"
+          open "$AGB_NTFY_BASE/$topic" 2>/dev/null || true
+        fi
       else
         echo "  Desktop: open $AGB_NTFY_BASE/$topic in a browser; allow notifications."
       fi
@@ -1164,11 +1185,23 @@ cmd_notify() {
         echo "(already cleared)"
       fi
       ;;
-    open|browser)
+    open)
       local t
       t=$(ntfy_get_topic) || err "no topic configured (run: agentbox notify setup)"
       command -v open >/dev/null 2>&1 || err "no 'open' command available"
-      log "opening $AGB_NTFY_BASE/$t in default browser"
+      if [ -d /Applications/ntfy.app ] && [ "${AGENTBOX_NTFY_SUBSCRIBE:-auto}" != "browser" ]; then
+        printf '%s' "$t" | pbcopy 2>/dev/null && log "topic copied to clipboard"
+        log "opening ntfy.app (paste topic in the + button)"
+        open -a ntfy 2>/dev/null || open /Applications/ntfy.app 2>/dev/null
+      else
+        log "opening $AGB_NTFY_BASE/$t in default browser"
+        open "$AGB_NTFY_BASE/$t" 2>/dev/null || err "could not open browser"
+      fi
+      ;;
+    browser)
+      local t
+      t=$(ntfy_get_topic) || err "no topic configured (run: agentbox notify setup)"
+      log "opening $AGB_NTFY_BASE/$t in default browser (forced)"
       open "$AGB_NTFY_BASE/$t" 2>/dev/null || err "could not open browser"
       ;;
     qr)
