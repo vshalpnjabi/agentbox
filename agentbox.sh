@@ -366,9 +366,8 @@ prompt_approval() {
     fi
   fi
 
-  if command -v alerter >/dev/null 2>&1; then
-    # Single action ("Allow") + the close button relabeled as "Deny" gives two
-    # side-by-side buttons instead of a dropdown.
+  # macOS: alerter is the preferred local prompt (banner + Allow/Deny buttons).
+  if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
     local response
     response=$(alerter \
       --title "$title" \
@@ -387,17 +386,49 @@ prompt_approval() {
     return 0
   fi
 
-  # Fallback: osascript display alert
-  local response
-  response=$(osascript 2>/dev/null <<APPLESCRIPT
+  # macOS fallback: osascript display alert (focused modal with buttons).
+  if [ "$(uname)" = "Darwin" ] && command -v osascript >/dev/null 2>&1; then
+    local response
+    response=$(osascript 2>/dev/null <<APPLESCRIPT
 display alert "${title}" message "${subtitle}\n${message}" as informational buttons {"Deny", "Allow"} default button "Allow"
 APPLESCRIPT
 )
-  case "$response" in
-    *Allow*) echo "Allow" ;;
-    *Deny*)  echo "Deny" ;;
-    *)       echo "" ;;
-  esac
+    case "$response" in
+      *Allow*) echo "Allow" ;;
+      *Deny*)  echo "Deny" ;;
+      *)       echo "" ;;
+    esac
+    return 0
+  fi
+
+  # Linux: notify-send for the notification + read response from a tiny zenity/yad/whiptail
+  # dialog or terminal prompt. We use zenity if available (graphical), otherwise fall back
+  # to a terminal prompt on the controlling tty.
+  if command -v zenity >/dev/null 2>&1; then
+    if zenity --question --title="$title" --text="${subtitle}\n\n${message}\n\nAllow this and add to workspace policy?" --ok-label="Allow" --cancel-label="Deny" --timeout=300 2>/dev/null; then
+      echo "Allow"
+    else
+      # zenity returns 1 on Cancel/Deny, 5 on timeout
+      [ "$?" -eq 1 ] && echo "Deny" || echo ""
+    fi
+    return 0
+  fi
+
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -t 0 "$title" "$subtitle"$'\n'"$message"$'\n\nNo GUI dialog available; answer in the terminal.' 2>/dev/null || true
+  fi
+
+  # Last-resort fallback: read from /dev/tty (works on any platform when interactive)
+  if [ -r /dev/tty ]; then
+    printf '\n[agentbox] %s\n  %s\n  %s\n  Allow/Deny? [a/D]: ' "$title" "$subtitle" "$message" > /dev/tty
+    local ans
+    read -r ans < /dev/tty
+    case "$ans" in a|A|allow|Allow|y|Y|yes|Yes) echo "Allow" ;; *) echo "Deny" ;; esac
+    return 0
+  fi
+
+  # No prompt mechanism available: fail-closed (deny)
+  echo "Deny"
 }
 
 # The actual watcher loop, run in the background. Invoked as `agentbox __watch <sandbox>`.

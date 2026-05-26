@@ -33,13 +33,17 @@ End-to-end: type `claude` in any folder, get a fully-authenticated, sandboxed ag
 
 ## Install
 
-**One-liner (recommended):**
+agentbox runs natively on **macOS** and **Linux**. On **Windows** it runs inside **WSL** — the Windows entry points (`install.ps1`, `install.bat`) bootstrap WSL and install agentbox there.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.sh | bash
-```
+| Platform | One-liner |
+|---|---|
+| **macOS** | `curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.sh \| bash` |
+| **Linux** | same as macOS (alerter is replaced with zenity / notify-send fallbacks) |
+| **WSL (from inside Linux)** | same as Linux |
+| **Windows PowerShell** | `iwr https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.ps1 \| iex` |
+| **Windows CMD** | `curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.bat -o install.bat && install.bat` |
 
-The bootstrap script checks the platform, installs any missing Homebrew deps (openshell, mutagen, alerter, qrencode, jq), clones the repo to `~/src/agentbox`, and runs the installer. Add to your shell rc and you're done.
+The bootstrap auto-installs missing Homebrew/apt deps (openshell, mutagen, alerter or zenity, qrencode, jq), clones the repo to `~/src/agentbox`, and runs the local installer. Add the printed PATH line to your shell rc and you're done.
 
 **Or manually:**
 
@@ -47,6 +51,12 @@ The bootstrap script checks the platform, installs any missing Homebrew deps (op
 git clone https://github.com/vshlpunjabi/agentbox.git ~/src/agentbox
 ~/src/agentbox/install.sh
 ```
+
+### Platform notes
+
+- **Linux**: alerter (macOS-only) is replaced with `zenity` (graphical Allow/Deny) or `notify-send` + a terminal prompt. Install `zenity` for the nicest UX: `sudo apt install -y zenity libnotify-bin`.
+- **WSL**: works exactly like Linux from inside WSL. Docker Desktop's WSL2 integration must be enabled (Settings → Resources → WSL integration → toggle on for your distro).
+- **Windows**: agentbox itself is bash-only and runs inside WSL. The Windows entry points (`install.ps1` / `install.bat`) install/configure WSL if missing and forward all agentbox commands into the WSL distro. To launch claude from a Windows terminal: `wsl bash -lc "claude"` (or open a WSL shell and use `claude` directly).
 
 Either way, add this to your shell config so the shim takes priority over the real agent binaries:
 
@@ -62,9 +72,11 @@ Then open a new shell, and `claude` / `codex` / `opencode` will route through ag
 
 ## Uninstall
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.sh | bash
-```
+| Platform | One-liner |
+|---|---|
+| **macOS / Linux / WSL** | `curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.sh \| bash` |
+| **Windows PowerShell**  | `iwr https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.ps1 \| iex` |
+| **Windows CMD**         | `curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/uninstall.bat -o uninstall.bat && uninstall.bat` |
 
 Or from your local checkout:
 
