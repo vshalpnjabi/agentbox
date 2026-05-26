@@ -671,6 +671,49 @@ cmd_shell() {
   exec openshell sandbox exec --name "$name" --tty --workdir /sandbox/work -- /bin/sh -lc 'exec ${SHELL:-/bin/bash} -l'
 }
 
+cmd_approve() {
+  # Manage the watcher seen-list — the set of (binary, host, port) tuples the
+  # user has already responded to. Entries here suppress re-prompts. Use this
+  # to "forget" past denials/approvals so the watcher will ask again.
+  local sub="${1:-list}"
+  [ "$#" -gt 0 ] && shift
+  local name="${1:-$(workspace_sandbox_name)}"
+  local seen_file="$AGB_STATE_ROOT/$name/watcher-seen.txt"
+  case "$sub" in
+    list)
+      if [ ! -f "$seen_file" ]; then
+        echo "(no seen-list for $name)"
+        return 0
+      fi
+      printf '%-50s  %s\n' "BINARY" "HOST:PORT"
+      awk -F'|' '{printf "%-50s  %s:%s\n", $1, $2, $3}' "$seen_file"
+      ;;
+    forget)
+      local pattern="${1:-}"
+      [ -z "$pattern" ] && err "usage: agentbox approve forget <host-or-pattern> [NAME]"
+      [ -f "$seen_file" ] || { echo "(no seen-list)"; return 0; }
+      local before after
+      before=$(wc -l < "$seen_file" | tr -d ' ')
+      grep -v "$pattern" "$seen_file" > "$seen_file.tmp" 2>/dev/null || true
+      mv "$seen_file.tmp" "$seen_file"
+      after=$(wc -l < "$seen_file" | tr -d ' ')
+      log "removed $((before-after)) entries matching '$pattern' (was $before, now $after)"
+      ;;
+    reset|clear)
+      if [ -f "$seen_file" ]; then
+        local n; n=$(wc -l < "$seen_file" | tr -d ' ')
+        : > "$seen_file"
+        log "cleared seen-list ($n entries removed)"
+      else
+        echo "(already empty)"
+      fi
+      ;;
+    *)
+      err "usage: agentbox approve {list|forget <pattern>|reset} [NAME]"
+      ;;
+  esac
+}
+
 cmd_policy() {
   local sub="${1:-show}"
   [ "$#" -gt 0 ] && shift
@@ -739,6 +782,12 @@ Management:
   agentbox policy edit [NAME]  Edit .agentbox.policy.yaml in $EDITOR
   agentbox policy reload [N]   Push workspace policy to running sandbox
   agentbox policy reset [N]    Restore default policy + wipe approval seen-list
+
+Approval seen-list (the set of (binary, host:port) tuples the watcher
+won't re-prompt for):
+  agentbox approve list [N]              Show seen-list for this workspace
+  agentbox approve forget <pattern> [N]  Remove matching entries (re-prompts next time)
+  agentbox approve reset [N]             Clear the entire seen-list
   agentbox destroy [NAME]      Delete sandbox + ssh block (host state PRESERVED)
   agentbox destroy --purge [N] Also wipe ~/.local/share/agentbox/state/<sandbox>/
 
@@ -826,6 +875,7 @@ if [ "$self_name" = "agentbox" ]; then
     pull)    cmd_pull "$@" ;;
     shell)   cmd_shell "$@" ;;
     policy)  cmd_policy "$@" ;;
+    approve) cmd_approve "$@" ;;
     destroy) cmd_destroy "$@" ;;
     __watch) cmd_watch_internal "$@" ;;
     help|-h|--help) cmd_help ;;
