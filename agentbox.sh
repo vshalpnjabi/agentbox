@@ -1417,6 +1417,47 @@ cmd_shell() {
   exec openshell sandbox exec --name "$name" --tty --workdir /sandbox/work -- /bin/sh -lc 'exec ${SHELL:-/bin/bash} -l'
 }
 
+cmd_ssh() {
+  # SSH into the workspace's sandbox via the agentbox-managed ~/.ssh/config
+  # block. Uses ssh -t for a real PTY end-to-end (CLAUDE.md rule 6 — cleaner
+  # than openshell sandbox exec --tty for TUIs). Without trailing args, opens
+  # an interactive shell. With args, runs them as a one-shot command.
+  #
+  # Examples:
+  #   agentbox ssh                        # interactive shell, cwd=/sandbox/work
+  #   agentbox ssh -- ls -la              # one-shot; -- prevents flag parsing
+  #   agentbox ssh agentbox-foo-abc12345 cat /etc/os-release
+  local name=""
+  if [ "$#" -gt 0 ] && [[ "${1:-}" == agentbox-* ]]; then
+    name="$1"; shift
+  else
+    name=$(workspace_sandbox_name)
+  fi
+  # `--` is a convention for "stop parsing flags" — allow but skip it.
+  [ "${1:-}" = "--" ] && shift
+
+  local phase
+  phase=$(sandbox_phase "$name")
+  if [ "$phase" != "Ready" ]; then
+    err "sandbox '$name' not running (phase: ${phase:-not found}). Launch an agent first, or 'agentbox status'."
+  fi
+  ssh_config_sync "$name"
+
+  local ssh_host="openshell-$name"
+  if [ "$#" -eq 0 ]; then
+    log "ssh into $name (workdir=/sandbox/work) — exit to return"
+    exec ssh -t "$ssh_host" "cd /sandbox/work && exec \${SHELL:-/bin/bash} -l"
+  else
+    # Shell-quote each arg so the remote shell sees them safely as a command.
+    local quoted=""
+    for a in "$@"; do
+      quoted+=" $(printf '%q' "$a")"
+    done
+    log "ssh exec in $name:$quoted"
+    exec ssh -t "$ssh_host" "cd /sandbox/work && exec${quoted}"
+  fi
+}
+
 cmd_attach() {
   # Reattach to the tmux session for a workspace's agent (created when
   # agentbox wraps the agent launch in tmux, default-on). Useful after
@@ -2175,6 +2216,10 @@ Management:
   agentbox stop [NAME]         Pause workspace + state sync (sandbox preserved)
   agentbox pull [NAME]         Force-flush both sync sessions (workspace + state)
   agentbox shell [NAME]        Open interactive shell in sandbox
+                               (via openshell exec; for basic shells)
+  agentbox ssh [NAME] [-- cmd] Interactive shell OR one-shot command via
+                               ssh -t (cleaner PTY for TUIs; supports
+                               passing commands: 'agentbox ssh -- ls -la')
   agentbox attach [NAME]       Reattach to this workspace's tmux session
                                (created automatically when an agent runs)
   agentbox policy show [NAME]  Print active policy on sandbox
@@ -2380,6 +2425,7 @@ if [ "$self_name" = "agentbox" ] || [ "$self_name" = "agentbox.sh" ]; then
     stop)    cmd_stop "$@" ;;
     pull)    cmd_pull "$@" ;;
     shell)   cmd_shell "$@" ;;
+    ssh)     cmd_ssh "$@" ;;
     attach)  cmd_attach "$@" ;;
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
