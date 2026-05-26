@@ -23,7 +23,7 @@ real_binary() {
 }
 
 inside_sandbox() {
-  [ -d /agentbox ] && [ -f /etc/openshell-sandbox ] 2>/dev/null
+  [ -d /sandbox ] && [ -f /etc/openshell-sandbox ] 2>/dev/null
 }
 
 workspace_sandbox_name() {
@@ -143,7 +143,7 @@ mutagen_ensure() {
 }
 
 mutagen_state_ensure() {
-  # Persists /agentbox/.claude/projects across destroy/recreate so `claude --continue`
+  # Persists /sandbox/.claude/projects across destroy/recreate so `claude --continue`
   # survives sandbox loss. State lives in $AGB_STATE_ROOT/<sandbox-name>/ on host.
   local name="$1"
   local session_name="${name}-state"
@@ -161,11 +161,11 @@ mutagen_state_ensure() {
   ssh_host=$(ssh_host_for "$name")
   [ -z "$ssh_host" ] && { warn "could not resolve SSH host for state sync"; return 0; }
 
-  log "starting state sync $session_name (host:$host_state <-> ${ssh_host}:/agentbox/.claude/projects)"
+  log "starting state sync $session_name (host:$host_state <-> ${ssh_host}:/sandbox/.claude/projects)"
   mutagen sync create \
     --name "$session_name" \
     --mode two-way-resolved \
-    "$host_state" "${ssh_host}:/agentbox/.claude/projects" >/dev/null 2>&1 || \
+    "$host_state" "${ssh_host}:/sandbox/.claude/projects" >/dev/null 2>&1 || \
     warn "state sync failed to start (session history won't persist this run)"
 }
 
@@ -452,7 +452,7 @@ filesystem_policy:
     - /sys
     - /etc
   read_write:
-    - /agentbox
+    - /sandbox
     - /agentbox
     - /tmp
     - /var
@@ -556,9 +556,9 @@ agent_ensure_installed() {
 agent_auth_mapping() {
   # echoes "<host-source-file>::<sandbox-dest-file>" for the agent, or empty.
   case "$1" in
-    claude)   echo "$HOME/.claude/.credentials.json::/agentbox/.claude/.credentials.json" ;;
-    codex)    echo "$HOME/.codex/auth.json::/agentbox/.codex/auth.json" ;;
-    opencode) echo "$HOME/.local/share/opencode/auth.json::/agentbox/.local/share/opencode/auth.json" ;;
+    claude)   echo "$HOME/.claude/.credentials.json::/sandbox/.claude/.credentials.json" ;;
+    codex)    echo "$HOME/.codex/auth.json::/sandbox/.codex/auth.json" ;;
+    opencode) echo "$HOME/.local/share/opencode/auth.json::/sandbox/.local/share/opencode/auth.json" ;;
     *) return 1 ;;
   esac
 }
@@ -640,8 +640,8 @@ upload_claude_credentials_synthetic() {
   # Two files have to be on disk inside the sandbox for the claude TUI to
   # skip its first-run flow:
   #
-  #   /agentbox/.claude/.credentials.json   provides the auth token (claudeAiOauth)
-  #   /agentbox/.claude.json                provides hasCompletedOnboarding +
+  #   /sandbox/.claude/.credentials.json   provides the auth token (claudeAiOauth)
+  #   /sandbox/.claude.json                provides hasCompletedOnboarding +
   #                                        oauthAccount info (skips welcome
   #                                        screen + login-method selection)
   #
@@ -672,9 +672,9 @@ upload_claude_credentials_synthetic() {
   }
 }
 EOF
-      openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /agentbox/.claude </dev/null >/dev/null 2>&1 || true
-      if openshell sandbox upload "$sandbox" "$tmpfile" /agentbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
-        openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /agentbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
+      openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude </dev/null >/dev/null 2>&1 || true
+      if openshell sandbox upload "$sandbox" "$tmpfile" /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
+        openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
         log "synced synthetic claude credentials.json (from long-lived token)"
       else
         warn "claude synthetic credential upload failed"
@@ -682,9 +682,9 @@ EOF
       rm -f "$tmpfile"
     fi
   elif [ -f "$host_creds" ]; then
-    openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /agentbox/.claude </dev/null >/dev/null 2>&1 || true
-    if openshell sandbox upload "$sandbox" "$host_creds" /agentbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
-      openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /agentbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
+    openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude </dev/null >/dev/null 2>&1 || true
+    if openshell sandbox upload "$sandbox" "$host_creds" /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
+      openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
       log "synced host ~/.claude/.credentials.json"
     fi
   else
@@ -716,11 +716,11 @@ EOF
       cp "$host_global" "$tmpfile"
     fi
 
-    if openshell sandbox upload "$sandbox" "$tmpfile" /agentbox/.claude.json </dev/null >/dev/null 2>&1; then
-      openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /agentbox/.claude.json </dev/null >/dev/null 2>&1 || true
-      log "synced /agentbox/.claude.json (hasCompletedOnboarding + oauthAccount; skips TUI welcome)"
+    if openshell sandbox upload "$sandbox" "$tmpfile" /sandbox/.claude.json </dev/null >/dev/null 2>&1; then
+      openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude.json </dev/null >/dev/null 2>&1 || true
+      log "synced /sandbox/.claude.json (hasCompletedOnboarding + oauthAccount; skips TUI welcome)"
     else
-      warn "failed to upload /agentbox/.claude.json (welcome screen may appear)"
+      warn "failed to upload /sandbox/.claude.json (welcome screen may appear)"
     fi
     rm -f "$tmpfile"
   fi
@@ -1165,7 +1165,7 @@ Approval prompts (macOS):
   not asked again for the same tuple. Opt out with AGENTBOX_NO_WATCH=1.
 
 Session continuity:
-  /agentbox/.claude/projects (claude conversation history) is live-synced to
+  /sandbox/.claude/projects (claude conversation history) is live-synced to
   ~/.local/share/agentbox/state/<sandbox>/ via a second mutagen session.
   `claude --continue` survives both `agentbox destroy` and out-of-band
   container loss; auto-recovery rebuilds the sandbox and restores state
