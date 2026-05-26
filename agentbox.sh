@@ -985,7 +985,7 @@ if [ "$agb_want_tty" -eq 1 ]; then
   fi
   # Silence claude's "Native installation exists but ~/.local/bin is not in your
   # PATH" by ensuring the symlink and the PATH entry both exist inside the sandbox.
-  local setup_prefix="mkdir -p \$HOME/.local/bin && ln -sf /usr/local/bin/claude \$HOME/.local/bin/claude 2>/dev/null; export PATH=\$HOME/.local/bin:\$PATH && "
+  setup_prefix="mkdir -p \$HOME/.local/bin && ln -sf /usr/local/bin/claude \$HOME/.local/bin/claude 2>/dev/null; export PATH=\$HOME/.local/bin:\$PATH && "
   exec ssh -t "$ssh_host" "${setup_prefix}${env_prefix}cd /sandbox/work && exec $agent$quoted"
 else
   log "launching $agent in $sandbox (via openshell exec --no-tty, workdir=/sandbox/work)"
