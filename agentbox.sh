@@ -211,58 +211,61 @@ process:
 
 filesystem_policy:
   # include_workdir: true auto-adds /sandbox/work to read_write.
-  # Baseline read-only paths (/usr /lib /etc /var/log) and read-write paths
-  # (/sandbox /tmp) are added by openshell so the sandbox can function.
+  # openshell adds baseline paths (/usr /lib /etc /var/log read-only; /sandbox /tmp read-write)
+  # but NOT the /dev and /proc pseudo-files that most runtimes need — list those explicitly.
   # Anything not listed is inaccessible (Landlock-enforced).
   include_workdir: true
-  # read_only:
-  #   - /opt/some-shared-data
-  # read_write:
-  #   - /scratch
+  read_only:
+    - /usr
+    - /lib
+    - /etc
+    - /proc
+    - /dev/urandom
+    # - /opt/some-shared-data
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+    # - /scratch
 
-# network_policies: empty map = proxy denies all outbound network.
-# Add agent-specific blocks below to allow the agent's API endpoints.
-# Each entry has: name, endpoints (list of {host, port[, protocol, access, ...]}), binaries.
+# Each network_policies entry has: name, endpoints (list of {host, port[, protocol, access, ...]}), binaries.
 # Endpoint defaults to TCP passthrough; add protocol: rest + access: <preset> for L7 inspection.
+# Hot-reload changes here with `agentbox policy reload`.
 #
-# Example (claude): grants Claude Code access to Anthropic.
-#
-# network_policies:
-#   claude_code:
-#     name: claude-code
-#     endpoints:
-#       - { host: api.anthropic.com, port: 443 }
-#       - { host: platform.claude.com, port: 443 }
-#     binaries:
-#       - { path: /usr/local/bin/claude }
-#
-# Example (codex): grants OpenAI access for the codex binary.
-#
-#   codex:
-#     name: codex
-#     endpoints:
-#       - { host: api.openai.com, port: 443 }
-#     binaries:
-#       - { path: /usr/local/bin/codex }
-#
-# Example (opencode): grants opencode.ai backend access.
-#
-#   opencode:
-#     name: opencode
-#     endpoints:
-#       - { host: opencode.ai, port: 443 }
-#     binaries:
-#       - { path: /usr/local/bin/opencode }
-#
-# L7 example with read-only GitHub REST API:
-#
-#   github_api:
-#     name: github-rest
-#     endpoints:
-#       - { host: api.github.com, port: 443, protocol: rest, access: read-only }
-#     binaries:
-#       - { path: /usr/local/bin/claude }
-network_policies: {}
+# Default: claude is allowed to reach Anthropic so the agent works out of the box.
+# Uncomment the codex / opencode / github examples below to enable those.
+network_policies:
+  claude_code:
+    name: claude-code
+    endpoints:
+      - { host: api.anthropic.com, port: 443 }
+      - { host: platform.claude.com, port: 443 }
+      - { host: claude.ai, port: 443 }
+      - { host: statsig.anthropic.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+
+  # codex:
+  #   name: codex
+  #   endpoints:
+  #     - { host: api.openai.com, port: 443 }
+  #   binaries:
+  #     - { path: /usr/local/bin/codex }
+  #
+  # opencode:
+  #   name: opencode
+  #   endpoints:
+  #     - { host: opencode.ai, port: 443 }
+  #   binaries:
+  #     - { path: /usr/local/bin/opencode }
+  #
+  # L7 example with read-only GitHub REST API:
+  # github_api:
+  #   name: github-rest
+  #   endpoints:
+  #     - { host: api.github.com, port: 443, protocol: rest, access: read-only }
+  #   binaries:
+  #     - { path: /usr/local/bin/claude }
 YAML
 }
 
