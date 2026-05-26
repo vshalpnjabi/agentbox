@@ -530,10 +530,13 @@ mutagen_ensure "$sandbox" "$PWD"
 mutagen_state_ensure "$sandbox"
 agent_ensure_installed "$sandbox" "$agent"
 
-log "launching $agent in $sandbox (workdir=/sandbox/work)"
-# Explicit TTY decision (openshell's auto-detect can miss our case after exec chain).
-if [ -t 0 ] && [ -t 1 ]; then
-  exec openshell sandbox exec --name "$sandbox" --tty --workdir /sandbox/work -- "$agent" "$@"
-else
-  exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /sandbox/work -- "$agent" "$@"
-fi
+# TTY: override > detect (stdout is a tty) > off
+case "${AGENTBOX_TTY:-auto}" in
+  on)  agb_tty_flag="--tty" ;;
+  off) agb_tty_flag="--no-tty" ;;
+  *)
+    if [ -t 1 ]; then agb_tty_flag="--tty"; else agb_tty_flag="--no-tty"; fi
+    ;;
+esac
+log "launching $agent in $sandbox (workdir=/sandbox/work, tty=${agb_tty_flag#--})"
+exec openshell sandbox exec --name "$sandbox" "$agb_tty_flag" --workdir /sandbox/work -- "$agent" "$@"
