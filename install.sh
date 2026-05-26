@@ -188,7 +188,8 @@ done
 ln -sf "$AGB_HOME/agentbox.sh" "$USER_BIN/agentbox"
 chmod +x "$REPO_DIR/agentbox.sh"
 
-ok "agentbox installed ()"
+installed_version=$("$AGB_BIN/agentbox" version 2>/dev/null || echo "")
+ok "agentbox installed (${installed_version:-version unknown})"
 log "running doctor for a final health check"
 echo
 "$AGB_BIN/agentbox" doctor || true
