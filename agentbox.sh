@@ -192,12 +192,31 @@ watcher_running() {
 
 watcher_ensure() {
   local sandbox="$1"
-  [ "${AGENTBOX_NO_WATCH:-0}" = "1" ] && return 0
-  [ "$(uname)" = "Darwin" ] || return 0
-  command -v osascript >/dev/null 2>&1 || return 0
-
-  if watcher_running "$sandbox"; then
+  if [ "${AGENTBOX_NO_WATCH:-0}" = "1" ]; then
+    log "watcher disabled (AGENTBOX_NO_WATCH=1)"
     return 0
+  fi
+  if [ "$(uname)" != "Darwin" ]; then
+    log "watcher skipped (non-Darwin: $(uname))"
+    return 0
+  fi
+  if ! command -v osascript >/dev/null 2>&1; then
+    log "watcher skipped (osascript not found)"
+    return 0
+  fi
+
+  # Clean up stale pid file if process died without removing it
+  local pf
+  pf=$(watcher_pid_file "$sandbox")
+  if [ -f "$pf" ]; then
+    local existing_pid
+    existing_pid=$(cat "$pf" 2>/dev/null)
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      log "watcher already running (pid $existing_pid) for $sandbox"
+      return 0
+    fi
+    log "removing stale pid file (pid $existing_pid not alive)"
+    rm -f "$pf"
   fi
 
   local state_dir
@@ -208,7 +227,9 @@ watcher_ensure() {
   # Self-respawn via the hidden __watch subcommand
   nohup "$AGB_ROOT/agentbox.sh" __watch "$sandbox" \
     >"$(watcher_log_file "$sandbox")" 2>&1 &
+  local spawn_pid=$!
   disown 2>/dev/null || true
+  log "watcher spawn pid=$spawn_pid"
 }
 
 watcher_stop() {
