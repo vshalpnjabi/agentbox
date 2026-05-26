@@ -742,23 +742,29 @@ cmd_auth_setup() {
       [ -x "$real_claude" ] || err "claude not executable at $real_claude"
       local tok_file="$HOME/.claude/.agentbox-oauth-token"
       mkdir -p "$(dirname "$tok_file")"
-      log "claude: running '$real_claude setup-token' (interactive)"
-      log "  saves long-lived token to $tok_file"
-      if "$real_claude" setup-token | tee "$tok_file"; then
-        local cleaned
-        cleaned=$(grep -E "." "$tok_file" | tail -1 | tr -d "[:space:]")
-        if [ -n "$cleaned" ]; then
-          printf '%s\n' "$cleaned" > "$tok_file"
-          chmod 600 "$tok_file"
-          log "claude: saved long-lived token ($(wc -c < "$tok_file" | tr -d " ") bytes, mode 600)"
-        else
-          rm -f "$tok_file"
-          warn "claude: setup-token returned empty; auth not configured"
-        fi
-      else
-        rm -f "$tok_file"
-        err "claude setup-token failed"
+      log "claude: running '$real_claude setup-token' (interactive TUI)"
+      log "  sign in via the browser, then come back and paste the token below"
+      echo >&2
+
+      # Run setup-token with normal stdio so its interactive TUI works.
+      # Piping it would break the cursor positioning (the animation re-renders
+      # every frame as raw text).
+      "$real_claude" setup-token || err "claude setup-token failed (or was cancelled)"
+
+      echo >&2
+      echo >&2
+      printf 'Paste the long-lived token displayed above (or press Enter to skip): ' >&2
+      local tok
+      IFS= read -r tok
+      tok=$(printf '%s' "$tok" | tr -d "[:space:]")
+      if [ -z "$tok" ]; then
+        warn "claude: no token pasted; skipping save. Re-run 'agentbox auth setup claude' when ready."
+        return 0
       fi
+      printf '%s\n' "$tok" > "$tok_file"
+      chmod 600 "$tok_file"
+      log "claude: saved long-lived token to $tok_file (${#tok} chars, mode 600)"
+      log "future agentbox sandbox claude launches will auto-inject CLAUDE_CODE_OAUTH_TOKEN"
       ;;
     codex)
       local real_codex
