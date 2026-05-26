@@ -318,11 +318,22 @@ agent_ensure_installed() {
 }
 
 upload_claude_credentials() {
+  # Seed sandbox claude with host OAuth token so the agent is auto-authenticated.
+  # /sandbox is the sandbox user's home, so /sandbox/.claude/.credentials.json is
+  # what claude looks for. Idempotent: safe to call on every invocation; re-uploads
+  # in case the host token was refreshed.
   local sandbox="$1"
-  [ -d "$HOME/.claude" ] || return 0
-  log "uploading host ~/.claude credentials into sandbox"
-  openshell sandbox upload "$sandbox" "$HOME/.claude" /root/.claude >/dev/null 2>&1 \
-    || warn "credential upload failed (continuing; you'll do browser auth instead)"
+  local src="$HOME/.claude/.credentials.json"
+  [ -f "$src" ] || return 0
+  [ "${AGENTBOX_NO_CLAUDE_AUTH:-0}" = "1" ] && return 0
+
+  openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude >/dev/null 2>&1 || true
+  if openshell sandbox upload "$sandbox" "$src" /sandbox/.claude/ >/dev/null 2>&1; then
+    openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json >/dev/null 2>&1 || true
+    log "synced host claude credentials into sandbox (~/.claude/.credentials.json)"
+  else
+    warn "credential upload failed; claude inside sandbox will require browser auth"
+  fi
 }
 
 # Management subcommands
@@ -458,6 +469,13 @@ Launch (via shim symlinks):
 Bypass (run real binary, no sandbox):
   AGENTBOX_BYPASS=1 claude
 
+Defaults when running claude through agentbox:
+  - host ~/.claude/.credentials.json is auto-uploaded to the sandbox so the
+    agent is authenticated without a browser auth flow (opt out: AGENTBOX_NO_CLAUDE_AUTH=1)
+  - --dangerously-skip-permissions is prepended to claude args (the sandbox
+    is your safety net; permission prompts inside become redundant friction).
+    Opt out: AGENTBOX_PERMISSIONS=on, or pass the flag yourself.
+
 Per-workspace policy:
   On first agent invocation in a workspace, agentbox writes
   .agentbox.policy.yaml (deny-all network, baseline filesystem only).
@@ -521,8 +539,20 @@ ensure_workspace_policy
 sandbox=$(workspace_sandbox_name)
 sandbox_ensure "$sandbox" "$AGB_IMAGE" "$AGB_CPU" "$AGB_MEMORY" "$AGB_POLICY"
 
-if [ "$AGB_UPLOAD_CREDS" = "true" ] && [ "$agent" = "claude" ]; then
-  upload_claude_credentials "$sandbox"
+# Always seed claude credentials (set AGENTBOX_NO_CLAUDE_AUTH=1 to opt out)
+upload_claude_credentials "$sandbox"
+
+# Default claude to --dangerously-skip-permissions when running inside an agentbox sandbox
+# (the sandbox itself enforces policy; permission prompts become redundant friction).
+# Opt out per-invocation with AGENTBOX_PERMISSIONS=on, or by passing the flag yourself.
+if [ "$agent" = "claude" ] && [ "${AGENTBOX_PERMISSIONS:-off}" != "on" ]; then
+  has_skip=0
+  for a in "$@"; do
+    case "$a" in --dangerously-skip-permissions) has_skip=1; break ;; esac
+  done
+  if [ "$has_skip" -eq 0 ]; then
+    set -- --dangerously-skip-permissions "$@"
+  fi
 fi
 
 ssh_config_sync "$sandbox"
