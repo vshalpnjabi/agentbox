@@ -1097,10 +1097,19 @@ cmd_notify() {
       echo
       echo "Topic URL:    $AGB_NTFY_BASE/$topic"
       echo
-      echo "Subscribe via one of:"
-      echo "  iOS:     install ntfy from App Store -> add topic '$topic'"
-      echo "  Android: install ntfy from Play Store / F-Droid -> add topic"
-      echo "  Desktop: install ntfy app or open $AGB_NTFY_BASE/$topic in a browser"
+      if command -v qrencode >/dev/null 2>&1; then
+        echo "Scan this QR with the ntfy app to subscribe in one tap:"
+        echo
+        qrencode -t UTF8 -o - "$AGB_NTFY_BASE/$topic" 2>/dev/null
+        echo
+      else
+        echo "(install \`qrencode\` via \`brew install qrencode\` for a scannable QR)"
+        echo
+      fi
+      echo "Or subscribe manually:"
+      echo "  iOS:     ntfy app -> + button -> paste topic '$topic'"
+      echo "  Android: ntfy app -> + button -> paste topic '$topic'"
+      echo "  Desktop: open $AGB_NTFY_BASE/$topic in a browser"
       echo "  CLI:     curl -sS $AGB_NTFY_BASE/$topic/sse"
       echo
       echo "Sending a test notification..."
