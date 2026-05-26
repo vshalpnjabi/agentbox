@@ -708,7 +708,22 @@ EOF
         hasTrustDialogAccepted: true,
         bypassPermissionsModeAccepted: true,
         theme: (.theme // "dark"),
-        autoUpdates: false
+        autoUpdates: false,
+        projects: {
+          "/sandbox/work": {
+            hasTrustDialogAccepted: true,
+            allowedTools: [],
+            mcpContextUris: [],
+            mcpServers: {},
+            enabledMcpjsonServers: [],
+            disabledMcpjsonServers: [],
+            hasClaudeMdExternalIncludesApproved: true,
+            hasClaudeMdExternalIncludesWarningShown: true,
+            projectOnboardingSeenCount: 1,
+            exampleFiles: [],
+            lastGracefulShutdown: true
+          }
+        }
       }' "$host_global" > "$tmpfile" 2>/dev/null
     else
       # Fallback: copy verbatim
