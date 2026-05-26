@@ -636,23 +636,30 @@ upload_agent_credentials() {
 }
 
 upload_claude_credentials_synthetic() {
-  # Build /sandbox/.claude/.credentials.json from ~/.claude/.agentbox-oauth-token.
-  # Falls back to uploading host's ~/.claude/.credentials.json if no long-lived
-  # token exists (won't bypass welcome screen but won't break anything either).
+  # Two files have to be on disk inside the sandbox for the claude TUI to
+  # skip its first-run flow:
+  #
+  #   /sandbox/.claude/.credentials.json   provides the auth token (claudeAiOauth)
+  #   /sandbox/.claude.json                provides hasCompletedOnboarding +
+  #                                        oauthAccount info (skips welcome
+  #                                        screen + login-method selection)
+  #
+  # Without #2, the TUI shows "Select login method" even with valid auth.
   local sandbox="$1"
   local token_file="$HOME/.claude/.agentbox-oauth-token"
   local host_creds="$HOME/.claude/.credentials.json"
+  local host_global="$HOME/.claude.json"
   local tmpfile
 
+  # 1. Build / upload .credentials.json
   if [ -f "$token_file" ]; then
     local tok
     tok=$(tr -d "[:space:]" < "$token_file")
     if [ -z "$tok" ]; then
       warn "claude long-lived token file is empty; agent will need interactive auth"
-      return 0
-    fi
-    tmpfile=$(mktemp -t agentbox-cred) || return 1
-    cat > "$tmpfile" <<EOF
+    else
+      tmpfile=$(mktemp -t agentbox-cred) || return 1
+      cat > "$tmpfile" <<EOF
 {
   "claudeAiOauth": {
     "accessToken": "$tok",
@@ -664,22 +671,57 @@ upload_claude_credentials_synthetic() {
   }
 }
 EOF
-    openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude </dev/null >/dev/null 2>&1 || true
-    if openshell sandbox upload "$sandbox" "$tmpfile" /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
-      openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
-      log "synced synthetic claude credentials.json (from long-lived token; skips TUI welcome)"
-    else
-      warn "claude synthetic credential upload failed"
+      openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude </dev/null >/dev/null 2>&1 || true
+      if openshell sandbox upload "$sandbox" "$tmpfile" /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
+        openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
+        log "synced synthetic claude credentials.json (from long-lived token)"
+      else
+        warn "claude synthetic credential upload failed"
+      fi
+      rm -f "$tmpfile"
     fi
-    rm -f "$tmpfile"
   elif [ -f "$host_creds" ]; then
     openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude </dev/null >/dev/null 2>&1 || true
     if openshell sandbox upload "$sandbox" "$host_creds" /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
       openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
-      log "synced host ~/.claude/.credentials.json (no long-lived token; welcome screen may still appear)"
+      log "synced host ~/.claude/.credentials.json"
     fi
   else
-    warn "no claude auth available (no long-lived token, no host .credentials.json) — TUI will require interactive login"
+    warn "no claude auth available — TUI will require interactive login"
+  fi
+
+  # 2. Upload .claude.json (the global onboarding state) so welcome screen
+  # is skipped. Build a minimal version derived from host's file rather than
+  # uploading the whole 68KB (which contains lots of host-specific state).
+  if [ -f "$host_global" ]; then
+    tmpfile=$(mktemp -t agentbox-claudejson) || return 1
+    # Extract just the keys relevant for onboarding skip
+    if command -v jq >/dev/null 2>&1; then
+      jq '{
+        hasCompletedOnboarding: (.hasCompletedOnboarding // true),
+        lastOnboardingVersion: (.lastOnboardingVersion // "1.0.0"),
+        firstStartTime: (.firstStartTime // "2024-01-01T00:00:00.000Z"),
+        userID: (.userID // "agentbox-synthetic-user"),
+        installMethod: (.installMethod // "native"),
+        numStartups: (.numStartups // 1),
+        oauthAccount: .oauthAccount,
+        hasTrustDialogAccepted: true,
+        bypassPermissionsModeAccepted: true,
+        theme: (.theme // "dark"),
+        autoUpdates: false
+      }' "$host_global" > "$tmpfile" 2>/dev/null
+    else
+      # Fallback: copy verbatim
+      cp "$host_global" "$tmpfile"
+    fi
+
+    if openshell sandbox upload "$sandbox" "$tmpfile" /sandbox/.claude.json </dev/null >/dev/null 2>&1; then
+      openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude.json </dev/null >/dev/null 2>&1 || true
+      log "synced /sandbox/.claude.json (hasCompletedOnboarding + oauthAccount; skips TUI welcome)"
+    else
+      warn "failed to upload /sandbox/.claude.json (welcome screen may appear)"
+    fi
+    rm -f "$tmpfile"
   fi
 }
 
