@@ -1,0 +1,6 @@
+# Generated automatically by install.sh — do not edit by hand unless you
+# know what you're doing.
+# Format: <agent-name>=<absolute-path-to-real-binary>
+claude=/path/to/real/claude
+codex=/path/to/real/codex
+opencode=/path/to/real/opencode

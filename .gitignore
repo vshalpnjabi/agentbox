@@ -1,0 +1,9 @@
+# User-specific install state (paths to real binaries)
+originals.conf
+
+# Per-workspace policy files left from local testing
+.agentbox.policy.yaml
+.agentbox.toml
+
+# macOS
+.DS_Store
