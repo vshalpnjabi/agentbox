@@ -335,6 +335,33 @@ ntfy_prompt() {
   echo ""
 }
 
+# Resolve which notification backend prompt_approval would use right now.
+# Mirrors prompt_approval's decision tree without actually firing a prompt.
+notification_backend() {
+  if is_truthy "${AGENTBOX_NTFY:-}" \
+      && ntfy_get_topic >/dev/null 2>&1 \
+      && command -v curl >/dev/null 2>&1 \
+      && command -v jq >/dev/null 2>&1; then
+    echo "ntfy.sh (cross-device push)"; return
+  fi
+  if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
+    echo "alerter (macOS banner)"; return
+  fi
+  if [ "$(uname)" = "Darwin" ] && command -v osascript >/dev/null 2>&1; then
+    echo "osascript display alert (macOS modal)"; return
+  fi
+  if command -v zenity >/dev/null 2>&1; then
+    echo "zenity (Linux GUI)"; return
+  fi
+  if command -v notify-send >/dev/null 2>&1; then
+    echo "notify-send + /dev/tty prompt (Linux)"; return
+  fi
+  if [ -r /dev/tty ]; then
+    echo "/dev/tty interactive prompt"; return
+  fi
+  echo "none (fail-closed: all denies auto-Deny)"
+}
+
 # Prompt the user via alerter (proper macOS banner notification with
 # Allow/Deny action buttons; sender identity = com.apple.Terminal so the
 # notification isn't silently dropped on macOS 15+). Falls back to osascript
@@ -1245,6 +1272,15 @@ cmd_doctor() {
     _row info "ntfy.sh push" "optional; agentbox notify setup"
   fi
 
+  # ---- 8b. Resolved notification backend (which one prompt_approval will use)
+  local backend
+  backend=$(notification_backend)
+  case "$backend" in
+    "none"*)      _row bad  "notification backend" "$backend" ;;
+    "/dev/tty"*)  _row warn "notification backend" "$backend" ;;
+    *)            _row ok   "notification backend" "$backend" ;;
+  esac
+
   # ---- 9. Agents on PATH (the real binaries)
   for agent in claude codex opencode; do
     local real
@@ -1745,13 +1781,16 @@ EOF
 }
 
 # Dispatch
-# Hidden subcommand: the approval watcher background process. Invoked by
-# watcher_ensure via `nohup "$AGB_ROOT/agentbox.sh" __watch <sandbox>`, where
-# $0 is the .sh file (not the agentbox symlink), so this needs to fire before
-# any $0-based dispatch.
+# Hidden subcommands that need to fire before $0-based routing.
 if [ "${1:-}" = "__watch" ]; then
   shift
   cmd_watch_internal "$@"
+  exit 0
+fi
+if [ "${1:-}" = "__backend" ]; then
+  # Print which notification backend would be used. Useful for testing the
+  # fallback chain (alerter → osascript → zenity → notify-send → /dev/tty).
+  notification_backend
   exit 0
 fi
 
