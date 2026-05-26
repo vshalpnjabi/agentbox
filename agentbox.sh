@@ -432,65 +432,80 @@ process:
   run_as_group: sandbox
 
 filesystem_policy:
-  # include_workdir: true auto-adds /sandbox/work to read_write.
-  # openshell adds baseline paths (/usr /lib /etc /var/log read-only; /sandbox /tmp read-write)
-  # but NOT the /dev and /proc pseudo-files that most runtimes need — list those explicitly.
-  # Anything not listed is inaccessible (Landlock-enforced).
+  # Full sandbox filesystem access — agents can read+write anywhere inside the
+  # container that the sandbox user (uid:gid sandbox:sandbox) has permission to
+  # access. The container itself is still the security boundary; this just
+  # disables the additional Landlock LSM constraints inside it.
+  #
+  # openshell rejects a single "/" entry as "overly broad", so we enumerate
+  # the standard Linux roots. Combined this covers every path the sandbox can
+  # touch. Trim back to a stricter set per-workspace if you want defense-in-depth.
   include_workdir: true
   read_only:
     - /usr
     - /lib
-    - /etc
+    - /lib64
+    - /bin
+    - /sbin
+    - /opt
     - /proc
-    - /dev/urandom
-    # - /opt/some-shared-data
+    - /sys
+    - /etc
   read_write:
     - /sandbox
     - /tmp
-    - /dev/null
-    # - /scratch
+    - /var
+    - /run
+    - /home
+    - /root
+    - /dev
 
 # Each network_policies entry has: name, endpoints (list of {host, port[, protocol, access, ...]}), binaries.
 # Endpoint defaults to TCP passthrough; add protocol: rest + access: <preset> for L7 inspection.
 # Hot-reload changes here with `agentbox policy reload`.
 #
-# Defaults: permissive — broad wildcards on common dev infrastructure so most
-# workflows "just work" without prompts. Lock down per-workspace by editing this
-# file and `agentbox policy reload`. The sandbox itself is still the safety
-# boundary (filesystem + process isolation); these are NETWORK rules only.
+# Defaults: agents allowed to reach their APIs + GitHub open to git/curl/agents.
+# Add/remove blocks to taste; `agentbox policy reload` hot-applies network changes.
 network_policies:
   claude_code:
     name: claude-code
     endpoints:
-      - { host: '*.anthropic.com', port: 443 }
-      - { host: '*.claude.ai', port: 443 }
+      - { host: api.anthropic.com, port: 443 }
+      - { host: platform.claude.com, port: 443 }
       - { host: claude.ai, port: 443 }
-      - { host: '*.datadoghq.com', port: 443 }
+      - { host: downloads.claude.ai, port: 443 }
+      - { host: statsig.anthropic.com, port: 443 }
+      - { host: mcp-proxy.anthropic.com, port: 443 }
+      - { host: http-intake.logs.us5.datadoghq.com, port: 443 }
     binaries:
       - { path: /usr/local/bin/claude }
 
   codex:
     name: codex
     endpoints:
-      - { host: '*.openai.com', port: 443 }
+      - { host: api.openai.com, port: 443 }
       - { host: chatgpt.com, port: 443 }
+      - { host: auth.openai.com, port: 443 }
     binaries:
       - { path: /usr/bin/codex }
 
   opencode:
     name: opencode
     endpoints:
-      - { host: '*.opencode.ai', port: 443 }
       - { host: opencode.ai, port: 443 }
+      - { host: api.opencode.ai, port: 443 }
     binaries:
       - { path: /usr/bin/opencode }
 
   github:
     name: github
     endpoints:
-      - { host: '*.github.com', port: 443 }
       - { host: github.com, port: 443 }
-      - { host: '*.githubusercontent.com', port: 443 }
+      - { host: api.github.com, port: 443 }
+      - { host: raw.githubusercontent.com, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      - { host: codeload.github.com, port: 443 }
+      - { host: gist.github.com, port: 443 }
       - { host: ghcr.io, port: 443 }
     binaries:
       - { path: /usr/local/bin/claude }
@@ -500,30 +515,6 @@ network_policies:
       - { path: /usr/bin/curl }
       - { path: /usr/bin/wget }
       - { path: /usr/bin/ssh }
-
-  package_registries:
-    name: package-registries
-    endpoints:
-      - { host: pypi.org, port: 443 }
-      - { host: '*.pythonhosted.org', port: 443 }
-      - { host: '*.npmjs.org', port: 443 }
-      - { host: '*.npmjs.com', port: 443 }
-      - { host: registry.npmjs.org, port: 443 }
-      - { host: '*.yarnpkg.com', port: 443 }
-      - { host: '*.crates.io', port: 443 }
-      - { host: crates.io, port: 443 }
-      - { host: '*.rubygems.org', port: 443 }
-      - { host: rubygems.org, port: 443 }
-      - { host: '*.docker.io', port: 443 }
-      - { host: '*.docker.com', port: 443 }
-    binaries:
-      - { path: /usr/local/bin/claude }
-      - { path: /usr/bin/codex }
-      - { path: /usr/bin/opencode }
-      - { path: /usr/bin/git }
-      - { path: /usr/bin/curl }
-      - { path: /usr/bin/wget }
-      - { path: /sandbox/.uv/python/cpython-3.13.12-linux-aarch64-gnu/bin/python3.13 }
 YAML
 }
 
