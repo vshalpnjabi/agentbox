@@ -463,7 +463,9 @@ network_policies:
       - { host: api.anthropic.com, port: 443 }
       - { host: platform.claude.com, port: 443 }
       - { host: claude.ai, port: 443 }
+      - { host: downloads.claude.ai, port: 443 }
       - { host: statsig.anthropic.com, port: 443 }
+      - { host: mcp-proxy.anthropic.com, port: 443 }
     binaries:
       - { path: /usr/local/bin/claude }
 
