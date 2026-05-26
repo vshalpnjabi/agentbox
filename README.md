@@ -36,7 +36,7 @@ End-to-end: type `claude` in any folder, get a fully-authenticated, sandboxed ag
 **One-liner (recommended):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.sh | bash
 ```
 
 The bootstrap script checks the platform, installs any missing Homebrew deps (openshell, mutagen, alerter, qrencode, jq), clones the repo to `~/src/agentbox`, and runs the installer. Add to your shell rc and you're done.
@@ -63,10 +63,10 @@ Then open a new shell, and `claude` / `codex` / `opencode` will route through ag
 ### Bootstrap knobs
 
 ```bash
-AGENTBOX_PREFIX=~/code curl -fsSL .../bootstrap.sh | bash   # clone target (default ~/src)
-AGENTBOX_YES=1         curl -fsSL .../bootstrap.sh | bash   # don't prompt before brew installs
-AGENTBOX_SKIP_BREW=1   curl -fsSL .../bootstrap.sh | bash   # don't auto-install deps; just check
-AGENTBOX_BRANCH=dev    curl -fsSL .../bootstrap.sh | bash   # check out a different branch
+AGENTBOX_PREFIX=~/code curl -fsSL .../install.sh | bash   # clone target (default ~/src)
+AGENTBOX_YES=1         curl -fsSL .../install.sh | bash   # don't prompt before brew installs
+AGENTBOX_SKIP_BREW=1   curl -fsSL .../install.sh | bash   # don't auto-install deps; just check
+AGENTBOX_BRANCH=dev    curl -fsSL .../install.sh | bash   # check out a different branch
 ```
 
 ## One-time host setup

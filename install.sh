@@ -1,27 +1,151 @@
 #!/usr/bin/env bash
-# agentbox installer: wires this repo's agentbox.sh into ~/.local/share/agentbox/,
-# detects installed agents (claude/codex/opencode/gemini), creates shim symlinks,
-# checks deps, and prints the PATH lines you need to add to your shell.
+# agentbox installer — works either as:
+#
+#   1) A standalone curl-pipe-bash bootstrapper (no checkout needed):
+#        curl -fsSL https://raw.githubusercontent.com/vshlpunjabi/agentbox/main/install.sh | bash
+#
+#   2) A local install from an existing checkout:
+#        git clone https://github.com/vshlpunjabi/agentbox.git ~/src/agentbox
+#        ~/src/agentbox/install.sh
+#
+# It auto-detects which mode it's in via the presence of agentbox.sh next to itself.
+#
+# Override knobs (env vars):
+#   AGENTBOX_PREFIX=~/src        Where to clone the repo (mode 1 only).
+#   AGENTBOX_REPO=https://...    Override repo URL (e.g., for a fork).
+#   AGENTBOX_BRANCH=main         Branch to check out.
+#   AGENTBOX_SKIP_BREW=1         Don't auto-install deps via brew; just check.
+#   AGENTBOX_YES=1               Don't prompt for confirmation on dep install.
 
 set -euo pipefail
 
-REPO_DIR=$(cd "$(dirname "$0")" && pwd -P)
+c_blue=$'\033[36m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_green=$'\033[32m'; c_reset=$'\033[0m'
+log()  { printf '%sinstall:%s %s\n' "$c_blue"   "$c_reset" "$*"; }
+warn() { printf '%sinstall:%s %s\n' "$c_yellow" "$c_reset" "$*" >&2; }
+err()  { printf '%sinstall:%s %s\n' "$c_red"    "$c_reset" "$*" >&2; exit 1; }
+ok()   { printf '%sinstall:%s %s\n' "$c_green"  "$c_reset" "$*"; }
+
+# ---- platform check ----
+case "$(uname)" in
+  Darwin) ;;
+  Linux)  warn "Linux is not fully tested. macOS-only features (alerter notifications, ntfy.app) degrade gracefully." ;;
+  *)      err "unsupported platform: $(uname). agentbox is macOS-first." ;;
+esac
+
+# ---- prompt helper (no tty = curl-pipe = default yes) ----
+confirm() {
+  local prompt="$1"
+  [ "${AGENTBOX_YES:-0}" = "1" ] && return 0
+  [ ! -t 0 ] && return 0
+  printf '%s [Y/n] ' "$prompt"
+  local ans; read -r ans
+  case "$ans" in n|N|no|NO) return 1 ;; *) return 0 ;; esac
+}
+
+# ---- detect mode ----
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+# Resolve symlinks to get the real script location
+if command -v realpath >/dev/null 2>&1; then
+  SCRIPT_DIR=$(dirname "$(realpath "$SCRIPT_PATH")") 2>/dev/null || SCRIPT_DIR=""
+else
+  SCRIPT_DIR=$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd) || SCRIPT_DIR=""
+fi
+
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/agentbox.sh" ]; then
+  MODE="local"
+  REPO_DIR="$SCRIPT_DIR"
+else
+  MODE="bootstrap"
+fi
+
+log "mode: $MODE"
+
+# ---- mode 1: bootstrap (curl-pipe-bash) — fetch the repo, then re-run self ----
+if [ "$MODE" = "bootstrap" ]; then
+  PREFIX="${AGENTBOX_PREFIX:-$HOME/src}"
+  REPO_URL="${AGENTBOX_REPO:-https://github.com/vshlpunjabi/agentbox.git}"
+  BRANCH="${AGENTBOX_BRANCH:-main}"
+  TARGET="$PREFIX/agentbox"
+
+  # Deps needed to bootstrap (git, plus all runtime deps so we do it once)
+  ensure_brew() {
+    command -v brew >/dev/null 2>&1 && return 0
+    [ "${AGENTBOX_SKIP_BREW:-0}" = "1" ] && err "Homebrew missing and AGENTBOX_SKIP_BREW=1"
+    err "Homebrew not found. Install from https://brew.sh first, then re-run."
+  }
+
+  declare -a deps=(
+    "git:git"
+    "openshell:nvidia/openshell/openshell"
+    "mutagen:mutagen-io/mutagen/mutagen"
+    "alerter:vjeantet/tap/alerter"
+    "qrencode:qrencode"
+    "jq:jq"
+  )
+
+  missing=()
+  for entry in "${deps[@]}"; do
+    cmd="${entry%%:*}"; spec="${entry##*:}"
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd:$spec")
+  done
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    log "missing dependencies:"
+    for m in "${missing[@]}"; do printf '    %s\n' "${m%%:*}"; done
+    [ "${AGENTBOX_SKIP_BREW:-0}" = "1" ] && err "AGENTBOX_SKIP_BREW=1; install the above manually and re-run."
+    ensure_brew
+    if confirm "Install missing deps via Homebrew now?"; then
+      for m in "${missing[@]}"; do
+        spec="${m##*:}"
+        log "brew install $spec"
+        brew install "$spec" 2>&1 | tail -3
+      done
+      ok "deps installed"
+    else
+      err "deps required; bailing"
+    fi
+  else
+    ok "all deps already installed"
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    docker info >/dev/null 2>&1 && ok "Docker daemon reachable" \
+      || warn "Docker installed but daemon not running. Start Docker Desktop before using agentbox."
+  elif command -v podman >/dev/null 2>&1; then
+    ok "podman detected (alternate compute driver)"
+  else
+    warn "no Docker/Podman/k8s detected. openshell needs a compute driver. Install Docker Desktop from https://docker.com"
+  fi
+
+  mkdir -p "$PREFIX"
+  if [ -d "$TARGET/.git" ]; then
+    log "updating existing checkout at $TARGET"
+    git -C "$TARGET" fetch --quiet origin "$BRANCH"
+    git -C "$TARGET" checkout --quiet "$BRANCH"
+    git -C "$TARGET" pull --quiet --ff-only origin "$BRANCH"
+  else
+    log "cloning $REPO_URL ($BRANCH) -> $TARGET"
+    git clone --quiet --branch "$BRANCH" "$REPO_URL" "$TARGET"
+  fi
+  ok "repo at $TARGET ($(git -C "$TARGET" rev-parse --short HEAD))"
+
+  log "re-running install.sh from the local checkout"
+  exec "$TARGET/install.sh"
+fi
+
+# ---- mode 2: local install (from existing checkout) ----
 AGB_HOME="${AGB_HOME:-$HOME/.local/share/agentbox}"
 AGB_BIN="$AGB_HOME/bin"
 USER_BIN="$HOME/.local/bin"
 
-log()  { printf '\033[36minstall:\033[0m %s\n' "$*"; }
-warn() { printf '\033[33minstall:\033[0m %s\n' "$*" >&2; }
-err()  { printf '\033[31minstall:\033[0m %s\n' "$*" >&2; exit 1; }
+log "checking runtime dependencies"
+command -v openshell >/dev/null 2>&1 || warn "openshell missing — brew install nvidia/openshell/openshell"
+command -v mutagen   >/dev/null 2>&1 || warn "mutagen missing — brew tap mutagen-io/mutagen && brew install mutagen"
+command -v alerter   >/dev/null 2>&1 || warn "alerter missing (optional, for approval dialogs) — brew install vjeantet/tap/alerter"
+command -v qrencode  >/dev/null 2>&1 || warn "qrencode missing (optional, for ntfy QR) — brew install qrencode"
+command -v jq        >/dev/null 2>&1 || warn "jq missing — brew install jq"
+docker info >/dev/null 2>&1 || warn "docker daemon not reachable. Start Docker Desktop before using agentbox."
 
-# ---- dep checks ----
-log "checking dependencies"
-command -v openshell >/dev/null || warn "openshell not found. Install: brew install nvidia/openshell/openshell"
-command -v mutagen   >/dev/null || warn "mutagen not found. Install: brew tap mutagen-io/mutagen && brew install mutagen"
-command -v docker    >/dev/null || warn "docker CLI not found; the openshell gateway needs a compute driver (docker/podman/k8s/vm)"
-docker info >/dev/null 2>&1 || warn "docker daemon not reachable. Start Docker Desktop (or your driver) before using agentbox."
-
-# ---- agent detection ----
 log "scanning for installed agents"
 mkdir -p "$AGB_HOME" "$AGB_BIN" "$USER_BIN" "$AGB_HOME/state"
 : > "$AGB_HOME/originals.conf"
@@ -29,7 +153,6 @@ mkdir -p "$AGB_HOME" "$AGB_BIN" "$USER_BIN" "$AGB_HOME/state"
 found=()
 for agent in claude codex opencode gemini; do
   if path=$(command -v "$agent" 2>/dev/null); then
-    # Don't record the agentbox shim itself if it already shadows the agent.
     case "$path" in
       "$AGB_BIN"/*) continue ;;
     esac
@@ -41,7 +164,6 @@ done
 
 [ "${#found[@]}" -eq 0 ] && err "no supported agents found on \$PATH (need at least one of: claude, codex, opencode, gemini)"
 
-# ---- symlinks ----
 log "installing shims under $AGB_BIN"
 ln -sf "$REPO_DIR/agentbox.sh" "$AGB_HOME/agentbox.sh"
 ln -sf "$AGB_HOME/agentbox.sh" "$AGB_BIN/agentbox"
@@ -49,15 +171,11 @@ for agent in "${found[@]}"; do
   ln -sf "$AGB_HOME/agentbox.sh" "$AGB_BIN/$agent"
 done
 
-# Also expose the management command via the user's existing ~/.local/bin (no PATH change needed)
 ln -sf "$AGB_HOME/agentbox.sh" "$USER_BIN/agentbox"
-
 chmod +x "$REPO_DIR/agentbox.sh"
 
-# ---- PATH hint ----
+ok "agentbox installed"
 cat <<EOF
-
-  agentbox installed.
 
   Files:
     repo:          $REPO_DIR
@@ -66,21 +184,24 @@ cat <<EOF
     mgmt symlink:  $USER_BIN/agentbox
     state dir:     $AGB_HOME/state
 
-  Next step — prepend the shim dir to your shell's PATH so 'claude'/'codex'/'opencode'
-  resolve to agentbox instead of the real binaries:
+  Add this to your shell config so 'claude'/'codex'/'opencode' resolve to
+  the agentbox shim instead of the real binaries:
 
-    # zsh (~/.zshrc):
+    # zsh / bash:
     export PATH="\$HOME/.local/share/agentbox/bin:\$PATH"
-
-    # bash (~/.bashrc):
-    export PATH="\$HOME/.local/share/agentbox/bin:\$PATH"
-
-    # fish (~/.config/fish/config.fish):
-    set -gx PATH \$HOME/.local/share/agentbox/bin \$PATH
 
     # nushell (env.nu):
     \$env.PATH = (\$env.PATH | prepend \$"(\$env.HOME)/.local/share/agentbox/bin")
 
   Then open a new shell and run 'agentbox help' or just 'claude' inside any workspace.
-  To call the real binaries without sandboxing, set AGENTBOX_BYPASS=1.
+
+  Optional one-time setup (interactive):
+
+    agentbox auth setup claude         # auto-authenticate claude inside sandboxes
+    agentbox notify setup              # ntfy.sh push notifications (opt-in)
+
+  Bypass agentbox for one invocation: AGENTBOX_BYPASS=1 claude
+
+  Source + docs: https://github.com/vshlpunjabi/agentbox
+
 EOF
