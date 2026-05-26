@@ -530,13 +530,26 @@ mutagen_ensure "$sandbox" "$PWD"
 mutagen_state_ensure "$sandbox"
 agent_ensure_installed "$sandbox" "$agent"
 
-# TTY: override > detect (stdout is a tty) > off
+# TTY: override > detect (stdout is a tty)
 case "${AGENTBOX_TTY:-auto}" in
-  on)  agb_tty_flag="--tty" ;;
-  off) agb_tty_flag="--no-tty" ;;
-  *)
-    if [ -t 1 ]; then agb_tty_flag="--tty"; else agb_tty_flag="--no-tty"; fi
-    ;;
+  on)  agb_want_tty=1 ;;
+  off) agb_want_tty=0 ;;
+  *)   [ -t 1 ] && agb_want_tty=1 || agb_want_tty=0 ;;
 esac
-log "launching $agent in $sandbox (workdir=/sandbox/work, tty=${agb_tty_flag#--})"
-exec openshell sandbox exec --name "$sandbox" "$agb_tty_flag" --workdir /sandbox/work -- "$agent" "$@"
+
+if [ "$agb_want_tty" -eq 1 ]; then
+  # Use SSH (via the agentbox-managed ~/.ssh/config block) for the interactive
+  # path — openshell sandbox exec --tty's gRPC channel was observed to break
+  # TUIs (each byte arrives line-buffered, terminal capability queries leak
+  # through). SSH plumbs a real PTY end-to-end via the openshell ssh-proxy.
+  log "launching $agent in $sandbox (via ssh -t, workdir=/sandbox/work)"
+  ssh_host="openshell-$sandbox"
+  quoted=""
+  for a in "$@"; do
+    quoted+=" $(printf '%q' "$a")"
+  done
+  exec ssh -t "$ssh_host" "cd /sandbox/work && exec $agent$quoted"
+else
+  log "launching $agent in $sandbox (via openshell exec --no-tty, workdir=/sandbox/work)"
+  exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /sandbox/work -- "$agent" "$@"
+fi
