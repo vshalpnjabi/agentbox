@@ -193,6 +193,16 @@ watcher_state_dir() { echo "$AGB_STATE_ROOT/$1"; }
 watcher_pid_file()  { echo "$(watcher_state_dir "$1")/watcher.pid"; }
 watcher_log_file()  { echo "$(watcher_state_dir "$1")/watcher.log"; }
 watcher_seen_file() { echo "$(watcher_state_dir "$1")/watcher-seen.txt"; }
+audit_log_file()    { echo "$(watcher_state_dir "$1")/audit.log"; }
+
+# Append a structured audit entry. Format: ISO-8601 timestamp + tag + message.
+audit_emit() {
+  local sandbox="$1" tag="$2" msg="$3"
+  local log_file
+  log_file=$(audit_log_file "$sandbox")
+  mkdir -p "$(dirname "$log_file")"
+  printf '%s [agentbox:%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$msg" >> "$log_file"
+}
 
 watcher_running() {
   local pf
@@ -414,6 +424,9 @@ cmd_watch_internal() {
     fi
 
     openshell logs "$sandbox" --tail --since 1s 2>/dev/null | while IFS= read -r line; do
+      # Persist every line to the host-side audit log (openshell's in-memory
+      # ring buffer is bounded and lost on gateway restart).
+      printf '%s\n' "$line" >> "$(audit_log_file "$sandbox")"
       [[ "$line" =~ NET:OPEN.*DENIED ]] || continue
       # Match: <binary>(<pid>) -> <host>:<port>
       if [[ "$line" =~ ([/A-Za-z0-9._-]+)\(([0-9]+)\)[[:space:]]*-\>[[:space:]]*([A-Za-z0-9.-]+):([0-9]+) ]]; then
@@ -444,6 +457,7 @@ cmd_watch_internal() {
               --add-endpoint "${host}:${port}" \
               --binary "$binary" \
               --wait >/dev/null 2>&1; then
+            audit_emit "$sandbox" "decision" "ALLOW $binary -> $host:$port (policy hot-reloaded by user)"
             echo "[watcher] approved: $host:$port for $binary (policy hot-reloaded)" >&2
             # Nudge: the agent already saw the 403 before approval. Until openshell
             # gets a hold-and-ask enforcement mode (deferred — see TODO), the user
@@ -453,6 +467,7 @@ cmd_watch_internal() {
             echo "[watcher] approval failed: openshell policy update returned non-zero" >&2
           fi
         else
+          audit_emit "$sandbox" "decision" "DENY $binary -> $host:$port (user declined; remembered in seen-list)"
           echo "[watcher] denied by user: $host:$port for $binary (won't prompt again)" >&2
         fi
 
@@ -1080,6 +1095,57 @@ cmd_auth_clear() {
   esac
 }
 
+cmd_audit() {
+  # View the host-side audit log for a sandbox. Captures every openshell event
+  # (network allows/denies/L7 inspections, with binary + pid + path/method)
+  # plus structured [agentbox:*] entries from the watcher for user decisions.
+  local sub="${1:-show}"
+  [ "$#" -gt 0 ] && shift
+  local name="${1:-$(workspace_sandbox_name)}"
+  local log_file
+  log_file=$(audit_log_file "$name")
+
+  case "$sub" in
+    show|cat)
+      [ -f "$log_file" ] || err "no audit log for $name yet (run claude in this workspace first)"
+      echo "$log_file ($(wc -l < "$log_file" | tr -d " ") lines, $(wc -c < "$log_file" | tr -d " ") bytes)"
+      echo "---"
+      cat "$log_file"
+      ;;
+    tail)
+      [ -f "$log_file" ] || err "no audit log for $name yet"
+      log "tailing $log_file (Ctrl-C to stop)"
+      exec tail -F "$log_file"
+      ;;
+    grep|search)
+      local pat="${1:-}"
+      [ -z "$pat" ] && err "usage: agentbox audit grep <pattern> [NAME]"
+      [ -f "$log_file" ] || err "no audit log for $name yet"
+      grep -E "$pat" "$log_file" || echo "(no matches)"
+      ;;
+    path)
+      echo "$log_file"
+      ;;
+    decisions)
+      [ -f "$log_file" ] || err "no audit log for $name yet"
+      grep "agentbox:decision" "$log_file" || echo "(no recorded decisions yet)"
+      ;;
+    denies)
+      [ -f "$log_file" ] || err "no audit log for $name yet"
+      grep "DENIED" "$log_file" | tail -50 || echo "(no denies in log)"
+      ;;
+    clear|truncate)
+      [ -f "$log_file" ] || { echo "(no log to clear)"; return 0; }
+      local before; before=$(wc -l < "$log_file" | tr -d " ")
+      : > "$log_file"
+      log "cleared $log_file ($before lines removed)"
+      ;;
+    *)
+      err "usage: agentbox audit {show|tail|grep <pattern>|decisions|denies|path|clear} [NAME]"
+      ;;
+  esac
+}
+
 cmd_notify() {
   # Manage the ntfy.sh approval channel: a cross-device push notification
   # backend with true two-button inline actions. Generates a hard-to-guess
@@ -1371,6 +1437,16 @@ Management:
   agentbox policy reload [N]   Push workspace policy to running sandbox
   agentbox policy reset [N]    Restore default policy + wipe approval seen-list
 
+Sandbox audit log (every openshell network event + watcher decisions,
+persisted to host so they survive gateway restarts):
+  agentbox audit show [NAME]               Print the full audit log
+  agentbox audit tail [NAME]               Live-tail the log (Ctrl-C to stop)
+  agentbox audit grep <pat> [NAME]         Filter the log by regex
+  agentbox audit denies [NAME]             Show only DENIED entries (recent 50)
+  agentbox audit decisions [NAME]          Show only Allow/Deny user decisions
+  agentbox audit path [NAME]               Print log file path (~/.local/share/agentbox/state/<sandbox>/audit.log)
+  agentbox audit clear [NAME]              Truncate the audit log
+
 Approval seen-list (the set of (binary, host:port) tuples the watcher
 won't re-prompt for):
   agentbox approve list [N]              Show seen-list for this workspace
@@ -1498,6 +1574,7 @@ if [ "$self_name" = "agentbox" ]; then
     shell)   cmd_shell "$@" ;;
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
+    audit)         cmd_audit "$@" ;;
     notifications) cmd_notifications "$@" ;;
     notify)        cmd_notify "$@" ;;
     auth)          cmd_auth "$@" ;;
