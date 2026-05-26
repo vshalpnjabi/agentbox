@@ -269,6 +269,55 @@ unfreeze_sandbox_agents() {
   openshell sandbox exec --name "$sandbox" --no-tty -- /bin/sh -c "$cmd" </dev/null >/dev/null 2>&1 || true
 }
 
+AGB_NTFY_TOPIC_FILE="$AGB_ROOT/ntfy-topic"
+AGB_NTFY_BASE="${AGB_NTFY_BASE:-https://ntfy.sh}"
+
+ntfy_get_topic() {
+  [ -f "$AGB_NTFY_TOPIC_FILE" ] || return 1
+  local t
+  t=$(tr -d "[:space:]" < "$AGB_NTFY_TOPIC_FILE")
+  [ -n "$t" ] && printf '%s\n' "$t"
+}
+
+ntfy_prompt() {
+  # Send an actionable ntfy notification with two HTTP action buttons that
+  # POST back to the same topic. Long-poll the topic for the user's response
+  # (filtered by a unique request id) and echo "Allow"/"Deny"/"".
+  local topic="$1" sandbox="$2" host="$3" port="$4" binary="$5"
+  local bname; bname=$(basename "$binary")
+  local req_id; req_id=$(printf '%s%s' "$(date +%s%N 2>/dev/null || date +%s)" "$$" | shasum -a 256 | cut -c1-16)
+  local since; since=$(date +%s)
+  local url="$AGB_NTFY_BASE/$topic"
+
+  # POST the notification. Actions: two http buttons that POST back with
+  # "ALLOW <req_id>" / "DENY <req_id>" so we can match this specific prompt.
+  curl -fsS -X POST \
+    -H "Title: agentbox: approve network access?" \
+    -H "Priority: high" \
+    -H "Tags: warning,lock" \
+    -H "Actions: http, Allow, $url, method=POST, body=ALLOW $req_id; http, Deny, $url, method=POST, body=DENY $req_id" \
+    -d "$bname -> $host:$port (sandbox: $sandbox)" \
+    "$url" >/dev/null 2>&1 || { echo ""; return; }
+
+  # Long-poll for response. ntfy supports ?poll=1&since=<sec>s to fetch all
+  # messages since N seconds ago in one batch — repeat until match or timeout.
+  local timeout=300
+  local deadline=$(( since + timeout ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local result
+    result=$(curl -fsS --max-time 10 "$url/json?poll=1&since=${since}s" 2>/dev/null \
+      | jq -r --arg id "$req_id" 'select(.message? | strings | test("^(ALLOW|DENY) " + $id + "$")) | .message' \
+      | head -1)
+    if [[ "$result" =~ ^ALLOW ]]; then
+      echo "Allow"; return
+    elif [[ "$result" =~ ^DENY ]]; then
+      echo "Deny"; return
+    fi
+    sleep 2
+  done
+  echo ""
+}
+
 # Prompt the user via alerter (proper macOS banner notification with
 # Allow/Deny action buttons; sender identity = com.apple.Terminal so the
 # notification isn't silently dropped on macOS 15+). Falls back to osascript
@@ -280,6 +329,23 @@ prompt_approval() {
   local bname; bname=$(basename "$binary")
   local subtitle="${bname} -> ${host}:${port}"
   local message="(sandbox: ${sandbox})"
+
+  # ntfy.sh backend (preferred when configured): cross-device push notification
+  # with proper two-button inline actions. Opt out per-invocation with
+  # AGENTBOX_NO_NTFY=1 (the watcher then falls through to alerter / osascript).
+  if [ "${AGENTBOX_NO_NTFY:-0}" != "1" ]; then
+    local topic
+    if topic=$(ntfy_get_topic) && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+      local result
+      result=$(ntfy_prompt "$topic" "$sandbox" "$host" "$port" "$binary")
+      if [ "$result" = "Allow" ] || [ "$result" = "Deny" ]; then
+        echo "$result"
+        return 0
+      fi
+      # ntfy timed out or failed; fall through to local alerter
+      echo "[watcher] ntfy returned no decision; falling back to alerter" >&2
+    fi
+  fi
 
   if command -v alerter >/dev/null 2>&1; then
     # Single action ("Allow") + the close button relabeled as "Deny" gives two
@@ -1005,6 +1071,80 @@ cmd_auth_clear() {
   esac
 }
 
+cmd_notify() {
+  # Manage the ntfy.sh approval channel: a cross-device push notification
+  # backend with true two-button inline actions. Generates a hard-to-guess
+  # topic, saves it locally, and prints subscribe instructions.
+  local sub="${1:-status}"
+  [ "$#" -gt 0 ] && shift
+
+  case "$sub" in
+    setup)
+      local existing
+      if existing=$(ntfy_get_topic); then
+        echo "ntfy topic already configured: $existing"
+        printf 'Overwrite? [y/N] ' >&2
+        local ans
+        IFS= read -r ans
+        [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { echo "(unchanged)"; return 0; }
+      fi
+      mkdir -p "$AGB_ROOT"
+      local topic="agentbox-$(uuidgen 2>/dev/null | tr "A-Z" "a-z" | tr -d "-" | head -c 24)"
+      [ "${#topic}" -lt 24 ] && topic="agentbox-$(printf '%s' "$RANDOM$RANDOM$RANDOM$$" | shasum -a 256 | cut -c1-24)"
+      printf '%s\n' "$topic" > "$AGB_NTFY_TOPIC_FILE"
+      chmod 600 "$AGB_NTFY_TOPIC_FILE"
+      log "saved ntfy topic to $AGB_NTFY_TOPIC_FILE"
+      echo
+      echo "Topic URL:    $AGB_NTFY_BASE/$topic"
+      echo
+      echo "Subscribe via one of:"
+      echo "  iOS:     install ntfy from App Store -> add topic '$topic'"
+      echo "  Android: install ntfy from Play Store / F-Droid -> add topic"
+      echo "  Desktop: install ntfy app or open $AGB_NTFY_BASE/$topic in a browser"
+      echo "  CLI:     curl -sS $AGB_NTFY_BASE/$topic/sse"
+      echo
+      echo "Sending a test notification..."
+      curl -fsS -X POST \
+        -H "Title: agentbox: setup complete" \
+        -H "Priority: default" \
+        -H "Tags: white_check_mark" \
+        -d "approvals will arrive here. Opt-out: AGENTBOX_NO_NTFY=1" \
+        "$AGB_NTFY_BASE/$topic" >/dev/null 2>&1 \
+        && echo "  ✓ test notification sent (you should see it shortly)" \
+        || warn "  test notification failed (network issue?)"
+      ;;
+    status)
+      local t
+      if t=$(ntfy_get_topic); then
+        echo "ntfy topic: $t"
+        echo "URL:        $AGB_NTFY_BASE/$t"
+        echo "Opt-out:    AGENTBOX_NO_NTFY=1"
+      else
+        echo "ntfy: not configured  (run: agentbox notify setup)"
+      fi
+      ;;
+    test)
+      local t
+      t=$(ntfy_get_topic) || err "no topic configured (run: agentbox notify setup)"
+      log "sending test notification with Allow/Deny actions to $t"
+      local result
+      result=$(ntfy_prompt "$t" "test-sandbox" "example.com" "443" "/usr/bin/curl")
+      echo "you clicked: [$result]"
+      ;;
+    clear|remove)
+      if [ -f "$AGB_NTFY_TOPIC_FILE" ]; then
+        rm -f "$AGB_NTFY_TOPIC_FILE"
+        log "removed ntfy topic"
+      else
+        echo "(already cleared)"
+      fi
+      ;;
+    *)
+      err "usage: agentbox notify {setup|status|test|clear}"
+      ;;
+  esac
+}
+
 cmd_notifications() {
   # Opens macOS System Settings to Notifications → Terminal so the user can
   # switch the notification style from "Banners" to "Alerts" (banners slide in
@@ -1152,6 +1292,15 @@ Notification appearance (macOS):
                                          "Alerts" for persistent banner-style
                                          approval prompts with action buttons.
 
+ntfy.sh (cross-device push notifications with two-button inline actions):
+  agentbox notify setup                  Generate a random topic, save it,
+                                         send a test notification.
+  agentbox notify status                 Show the configured topic + URL.
+  agentbox notify test                   Trigger a test Allow/Deny prompt.
+  agentbox notify clear                  Remove the saved topic.
+  AGENTBOX_NO_NTFY=1 claude              Skip ntfy for one invocation (falls
+                                         back to alerter / osascript).
+
 Per-agent host-side auth setup (so sandboxes auto-authenticate):
   agentbox auth status                          Show which agents are set up
   agentbox auth setup <claude|codex|opencode|all>
@@ -1254,6 +1403,7 @@ if [ "$self_name" = "agentbox" ]; then
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
     notifications) cmd_notifications "$@" ;;
+    notify)        cmd_notify "$@" ;;
     auth)          cmd_auth "$@" ;;
     destroy) cmd_destroy "$@" ;;
     __watch) cmd_watch_internal "$@" ;;
