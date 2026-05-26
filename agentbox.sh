@@ -531,7 +531,10 @@ apply_agentbox_tmux_settings() {
 inject_retry_to_agent() {
   local sandbox="$1" host="$2" port="$3" binary="$4"
   local prompt
-  prompt="${AGENTBOX_RETRY_PROMPT:-The previous request to ${host}:${port} was just approved by the user. Please retry the action that failed.}"
+  # Default kept short ("retry") so the char-by-char typing finishes fast
+  # and there's less surface area for paste-detect heuristics to trigger.
+  # Override with a longer / more detailed instruction via AGENTBOX_RETRY_PROMPT.
+  prompt="${AGENTBOX_RETRY_PROMPT:-retry}"
 
   # Preferred path: tmux send-keys to the agent's wrapped session. No focus
   # dependency, no keystroke fragility, works on macOS/Linux/Wayland/Windows.
