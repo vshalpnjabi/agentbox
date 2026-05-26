@@ -178,8 +178,12 @@ ln -sf "$AGB_HOME/agentbox.sh" "$USER_BIN/agentbox"
 chmod +x "$REPO_DIR/agentbox.sh"
 
 ok "agentbox installed"
-cat <<EOF
+log "running doctor for a final health check"
+echo
+"$AGB_HOME/agentbox.sh" doctor || true
+echo
 
+cat <<EOF
   Files:
     repo:          $REPO_DIR
     install dir:   $AGB_HOME

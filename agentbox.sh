@@ -1095,6 +1095,155 @@ cmd_auth_clear() {
   esac
 }
 
+cmd_doctor() {
+  # Health check: walk through every prerequisite agentbox needs and report
+  # which are good / missing / unknown. Offer to open the right macOS settings
+  # pane for the ones a user has to click through (Accessibility, Notifications).
+
+  local fix_mode=0
+  case "${1:-}" in --fix|fix) fix_mode=1 ;; esac
+
+  local pass=0 fail=0 unknown=0
+  local maybe_open_pane=()
+
+  printf '\nagentbox doctor\n'
+  printf '%s\n' "---------------"
+
+  _row() {
+    # _row STATUS LABEL [HINT]
+    local sym color
+    case "$1" in
+      ok)   sym="✓"; color="$c_green";  pass=$((pass+1)) ;;
+      bad)  sym="✗"; color="$c_red";    fail=$((fail+1)) ;;
+      warn) sym="!"; color="$c_yellow"; unknown=$((unknown+1)) ;;
+      info) sym="·"; color="$c_blue" ;;
+    esac
+    printf '  %s%s%s  %-30s' "$color" "$sym" "$c_reset" "$2"
+    [ -n "${3:-}" ] && printf '  %s%s%s' "$c_yellow" "$3" "$c_reset"
+    printf '\n'
+  }
+  c_blue=$'\033[36m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_green=$'\033[32m'; c_reset=$'\033[0m'
+
+  # ---- 1. CLI dependencies ----
+  for entry in "openshell:nvidia/openshell/openshell" "mutagen:mutagen-io/mutagen/mutagen" "alerter:vjeantet/tap/alerter" "qrencode:qrencode" "jq:jq" "git:git"; do
+    cmd="${entry%%:*}"; spec="${entry##*:}"
+    if command -v "$cmd" >/dev/null 2>&1; then
+      _row ok "$cmd"
+    else
+      _row bad "$cmd" "brew install $spec"
+    fi
+  done
+
+  # ---- 2. Docker / compute driver ----
+  if command -v docker >/dev/null 2>&1; then
+    if docker info >/dev/null 2>&1; then
+      _row ok "Docker daemon"
+    else
+      _row bad "Docker daemon" "start Docker Desktop"
+    fi
+  else
+    _row warn "Docker / Podman" "install Docker Desktop"
+  fi
+
+  # ---- 3. openshell gateway ----
+  if brew services list 2>/dev/null | grep -qE "^openshell\s+started"; then
+    _row ok "openshell gateway"
+  else
+    _row warn "openshell gateway" "brew services start openshell"
+  fi
+
+  # ---- 4. Accessibility permission for the terminal (alerter / osascript)
+  # osascript on macOS requires "Accessibility" or "Automation" perm to
+  # control System Events. Probe by querying running process names.
+  if [ "$(uname)" = "Darwin" ]; then
+    if osascript -e 'tell application "System Events" to count processes' >/dev/null 2>&1; then
+      _row ok "Accessibility (osascript)"
+    else
+      _row bad "Accessibility" "open System Settings → Privacy & Security → Accessibility; add Terminal"
+      maybe_open_pane+=("accessibility")
+    fi
+  fi
+
+  # ---- 5. Notifications permission for Terminal (alerter sender)
+  # macOS doesn't expose a clean read API for per-app notification settings,
+  # so we can only hint. Open the pane so the user can verify.
+  if [ "$(uname)" = "Darwin" ]; then
+    _row info "Notifications" "verify Terminal style = Alerts in System Settings"
+    maybe_open_pane+=("notifications")
+  fi
+
+  # ---- 6. Long-lived claude token (optional but recommended)
+  if [ -f "$HOME/.claude/.agentbox-oauth-token" ]; then
+    local sz; sz=$(wc -c < "$HOME/.claude/.agentbox-oauth-token" | tr -d " ")
+    _row ok "claude long-lived token" "$sz bytes"
+  else
+    _row warn "claude long-lived token" "agentbox auth setup claude"
+  fi
+
+  # ---- 7. codex / opencode auth
+  if [ -f "$HOME/.codex/auth.json" ]; then
+    _row ok "codex auth"
+  else
+    _row warn "codex auth" "agentbox auth setup codex"
+  fi
+  if [ -f "$HOME/.local/share/opencode/auth.json" ]; then
+    _row ok "opencode auth"
+  else
+    _row warn "opencode auth" "agentbox auth setup opencode"
+  fi
+
+  # ---- 8. ntfy (optional)
+  if [ -f "$AGB_NTFY_TOPIC_FILE" ]; then
+    if is_truthy "${AGENTBOX_NTFY:-}"; then
+      _row ok "ntfy.sh push"
+    else
+      _row warn "ntfy.sh push" "configured but disabled (export AGENTBOX_NTFY=1)"
+    fi
+  else
+    _row info "ntfy.sh push" "optional; agentbox notify setup"
+  fi
+
+  # ---- 9. Agents on PATH (the real binaries)
+  for agent in claude codex opencode; do
+    local real
+    real=$(awk -F= -v a="$agent" '$1==a {print $2}' "$AGB_ORIGINALS" 2>/dev/null)
+    if [ -n "$real" ] && [ -x "$real" ]; then
+      _row ok "$agent binary" "$real"
+    elif [ -n "$real" ]; then
+      _row bad "$agent binary" "recorded but missing: $real"
+    else
+      _row warn "$agent binary" "not detected (re-run install.sh after installing)"
+    fi
+  done
+
+  # ---- Summary
+  printf '\n  '
+  printf '%s%d pass%s · ' "$c_green" "$pass" "$c_reset"
+  [ "$fail" -gt 0 ] && printf '%s%d fail%s · ' "$c_red" "$fail" "$c_reset" || printf '%d fail · ' "$fail"
+  printf '%s%d warn%s\n\n' "$c_yellow" "$unknown" "$c_reset"
+
+  # ---- Offer to open settings panes if Accessibility/Notifications need attention
+  if [ "${#maybe_open_pane[@]}" -gt 0 ] && [ "$fix_mode" -eq 1 ]; then
+    for pane in "${maybe_open_pane[@]}"; do
+      case "$pane" in
+        accessibility)
+          log "opening Privacy & Security → Accessibility"
+          open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
+          ;;
+        notifications)
+          log "opening Notifications pane"
+          open "x-apple.systempreferences:com.apple.preference.notifications" 2>/dev/null || true
+          ;;
+      esac
+      sleep 1
+    done
+  elif [ "${#maybe_open_pane[@]}" -gt 0 ]; then
+    printf '  Run %s\n\n' "agentbox doctor --fix   # to auto-open the relevant System Settings panes"
+  fi
+
+  return $((fail > 0))
+}
+
 cmd_audit() {
   # View the host-side audit log for a sandbox. Captures every openshell event
   # (network allows/denies/L7 inspections, with binary + pid + path/method)
@@ -1437,6 +1586,15 @@ Management:
   agentbox policy reload [N]   Push workspace policy to running sandbox
   agentbox policy reset [N]    Restore default policy + wipe approval seen-list
 
+Health check:
+  agentbox doctor                          Walk every prerequisite + report
+                                           pass/fail/warn (deps, Docker, gateway,
+                                           Accessibility, Notifications, agent
+                                           auth, ntfy, agent binaries).
+  agentbox doctor --fix                    Same, plus auto-open System Settings
+                                           panes for permissions that need clicks
+                                           (Accessibility, Notifications).
+
 Sandbox audit log (every openshell network event + watcher decisions,
 persisted to host so they survive gateway restarts):
   agentbox audit show [NAME]               Print the full audit log
@@ -1575,6 +1733,7 @@ if [ "$self_name" = "agentbox" ]; then
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
     audit)         cmd_audit "$@" ;;
+    doctor)        cmd_doctor "$@" ;;
     notifications) cmd_notifications "$@" ;;
     notify)        cmd_notify "$@" ;;
     auth)          cmd_auth "$@" ;;
