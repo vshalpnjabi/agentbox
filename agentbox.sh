@@ -263,17 +263,43 @@ unfreeze_sandbox_agents() {
   openshell sandbox exec --name "$sandbox" --no-tty -- /bin/sh -c "$cmd" </dev/null >/dev/null 2>&1 || true
 }
 
-# Prompt the user via osascript `display alert` (system-styled informational
-# alert with Allow/Deny buttons). `display notification` doesn't accept input;
-# terminal-notifier 2.0 dropped -actions. `display alert` is the closest thing
-# to a "notification" that supports buttons. Echos "Allow" / "Deny" / "".
+# Prompt the user via alerter (proper macOS banner notification with
+# Allow/Deny action buttons; sender identity = com.apple.Terminal so the
+# notification isn't silently dropped on macOS 15+). Falls back to osascript
+# display alert if alerter isn't installed.
+# Echos "Allow", "Deny", or "" (timeout / dismissed).
 prompt_approval() {
   local sandbox="$1" host="$2" port="$3" binary="$4"
-  local title="agentbox approval"
+  local title="agentbox: approve network access?"
   local bname; bname=$(basename "$binary")
+  local subtitle="${bname} -> ${host}:${port}"
+  local message="(sandbox: ${sandbox})"
+
+  if command -v alerter >/dev/null 2>&1; then
+    # Single action ("Allow") + the close button relabeled as "Deny" gives two
+    # side-by-side buttons instead of a dropdown.
+    local response
+    response=$(alerter \
+      --title "$title" \
+      --subtitle "$subtitle" \
+      --message "$message" \
+      --actions "Allow" \
+      --close-label "Deny" \
+      --timeout 300 \
+      --sound default \
+      2>/dev/null)
+    case "$response" in
+      Allow)   echo "Allow" ;;
+      @CLOSED) echo "Deny" ;;
+      *)       echo "" ;;
+    esac
+    return 0
+  fi
+
+  # Fallback: osascript display alert
   local response
   response=$(osascript 2>/dev/null <<APPLESCRIPT
-display alert "${title}" message "${bname} in sandbox ${sandbox}\n\nwants to reach ${host}:${port}\n\nAllow and add to workspace policy?" as informational buttons {"Deny", "Allow"} default button "Allow"
+display alert "${title}" message "${subtitle}\n${message}" as informational buttons {"Deny", "Allow"} default button "Allow"
 APPLESCRIPT
 )
   case "$response" in
