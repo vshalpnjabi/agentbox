@@ -693,6 +693,29 @@ cmd_shell() {
   exec openshell sandbox exec --name "$name" --tty --workdir /sandbox/work -- /bin/sh -lc 'exec ${SHELL:-/bin/bash} -l'
 }
 
+cmd_notifications() {
+  # Opens macOS System Settings to Notifications → Terminal so the user can
+  # switch the notification style from "Banners" to "Alerts" (banners slide in
+  # and disappear; alerts persist and show action buttons inline).
+  if [ "$(uname)" != "Darwin" ]; then
+    err "notifications setup is macOS-only"
+  fi
+  cat <<'EOF' >&2
+
+In the pane that opens:
+  1. Find "Terminal" in the list (or whichever sender agentbox impersonates).
+  2. Set "Notification style" to "Alerts" (not Banners).
+  3. Ensure "Allow notifications" is on and "Show actions" is checked.
+
+Once that's set, agentbox approval prompts will appear as persistent
+alerts with side-by-side Allow / Deny buttons.
+
+EOF
+  open "x-apple.systempreferences:com.apple.preference.notifications" 2>/dev/null \
+    || open "x-apple.systempreferences:com.apple.Notifications-Settings.extension" 2>/dev/null \
+    || { err "couldn't open System Settings — navigate manually to Settings → Notifications → Terminal"; }
+}
+
 cmd_approve() {
   # Manage the watcher seen-list — the set of (binary, host, port) tuples the
   # user has already responded to. Entries here suppress re-prompts. Use this
@@ -810,6 +833,12 @@ won't re-prompt for):
   agentbox approve list [N]              Show seen-list for this workspace
   agentbox approve forget <pattern> [N]  Remove matching entries (re-prompts next time)
   agentbox approve reset [N]             Clear the entire seen-list
+
+Notification appearance (macOS):
+  agentbox notifications                 Open System Settings → Notifications →
+                                         Terminal. Set "Notification style" to
+                                         "Alerts" for persistent banner-style
+                                         approval prompts with action buttons.
   agentbox destroy [NAME]      Delete sandbox + ssh block (host state PRESERVED)
   agentbox destroy --purge [N] Also wipe ~/.local/share/agentbox/state/<sandbox>/
 
@@ -897,7 +926,8 @@ if [ "$self_name" = "agentbox" ]; then
     pull)    cmd_pull "$@" ;;
     shell)   cmd_shell "$@" ;;
     policy)  cmd_policy "$@" ;;
-    approve) cmd_approve "$@" ;;
+    approve)       cmd_approve "$@" ;;
+    notifications) cmd_notifications "$@" ;;
     destroy) cmd_destroy "$@" ;;
     __watch) cmd_watch_internal "$@" ;;
     help|-h|--help) cmd_help ;;
