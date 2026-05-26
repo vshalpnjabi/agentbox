@@ -477,6 +477,14 @@ APPLESCRIPT
 # Skipped automatically when already inside an outer tmux ($TMUX set) — nesting
 # is messy and we don't know which outer pane holds the agent.
 
+# All agentbox tmux state lives on a private socket (`-L`). This isolates
+# sessions, key bindings, hooks, and options from the user's own tmux
+# server — so the mouse / copy-mode tweaks below don't leak into their
+# regular tmux config. The trade-off: `tmux ls` from a normal shell won't
+# show these sessions; use `agentbox attach` or `tmux -L agentbox ls`.
+AGB_TMUX_SOCKET="${AGENTBOX_TMUX_SOCKET:-agentbox}"
+agb_tmux() { tmux -L "$AGB_TMUX_SOCKET" "$@"; }
+
 # Session name = sandbox name; sandbox names already start with "agentbox-".
 tmux_session_for_sandbox() { echo "$1"; }
 
@@ -484,7 +492,7 @@ tmux_available() { command -v tmux >/dev/null 2>&1; }
 
 tmux_have_session() {
   tmux_available || return 1
-  tmux has-session -t "$(tmux_session_for_sandbox "$1")" 2>/dev/null
+  agb_tmux has-session -t "$(tmux_session_for_sandbox "$1")" 2>/dev/null
 }
 
 # Should we wrap this launch in tmux? Returns 0 (yes) only when all three hold:
@@ -500,20 +508,28 @@ tmux_should_wrap() {
 
 tmux_kill_session() {
   tmux_available || return 0
-  tmux kill-session -t "$(tmux_session_for_sandbox "$1")" 2>/dev/null || true
+  agb_tmux kill-session -t "$(tmux_session_for_sandbox "$1")" 2>/dev/null || true
 }
 
-# Apply agentbox's preferred session-level tmux settings. Idempotent — safe
-# to call on every attach. Customize via env vars before launching an agent.
+# Apply agentbox's preferred session-level options + server-level mouse
+# bindings. Bindings live on tmux key tables (server-global) but since we
+# run on a private socket, they don't pollute the user's normal tmux.
+# Idempotent — safe to call on every attach.
 apply_agentbox_tmux_settings() {
   local session="$1"
   tmux_available || return 0
-  # Mouse on: scroll wheel scrolls the tmux history buffer instead of being
-  # translated to arrow keys (which agents misinterpret as navigation).
-  # Click-to-focus and pane resizing also start working.
-  tmux set-option -t "$session" mouse "${AGENTBOX_TMUX_MOUSE:-on}" >/dev/null 2>&1 || true
+  # Mouse on: scroll wheel scrolls history; click selects pane; etc.
+  agb_tmux set-option -t "$session" mouse "${AGENTBOX_TMUX_MOUSE:-on}" >/dev/null 2>&1 || true
   # Bigger scrollback than tmux's default of 2000 lines.
-  tmux set-option -t "$session" history-limit "${AGENTBOX_TMUX_HISTORY:-10000}" >/dev/null 2>&1 || true
+  agb_tmux set-option -t "$session" history-limit "${AGENTBOX_TMUX_HISTORY:-10000}" >/dev/null 2>&1 || true
+  # Make copy-mode less sticky: any mouse click (no drag) immediately
+  # cancels and returns to live input. Default tmux behavior keeps you
+  # in copy-mode after scroll-wheel triggers it, which surprises users
+  # who expect a click to "get me back to typing". `cancel` exits the
+  # mode entirely. Drag-to-select still works (drag is a different event
+  # MouseDrag1Pane), only standalone clicks are short-circuited.
+  agb_tmux bind-key -T copy-mode    MouseDown1Pane send-keys -X cancel >/dev/null 2>&1 || true
+  agb_tmux bind-key -T copy-mode-vi MouseDown1Pane send-keys -X cancel >/dev/null 2>&1 || true
 }
 
 # Type a retry prompt into the agent's TUI. Preferred delivery path is
@@ -555,7 +571,7 @@ inject_retry_to_agent() {
     local i len=${#prompt}
     local typed_ok=1
     for ((i=0; i<len; i++)); do
-      if ! tmux send-keys -t "$session" -l -- "${prompt:$i:1}" 2>/dev/null; then
+      if ! agb_tmux send-keys -t "$session" -l -- "${prompt:$i:1}" 2>/dev/null; then
         typed_ok=0; break
       fi
       [ "$typing_delay" != "0" ] && sleep "$typing_delay"
@@ -575,7 +591,7 @@ inject_retry_to_agent() {
       if [ "$submit_spec" != "none" ]; then
         local k
         for k in $submit_spec; do
-          tmux send-keys -t "$session" "$k" 2>/dev/null || true
+          agb_tmux send-keys -t "$session" "$k" 2>/dev/null || true
           sleep 0.05
         done
       fi
@@ -1515,14 +1531,14 @@ cmd_attach() {
   tmux_available || err "tmux not installed (brew install tmux)"
   local session
   session=$(tmux_session_for_sandbox "$name")
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! agb_tmux has-session -t "$session" 2>/dev/null; then
     err "no tmux session '$session' (run 'claude' / 'codex' / 'opencode' in this workspace to start one)"
   fi
   if [ -n "${TMUX:-}" ]; then
-    err "already inside tmux. Switch with: tmux switch-client -t $session"
+    err "already inside tmux. Detach (Ctrl-B d) first, then run: agentbox attach"
   fi
   apply_agentbox_tmux_settings "$session"
-  exec tmux attach -d -t "$session"
+  exec agb_tmux attach -d -t "$session"
 }
 
 cmd_auth() {
@@ -2367,16 +2383,20 @@ Approval prompts (macOS):
   in ~/.local/share/agentbox/state/<sandbox>/watcher-seen.txt so you're
   not asked again for the same tuple. Opt out with AGENTBOX_NO_WATCH=1.
 
-Tmux wrap (default-on; every TTY agent launch is wrapped in tmux so the
-watcher can deliver retry-prompts via send-keys regardless of focus, and
-you can detach/reattach without killing the agent):
-  Detach a session:           Ctrl-B then d (default tmux prefix)
+Tmux wrap (default-on; every TTY agent launch runs inside a dedicated
+tmux session so the watcher can deliver retry-prompts via send-keys
+regardless of focus, and you can detach/reattach without killing the
+agent). Agentbox uses its own tmux SOCKET ('-L agentbox') so its key
+bindings + options don't pollute your normal tmux config:
+  Detach a session:           Ctrl-B then d
   Reattach:                   agentbox attach [NAME]
-  List active sessions:       tmux ls
+  List active sessions:       tmux -L agentbox ls  (NOT plain 'tmux ls')
   Opt out for one shell:      export AGENTBOX_NO_TMUX=1
-  Scrollback (mouse wheel):   enabled by default — scroll wheel scrolls the
-                              tmux history. Disable: AGENTBOX_TMUX_MOUSE=off
+  Custom socket name:         export AGENTBOX_TMUX_SOCKET=mysocket
+  Mouse scrollback:           enabled by default. Disable: AGENTBOX_TMUX_MOUSE=off
   Scrollback depth:           AGENTBOX_TMUX_HISTORY=10000 (default)
+  Click in copy-mode:         exits back to live input (override default
+                              tmux behavior, which is sticky).
   Auto-skipped when already inside a tmux session (TMUX env set) — agentbox
   doesn't nest. Inside an outer tmux, retry-injection falls back to the
   keystroke path (which IS focus-dependent — see Force-retry caveats below).
@@ -2599,12 +2619,12 @@ if [ "$agb_want_tty" -eq 1 ]; then
     # session-level settings (idempotent on every attach), then attach.
     # Splitting into three steps lets us apply settings — `new-session -A`
     # alone has no hook for that.
-    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
-      tmux new-session -d -s "$tmux_session" "$ssh_invoke"
+    if ! agb_tmux has-session -t "$tmux_session" 2>/dev/null; then
+      agb_tmux new-session -d -s "$tmux_session" "$ssh_invoke"
     fi
     apply_agentbox_tmux_settings "$tmux_session"
     # -d detaches any other clients so a fresh window owns the session.
-    exec tmux attach -d -t "$tmux_session"
+    exec agb_tmux attach -d -t "$tmux_session"
   else
     if [ -n "${TMUX:-}" ]; then
       warn "already inside tmux (TMUX=$TMUX); skipping agentbox tmux wrap (retry-injection will fall back to keystroke). Run from outside tmux to use the wrap."
