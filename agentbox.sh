@@ -169,6 +169,151 @@ mutagen_state_ensure() {
     warn "state sync failed to start (session history won't persist this run)"
 }
 
+# ---- Approval watcher (macOS) ----
+# Background process that tails openshell logs for NET:OPEN DENIED events and
+# prompts the user (osascript display dialog) on the first occurrence of each
+# (binary, host:port) tuple. Approval adds the endpoint to the workspace policy
+# (hot-reloaded); decisions are remembered per-sandbox so the user is not
+# prompted again for the same tuple.
+
+watcher_state_dir() { echo "$AGB_STATE_ROOT/$1"; }
+watcher_pid_file()  { echo "$(watcher_state_dir "$1")/watcher.pid"; }
+watcher_log_file()  { echo "$(watcher_state_dir "$1")/watcher.log"; }
+watcher_seen_file() { echo "$(watcher_state_dir "$1")/watcher-seen.txt"; }
+
+watcher_running() {
+  local pf
+  pf=$(watcher_pid_file "$1")
+  [ -f "$pf" ] || return 1
+  local pid
+  pid=$(cat "$pf" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+watcher_ensure() {
+  local sandbox="$1"
+  [ "${AGENTBOX_NO_WATCH:-0}" = "1" ] && return 0
+  [ "$(uname)" = "Darwin" ] || return 0
+  command -v osascript >/dev/null 2>&1 || return 0
+
+  if watcher_running "$sandbox"; then
+    return 0
+  fi
+
+  local state_dir
+  state_dir=$(watcher_state_dir "$sandbox")
+  mkdir -p "$state_dir"
+  log "starting approval watcher for $sandbox (denials prompt; AGENTBOX_NO_WATCH=1 to disable)"
+
+  # Self-respawn via the hidden __watch subcommand
+  nohup "$AGB_ROOT/agentbox.sh" __watch "$sandbox" \
+    >"$(watcher_log_file "$sandbox")" 2>&1 &
+  disown 2>/dev/null || true
+}
+
+watcher_stop() {
+  local sandbox="$1"
+  local pf
+  pf=$(watcher_pid_file "$sandbox")
+  if [ -f "$pf" ]; then
+    local pid
+    pid=$(cat "$pf" 2>/dev/null)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    rm -f "$pf"
+  fi
+}
+
+# Freeze the agent process(es) inside the sandbox so the TUI visibly pauses
+# while the approval dialog is open. Belt-and-suspenders: SIGSTOP the exact
+# offending PID (in case the agent is the one calling out directly) plus any
+# top-level agent process by name (for tool-spawned-child denies). Single
+# openshell exec round-trip to minimize latency before the freeze takes effect.
+freeze_sandbox_agents() {
+  local sandbox="$1" pid="$2"
+  local cmd="kill -STOP $pid 2>/dev/null; pkill -STOP -x claude 2>/dev/null; pkill -STOP -x codex 2>/dev/null; pkill -STOP -x opencode 2>/dev/null; true"
+  openshell sandbox exec --name "$sandbox" --no-tty -- /bin/sh -c "$cmd" >/dev/null 2>&1 || true
+}
+
+unfreeze_sandbox_agents() {
+  local sandbox="$1" pid="$2"
+  local cmd="kill -CONT $pid 2>/dev/null; pkill -CONT -x claude 2>/dev/null; pkill -CONT -x codex 2>/dev/null; pkill -CONT -x opencode 2>/dev/null; true"
+  openshell sandbox exec --name "$sandbox" --no-tty -- /bin/sh -c "$cmd" >/dev/null 2>&1 || true
+}
+
+# The actual watcher loop, run in the background. Invoked as `agentbox __watch <sandbox>`.
+cmd_watch_internal() {
+  local sandbox="${1:-}"
+  [ -z "$sandbox" ] && { echo "usage: agentbox __watch <sandbox>" >&2; exit 2; }
+  local state_dir pid_file seen_file
+  state_dir=$(watcher_state_dir "$sandbox")
+  pid_file="$state_dir/watcher.pid"
+  seen_file="$state_dir/watcher-seen.txt"
+  mkdir -p "$state_dir"
+  touch "$seen_file"
+  echo "$$" > "$pid_file"
+  trap 'rm -f "$pid_file"' EXIT TERM INT
+
+  echo "[watcher] starting for $sandbox at $(date)" >&2
+
+  # Outer loop: reconnect if openshell logs disconnects (sandbox restart, etc.)
+  while true; do
+    # Verify sandbox still exists; exit cleanly if not.
+    if ! openshell sandbox list 2>/dev/null | awk '{print $1}' | grep -qx "$sandbox"; then
+      echo "[watcher] sandbox $sandbox no longer exists; exiting" >&2
+      exit 0
+    fi
+
+    openshell logs "$sandbox" --tail --since 1s 2>/dev/null | while IFS= read -r line; do
+      [[ "$line" =~ NET:OPEN.*DENIED ]] || continue
+      # Match: <binary>(<pid>) -> <host>:<port>
+      if [[ "$line" =~ ([/A-Za-z0-9._-]+)\(([0-9]+)\)[[:space:]]*-\>[[:space:]]*([A-Za-z0-9.-]+):([0-9]+) ]]; then
+        local binary="${BASH_REMATCH[1]}"
+        local host="${BASH_REMATCH[3]}"
+        local port="${BASH_REMATCH[4]}"
+        local key="${binary}|${host}|${port}"
+
+        if grep -Fxq "$key" "$seen_file"; then
+          continue
+        fi
+        echo "$key" >> "$seen_file"
+
+        echo "[watcher] denied: $binary($pid) -> $host:$port — freezing agents" >&2
+
+        # Freeze the offender + any top-level agent process so the TUI visibly
+        # pauses until the user decides.
+        freeze_sandbox_agents "$sandbox" "$pid"
+
+        local response
+        response=$(osascript <<APPLESCRIPT 2>/dev/null
+display dialog "Agent in sandbox \"$sandbox\" wants to reach:\n\n$host:$port\n\nFrom: $binary\n\nAllow this and add it to the workspace policy?\n\n(agent is paused until you decide)" buttons {"Deny", "Allow"} default button "Allow" with title "agentbox approval" with icon caution
+APPLESCRIPT
+)
+
+        if [[ "$response" == *"Allow"* ]]; then
+          if openshell policy update "$sandbox" \
+              --add-endpoint "${host}:${port}" \
+              --binary "$binary" \
+              --wait >/dev/null 2>&1; then
+            echo "[watcher] approved: $host:$port for $binary (policy hot-reloaded)" >&2
+            osascript -e "display notification \"Allowed $host:$port for $binary\" with title \"agentbox\"" 2>/dev/null || true
+          else
+            echo "[watcher] approval failed: openshell policy update returned non-zero" >&2
+          fi
+        else
+          echo "[watcher] denied by user: $host:$port for $binary (won't prompt again)" >&2
+        fi
+
+        # Always resume — even on deny, the agent needs to see the 403 and report back.
+        unfreeze_sandbox_agents "$sandbox" "$pid"
+        echo "[watcher] unfroze agents in $sandbox" >&2
+      fi
+    done
+
+    # Reconnect after brief pause
+    sleep 2
+  done
+}
+
 load_config() {
   AGB_IMAGE="$DEFAULT_IMAGE"
   AGB_CPU="$DEFAULT_CPU"
@@ -406,7 +551,8 @@ cmd_status() {
 
 cmd_stop() {
   local name="${1:-$(workspace_sandbox_name)}"
-  log "stopping mutagen sync for $name (sandbox + state preserved)"
+  log "stopping mutagen sync + watcher for $name (sandbox + state preserved)"
+  watcher_stop "$name"
   mutagen sync terminate "$name" >/dev/null 2>&1 || true
   mutagen sync terminate "${name}-state" >/dev/null 2>&1 || true
 }
@@ -426,6 +572,7 @@ cmd_destroy() {
   else
     log "destroying $name (sandbox + sync + ssh block; host state preserved at $AGB_STATE_ROOT/$name)"
   fi
+  watcher_stop "$name"
   mutagen sync terminate "$name" >/dev/null 2>&1 || true
   mutagen sync terminate "${name}-state" >/dev/null 2>&1 || true
   openshell sandbox delete "$name" >/dev/null 2>&1 || true
@@ -505,6 +652,16 @@ Management:
   agentbox destroy [NAME]      Delete sandbox + ssh block (host state PRESERVED)
   agentbox destroy --purge [N] Also wipe ~/.local/share/agentbox/state/<sandbox>/
 
+Approval prompts (macOS):
+  When an agent inside the sandbox hits a network deny (host:port not in
+  policy), a background watcher SIGSTOPs the agent process(es) and pops a
+  macOS dialog asking Allow/Deny — the TUI visibly pauses until you decide.
+  Allow → `openshell policy update` hot-reloads the rule, agent resumes
+  (the request that triggered the prompt still 403'd; retry succeeds).
+  Deny → agent resumes and sees the 403. The (binary, host, port) is kept
+  in ~/.local/share/agentbox/state/<sandbox>/watcher-seen.txt so you're
+  not asked again for the same tuple. Opt out with AGENTBOX_NO_WATCH=1.
+
 Session continuity:
   /sandbox/.claude/projects (claude conversation history) is live-synced to
   ~/.local/share/agentbox/state/<sandbox>/ via a second mutagen session.
@@ -570,6 +727,7 @@ if [ "$self_name" = "agentbox" ]; then
     shell)   cmd_shell "$@" ;;
     policy)  cmd_policy "$@" ;;
     destroy) cmd_destroy "$@" ;;
+    __watch) cmd_watch_internal "$@" ;;
     help|-h|--help) cmd_help ;;
     *) err "unknown subcommand '$sub' (try: agentbox help)" ;;
   esac
@@ -622,6 +780,7 @@ fi
 ssh_config_sync "$sandbox"
 mutagen_ensure "$sandbox" "$PWD"
 mutagen_state_ensure "$sandbox"
+watcher_ensure "$sandbox"
 agent_ensure_installed "$sandbox" "$agent"
 
 # TTY: override > detect (stdout is a tty)
