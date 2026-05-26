@@ -694,76 +694,160 @@ cmd_shell() {
 }
 
 cmd_auth() {
-  # One-time setup of a long-lived claude OAuth token. Runs the host's real
-  # claude (bypassing the agentbox shim) so setup-token's interactive flow
-  # works against your host's keychain auth, then saves the resulting token
-  # to ~/.claude/.agentbox-oauth-token. All future agentbox sandbox claude
-  # launches auto-inject this as CLAUDE_CODE_OAUTH_TOKEN — no re-auth.
-  local sub="${1:-setup}"
+  # Per-agent host-side auth setup. Each agent has its own credential file;
+  # agentbox uploads them into the sandbox on every launch (and for claude,
+  # also injects CLAUDE_CODE_OAUTH_TOKEN since macOS keychain isn't portable
+  # to the Linux sandbox).
+  #
+  # Auth surfaces:
+  #   claude    ~/.claude/.agentbox-oauth-token  (via `claude setup-token`)
+  #   codex     ~/.codex/auth.json               (via `codex login`)
+  #   opencode  ~/.local/share/opencode/auth.json (via `opencode auth login`)
+  local sub="${1:-status}"
   [ "$#" -gt 0 ] && shift
-  local tok_file="$HOME/.claude/.agentbox-oauth-token"
+  local agent="${1:-claude}"
+  [ "$#" -gt 0 ] && shift
 
   case "$sub" in
     setup)
+      cmd_auth_setup "$agent"
+      ;;
+    status)
+      cmd_auth_status
+      ;;
+    clear|remove)
+      cmd_auth_clear "$agent"
+      ;;
+    *)
+      err "usage: agentbox auth {setup|status|clear} [claude|codex|opencode|all]"
+      ;;
+  esac
+}
+
+cmd_auth_setup() {
+  local agent="$1"
+  case "$agent" in
+    all)
+      cmd_auth_setup claude
+      echo >&2
+      cmd_auth_setup codex
+      echo >&2
+      cmd_auth_setup opencode
+      return 0
+      ;;
+    claude)
       local real_claude
       real_claude=$(real_binary "claude")
-      [ -z "$real_claude" ] && err "no real claude binary recorded in $AGB_ORIGINALS (run install.sh)"
-      [ -x "$real_claude" ] || err "claude binary not executable at $real_claude"
-
+      [ -z "$real_claude" ] && err "no real claude binary recorded (run install.sh)"
+      [ -x "$real_claude" ] || err "claude not executable at $real_claude"
+      local tok_file="$HOME/.claude/.agentbox-oauth-token"
       mkdir -p "$(dirname "$tok_file")"
-      log "running '$real_claude setup-token' on host (interactive)..."
-      log "follow the prompts; the token will be saved to $tok_file"
-      echo >&2
-
-      # setup-token's URL/instruction text goes to stderr (visible); token
-      # to stdout. `tee` captures stdout to the file while still echoing.
+      log "claude: running '$real_claude setup-token' (interactive)"
+      log "  saves long-lived token to $tok_file"
       if "$real_claude" setup-token | tee "$tok_file"; then
-        # Strip whitespace and re-write to be safe
-        if [ -s "$tok_file" ]; then
-          # Keep only the last non-empty line (the token), tidy whitespace
-          local cleaned
-          cleaned=$(grep -E "." "$tok_file" | tail -1 | tr -d "[:space:]")
-          if [ -n "$cleaned" ]; then
-            printf '%s\n' "$cleaned" > "$tok_file"
-            chmod 600 "$tok_file"
-            log "saved long-lived token to $tok_file (mode 600, ${#cleaned} chars)"
-            log "future agentbox sandbox claude launches will auto-inject CLAUDE_CODE_OAUTH_TOKEN"
-          else
-            warn "no token captured (setup-token returned empty); retry or save manually"
-            rm -f "$tok_file"
-          fi
+        local cleaned
+        cleaned=$(grep -E "." "$tok_file" | tail -1 | tr -d "[:space:]")
+        if [ -n "$cleaned" ]; then
+          printf '%s\n' "$cleaned" > "$tok_file"
+          chmod 600 "$tok_file"
+          log "claude: saved long-lived token ($(wc -c < "$tok_file" | tr -d " ") bytes, mode 600)"
         else
-          warn "token file is empty — setup-token may have aborted"
           rm -f "$tok_file"
+          warn "claude: setup-token returned empty; auth not configured"
         fi
       else
         rm -f "$tok_file"
         err "claude setup-token failed"
       fi
       ;;
-    status)
-      if [ -f "$tok_file" ]; then
-        local sz; sz=$(wc -c < "$tok_file" | tr -d " ")
-        echo "long-lived token: $tok_file ($sz bytes, $(stat -f "%Sm" "$tok_file" 2>/dev/null))"
+    codex)
+      local real_codex
+      real_codex=$(real_binary "codex")
+      [ -z "$real_codex" ] && err "no real codex binary recorded (run install.sh)"
+      [ -x "$real_codex" ] || err "codex not executable at $real_codex"
+      log "codex: running '$real_codex login' (interactive)"
+      log "  saves credentials to ~/.codex/auth.json (auto-uploaded to sandboxes)"
+      "$real_codex" login || err "codex login failed"
+      if [ -f "$HOME/.codex/auth.json" ]; then
+        log "codex: auth.json present ($(wc -c < "$HOME/.codex/auth.json" | tr -d " ") bytes)"
       else
-        echo "long-lived token: NOT SET   (run: agentbox auth setup)"
-      fi
-      if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-        echo "ANTHROPIC_API_KEY: set in env (${#ANTHROPIC_API_KEY} chars)"
-      else
-        echo "ANTHROPIC_API_KEY: not set in env"
+        warn "codex: ~/.codex/auth.json not found after login — verify with 'codex login status'"
       fi
       ;;
-    clear|remove)
-      if [ -f "$tok_file" ]; then
-        rm -f "$tok_file"
-        log "removed $tok_file"
+    opencode)
+      local real_opencode
+      real_opencode=$(real_binary "opencode")
+      [ -z "$real_opencode" ] && err "no real opencode binary recorded (run install.sh)"
+      [ -x "$real_opencode" ] || err "opencode not executable at $real_opencode"
+      log "opencode: running '$real_opencode auth login' (interactive)"
+      log "  saves credentials to ~/.local/share/opencode/auth.json (auto-uploaded to sandboxes)"
+      "$real_opencode" auth login || err "opencode auth login failed"
+      if [ -f "$HOME/.local/share/opencode/auth.json" ]; then
+        log "opencode: auth.json present ($(wc -c < "$HOME/.local/share/opencode/auth.json" | tr -d " ") bytes)"
       else
-        echo "(already cleared)"
+        warn "opencode: auth.json not found — verify with 'opencode auth list'"
       fi
       ;;
     *)
-      err "usage: agentbox auth {setup|status|clear}"
+      err "unknown agent '$agent' (valid: claude | codex | opencode | all)"
+      ;;
+  esac
+}
+
+cmd_auth_status() {
+  local tok_file="$HOME/.claude/.agentbox-oauth-token"
+  echo "agent     credential file                                 status"
+  echo "--------  ---------------------------------------------  ---------------------"
+
+  if [ -f "$tok_file" ]; then
+    printf '%-8s  %-45s  %s\n' "claude" "$tok_file" "$(wc -c < "$tok_file" | tr -d " ") bytes"
+  else
+    printf '%-8s  %-45s  %s\n' "claude" "$tok_file" "NOT SET (agentbox auth setup claude)"
+  fi
+
+  if [ -f "$HOME/.codex/auth.json" ]; then
+    printf '%-8s  %-45s  %s\n' "codex" "~/.codex/auth.json" "$(wc -c < "$HOME/.codex/auth.json" | tr -d " ") bytes"
+  else
+    printf '%-8s  %-45s  %s\n' "codex" "~/.codex/auth.json" "NOT SET (agentbox auth setup codex)"
+  fi
+
+  if [ -f "$HOME/.local/share/opencode/auth.json" ]; then
+    printf '%-8s  %-45s  %s\n' "opencode" "~/.local/share/opencode/auth.json" "$(wc -c < "$HOME/.local/share/opencode/auth.json" | tr -d " ") bytes"
+  else
+    printf '%-8s  %-45s  %s\n' "opencode" "~/.local/share/opencode/auth.json" "NOT SET (agentbox auth setup opencode)"
+  fi
+
+  echo
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "ANTHROPIC_API_KEY: set in env (${#ANTHROPIC_API_KEY} chars) — used as claude fallback"
+  fi
+  if [ -n "${OPENAI_API_KEY:-}" ]; then
+    echo "OPENAI_API_KEY:    set in env (${#OPENAI_API_KEY} chars)    — forwarded to codex"
+  fi
+}
+
+cmd_auth_clear() {
+  local agent="$1"
+  case "$agent" in
+    all)
+      cmd_auth_clear claude
+      cmd_auth_clear codex
+      cmd_auth_clear opencode
+      ;;
+    claude)
+      local f="$HOME/.claude/.agentbox-oauth-token"
+      [ -f "$f" ] && { rm -f "$f"; log "removed $f"; } || echo "claude: already cleared"
+      ;;
+    codex)
+      local f="$HOME/.codex/auth.json"
+      [ -f "$f" ] && { rm -f "$f"; log "removed $f"; } || echo "codex: already cleared"
+      ;;
+    opencode)
+      local f="$HOME/.local/share/opencode/auth.json"
+      [ -f "$f" ] && { rm -f "$f"; log "removed $f"; } || echo "opencode: already cleared"
+      ;;
+    *)
+      err "unknown agent '$agent'"
       ;;
   esac
 }
@@ -915,11 +999,19 @@ Notification appearance (macOS):
                                          "Alerts" for persistent banner-style
                                          approval prompts with action buttons.
 
-Claude long-lived auth (one-time host setup so sandboxes auto-authenticate):
-  agentbox auth setup                    Run `claude setup-token` and save to
-                                         ~/.claude/.agentbox-oauth-token
-  agentbox auth status                   Show whether the token is configured
-  agentbox auth clear                    Remove the saved token
+Per-agent host-side auth setup (so sandboxes auto-authenticate):
+  agentbox auth status                          Show which agents are set up
+  agentbox auth setup <claude|codex|opencode|all>
+                                                Run agent's interactive login
+                                                and stash the credential file.
+  agentbox auth clear <claude|codex|opencode|all>
+                                                Remove the agent's host credential.
+
+  Credential layout (auto-uploaded into every sandbox):
+    claude    ~/.claude/.agentbox-oauth-token  (long-lived token, injected as
+                                                CLAUDE_CODE_OAUTH_TOKEN env)
+    codex     ~/.codex/auth.json
+    opencode  ~/.local/share/opencode/auth.json
   agentbox destroy [NAME]      Delete sandbox + ssh block (host state PRESERVED)
   agentbox destroy --purge [N] Also wipe ~/.local/share/agentbox/state/<sandbox>/
 
