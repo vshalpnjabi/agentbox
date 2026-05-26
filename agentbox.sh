@@ -278,17 +278,24 @@ cmd_watch_internal() {
         fi
         echo "$key" >> "$seen_file"
 
-        echo "[watcher] denied: $binary($pid) -> $host:$port — freezing agents" >&2
+        echo "[watcher] denied: $binary($pid) -> $host:$port — showing dialog" >&2
 
-        # Freeze the offender + any top-level agent process so the TUI visibly
-        # pauses until the user decides.
-        freeze_sandbox_agents "$sandbox" "$pid"
+        # NOTE: SIGSTOP-on-deny removed. From a nohup'd detached background process,
+        # `openshell sandbox exec --no-tty` hangs indefinitely (stdin handling — works
+        # from a foreground shell). The dialog still gates approval; the TUI just
+        # doesn't visibly freeze. Re-add when we have a non-blocking exec channel.
 
-        local response
-        response=$(osascript <<APPLESCRIPT 2>/dev/null
-display dialog "Agent in sandbox \"$sandbox\" wants to reach:\n\n$host:$port\n\nFrom: $binary\n\nAllow this and add it to the workspace policy?\n\n(agent is paused until you decide)" buttons {"Deny", "Allow"} default button "Allow" with title "agentbox approval" with icon caution
+        local response osa_err
+        osa_err=$(mktemp /tmp/agentbox-osa.XXXXXX) || osa_err=/dev/null
+        response=$(osascript 2>"$osa_err" <<APPLESCRIPT
+display dialog "Agent in sandbox \"$sandbox\" wants to reach:\n\n$host:$port\n\nFrom: $binary\n\nAllow and add to workspace policy?" buttons {"Deny", "Allow"} default button "Allow" with title "agentbox approval"
 APPLESCRIPT
 )
+        echo "[watcher] osascript exit=$?; response=[$response]" >&2
+        if [ -s "$osa_err" ]; then
+          echo "[watcher] osascript stderr: $(tr "\n" " " < "$osa_err")" >&2
+        fi
+        rm -f "$osa_err" 2>/dev/null
 
         if [[ "$response" == *"Allow"* ]]; then
           if openshell policy update "$sandbox" \
@@ -304,9 +311,7 @@ APPLESCRIPT
           echo "[watcher] denied by user: $host:$port for $binary (won't prompt again)" >&2
         fi
 
-        # Always resume — even on deny, the agent needs to see the 403 and report back.
-        unfreeze_sandbox_agents "$sandbox" "$pid"
-        echo "[watcher] unfroze agents in $sandbox" >&2
+        # (No unfreeze — freeze was removed; see note above.)
       fi
     done
 
