@@ -599,11 +599,24 @@ agent_env_token() {
 }
 
 upload_agent_credentials() {
-  # Seed sandbox with the host's auth file for the given agent so it's
-  # auto-authenticated (no browser/device-code flow inside the sandbox).
-  # Idempotent: re-uploads on every invocation so a host-refreshed token stays current.
+  # Seed sandbox with the host's auth so the agent is auto-authenticated and
+  # doesn't show the first-run "Select login method" screen.
+  #
+  # For claude specifically: synthesize a .credentials.json with the long-lived
+  # OAuth token from `agentbox auth setup claude`. Just passing
+  # CLAUDE_CODE_OAUTH_TOKEN via env var gives `claude --print` auth (sufficient
+  # for non-interactive use), but the TUI's onboarding flow checks for a
+  # claudeAiOauth blob on disk; without it the welcome screen pops every new
+  # sandbox. Building the blob from the long-lived token satisfies both checks.
+  #
+  # For codex/opencode: just upload the host's auth.json verbatim.
   local sandbox="$1" agent="$2"
   [ "${AGENTBOX_NO_AGENT_AUTH:-0}" = "1" ] && return 0
+
+  if [ "$agent" = "claude" ]; then
+    upload_claude_credentials_synthetic "$sandbox"
+    return 0
+  fi
 
   local mapping src dest dest_dir
   mapping=$(agent_auth_mapping "$agent") || return 0
@@ -613,12 +626,60 @@ upload_agent_credentials() {
   [ -f "$src" ] || return 0
   dest_dir=$(dirname "$dest")
 
-  openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p "$dest_dir" >/dev/null 2>&1 || true
-  if openshell sandbox upload "$sandbox" "$src" "$dest" >/dev/null 2>&1; then
-    openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 "$dest" >/dev/null 2>&1 || true
+  openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p "$dest_dir" </dev/null >/dev/null 2>&1 || true
+  if openshell sandbox upload "$sandbox" "$src" "$dest" </dev/null >/dev/null 2>&1; then
+    openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 "$dest" </dev/null >/dev/null 2>&1 || true
     log "synced host $agent credentials into sandbox ($dest)"
   else
     warn "$agent credential upload failed; agent inside sandbox will require interactive auth"
+  fi
+}
+
+upload_claude_credentials_synthetic() {
+  # Build /sandbox/.claude/.credentials.json from ~/.claude/.agentbox-oauth-token.
+  # Falls back to uploading host's ~/.claude/.credentials.json if no long-lived
+  # token exists (won't bypass welcome screen but won't break anything either).
+  local sandbox="$1"
+  local token_file="$HOME/.claude/.agentbox-oauth-token"
+  local host_creds="$HOME/.claude/.credentials.json"
+  local tmpfile
+
+  if [ -f "$token_file" ]; then
+    local tok
+    tok=$(tr -d "[:space:]" < "$token_file")
+    if [ -z "$tok" ]; then
+      warn "claude long-lived token file is empty; agent will need interactive auth"
+      return 0
+    fi
+    tmpfile=$(mktemp -t agentbox-cred) || return 1
+    cat > "$tmpfile" <<EOF
+{
+  "claudeAiOauth": {
+    "accessToken": "$tok",
+    "refreshToken": "$tok",
+    "expiresAt": 9999999999999,
+    "scopes": ["user:profile", "user:inference"],
+    "subscriptionType": "pro",
+    "rateLimitTier": "default"
+  }
+}
+EOF
+    openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude </dev/null >/dev/null 2>&1 || true
+    if openshell sandbox upload "$sandbox" "$tmpfile" /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
+      openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
+      log "synced synthetic claude credentials.json (from long-lived token; skips TUI welcome)"
+    else
+      warn "claude synthetic credential upload failed"
+    fi
+    rm -f "$tmpfile"
+  elif [ -f "$host_creds" ]; then
+    openshell sandbox exec --name "$sandbox" --no-tty -- mkdir -p /sandbox/.claude </dev/null >/dev/null 2>&1 || true
+    if openshell sandbox upload "$sandbox" "$host_creds" /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1; then
+      openshell sandbox exec --name "$sandbox" --no-tty -- chmod 600 /sandbox/.claude/.credentials.json </dev/null >/dev/null 2>&1 || true
+      log "synced host ~/.claude/.credentials.json (no long-lived token; welcome screen may still appear)"
+    fi
+  else
+    warn "no claude auth available (no long-lived token, no host .credentials.json) — TUI will require interactive login"
   fi
 }
 
