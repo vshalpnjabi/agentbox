@@ -63,7 +63,7 @@ sandbox_ensure() {
     log "creating sandbox $name (image=$image cpu=$cpu mem=$memory)"
   fi
 
-  local args=( sandbox create --name "$name" --from "$image" --cpu "$cpu" --memory "$memory" --upload ".:/agentbox/work" --no-tty )
+  local args=( sandbox create --name "$name" --from "$image" --cpu "$cpu" --memory "$memory" --upload ".:/sandbox/work" --no-tty )
   [ -n "$policy" ] && args+=( --policy "$policy" )
   args+=( -- /bin/true )
   openshell "${args[@]}" >/dev/null
@@ -114,7 +114,7 @@ mutagen_ensure() {
   ssh_host=$(ssh_host_for "$name")
   [ -z "$ssh_host" ] && err "could not resolve SSH host for sandbox $name (openshell sandbox ssh-config returned nothing)"
 
-  log "starting mutagen sync $name (host:$local_path <-> ${ssh_host}:/agentbox/work)"
+  log "starting mutagen sync $name (host:$local_path <-> ${ssh_host}:/sandbox/work)"
   mutagen sync create \
     --name "$name" \
     --mode two-way-resolved \
@@ -128,7 +128,7 @@ mutagen_ensure() {
     --ignore '/build' \
     --ignore '/.next' \
     --ignore '/.cache' \
-    "$local_path" "${ssh_host}:/agentbox/work" >/dev/null
+    "$local_path" "${ssh_host}:/sandbox/work" >/dev/null
 
   log "waiting for initial sync (up to ${MUTAGEN_SYNC_TIMEOUT}s)..."
   local i
@@ -415,7 +415,7 @@ write_default_policy() {
   local target="$1"
   cat > "$target" <<'YAML'
 # agentbox auto-generated sandbox policy
-# Default: deny-all network, baseline filesystem (workspace at /agentbox/work + system paths).
+# Default: deny-all network, baseline filesystem (workspace at /sandbox/work + system paths).
 # Edit this file to grant additional access. Static fields (filesystem/landlock/process)
 # require `agentbox destroy && claude` to take effect; network_policies hot-reloads on
 # `openshell policy update <sandbox>` against a running sandbox.
@@ -453,7 +453,6 @@ filesystem_policy:
     - /etc
   read_write:
     - /sandbox
-    - /agentbox
     - /tmp
     - /var
     - /run
@@ -794,7 +793,7 @@ cmd_pull() {
 
 cmd_shell() {
   local name="${1:-$(workspace_sandbox_name)}"
-  exec openshell sandbox exec --name "$name" --tty --workdir /agentbox/work -- /bin/sh -lc 'exec ${SHELL:-/bin/bash} -l'
+  exec openshell sandbox exec --name "$name" --tty --workdir /sandbox/work -- /bin/sh -lc 'exec ${SHELL:-/bin/bash} -l'
 }
 
 cmd_auth() {
@@ -1310,7 +1309,7 @@ if [ "$agb_want_tty" -eq 1 ]; then
   # path — openshell sandbox exec --tty's gRPC channel was observed to break
   # TUIs (each byte arrives line-buffered, terminal capability queries leak
   # through). SSH plumbs a real PTY end-to-end via the openshell ssh-proxy.
-  log "launching $agent in $sandbox (via ssh -t, workdir=/agentbox/work)"
+  log "launching $agent in $sandbox (via ssh -t, workdir=/sandbox/work)"
   ssh_host="openshell-$sandbox"
   quoted=""
   for a in "$@"; do
@@ -1329,14 +1328,14 @@ if [ "$agb_want_tty" -eq 1 ]; then
   # Silence claude's "Native installation exists but ~/.local/bin is not in your
   # PATH" by ensuring the symlink and the PATH entry both exist inside the sandbox.
   setup_prefix="mkdir -p \$HOME/.local/bin && ln -sf /usr/local/bin/claude \$HOME/.local/bin/claude 2>/dev/null; export PATH=\$HOME/.local/bin:\$PATH && "
-  exec ssh -t "$ssh_host" "${setup_prefix}${env_prefix}cd /agentbox/work && exec $agent$quoted"
+  exec ssh -t "$ssh_host" "${setup_prefix}${env_prefix}cd /sandbox/work && exec $agent$quoted"
 else
-  log "launching $agent in $sandbox (via openshell exec --no-tty, workdir=/agentbox/work)"
+  log "launching $agent in $sandbox (via openshell exec --no-tty, workdir=/sandbox/work)"
   env_line=$(agent_env_token "$agent")
   if [ -n "$env_line" ]; then
     log "  injecting ${env_line%%=*} into sandbox (from host)"
-    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /agentbox/work -- /usr/bin/env "$env_line" "$agent" "$@"
+    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /sandbox/work -- /usr/bin/env "$env_line" "$agent" "$@"
   else
-    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /agentbox/work -- "$agent" "$@"
+    exec openshell sandbox exec --name "$sandbox" --no-tty --workdir /sandbox/work -- "$agent" "$@"
   fi
 fi
