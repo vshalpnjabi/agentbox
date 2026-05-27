@@ -533,45 +533,10 @@ prompt_approval() {
     fi
   fi
 
-  # macOS: osascript display alert is the default — it's a modal dialog
-  # that natively supports 3 side-by-side buttons (Deny / Allow all *.x /
-  # Allow), all visible without a dropdown. alerter's banner notification
-  # is preferred ergonomically (less intrusive) but NSUserNotification
-  # only supports one primary action button — anything more becomes a
-  # macOS-native dropdown labeled "Options"/"Show" which the user finds
-  # clunky.
-  #
-  # Trade-off accepted: focused modal dialog instead of banner, in
-  # exchange for all 3 options visible as buttons.
-  #
-  # For users who specifically want banner notifications:
-  #   - export AGENTBOX_NTFY=1 (ntfy push with 3 inline buttons)
-  #   - or fall back to alerter explicitly: AGENTBOX_PROMPT=alerter
-  if [ "$(uname)" = "Darwin" ] && command -v osascript >/dev/null 2>&1 \
-       && [ "${AGENTBOX_PROMPT:-osascript}" = "osascript" ]; then
-    local response
-    response=$(osascript 2>/dev/null <<APPLESCRIPT
-display alert "${title}" message "${subtitle}
-${message}" as informational buttons {"Deny", "${wild_label}", "Allow"} default button "Allow"
-APPLESCRIPT
-)
-    # Order matters: "Allow all *.x" contains "Allow" so the wildcard
-    # match must come before the bare-Allow match.
-    case "$response" in
-      *"Allow all "*) echo "AllowWildcard:$wild" ;;
-      *Allow*)        echo "Allow" ;;
-      *Deny*)         echo "Deny" ;;
-      *)              echo "" ;;
-    esac
-    return 0
-  fi
-
-  # macOS opt-in or fallback: alerter banner notification.
-  # AGENTBOX_PROMPT=alerter forces this even when osascript is available.
-  # Otherwise this only fires when osascript is missing (unusual on macOS).
-  # macOS UX limit: NSUserNotification supports exactly ONE primary action
-  # button. Passing 2+ to --actions makes macOS render a dropdown ("Options"
-  # / "Show") — that label is macOS-native and not configurable.
+  # macOS: alerter banner notification is the default — less intrusive than
+  # a modal dialog. The 3rd option ("Allow all *.x") goes into the macOS-
+  # native dropdown labeled "Options" / "Show". That label is rendered by
+  # macOS, not configurable via alerter or NSUserNotification.
   if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
     local response
     response=$(alerter \
@@ -588,6 +553,26 @@ APPLESCRIPT
       "$wild_label") echo "AllowWildcard:$wild" ;;
       @CLOSED)       echo "Deny" ;;
       *)             echo "" ;;
+    esac
+    return 0
+  fi
+
+  # macOS fallback: osascript display alert (3-button modal). Fires only
+  # when alerter isn't installed.
+  if [ "$(uname)" = "Darwin" ] && command -v osascript >/dev/null 2>&1; then
+    local response
+    response=$(osascript 2>/dev/null <<APPLESCRIPT
+display alert "${title}" message "${subtitle}
+${message}" as informational buttons {"Deny", "${wild_label}", "Allow"} default button "Allow"
+APPLESCRIPT
+)
+    # Order matters: "Allow all *.x" contains "Allow" so the wildcard
+    # match must come before the bare-Allow match.
+    case "$response" in
+      *"Allow all "*) echo "AllowWildcard:$wild" ;;
+      *Allow*)        echo "Allow" ;;
+      *Deny*)         echo "Deny" ;;
+      *)              echo "" ;;
     esac
     return 0
   fi
