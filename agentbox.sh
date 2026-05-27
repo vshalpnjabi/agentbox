@@ -235,9 +235,41 @@ watcher_ensure() {
     return 0
   fi
 
-  # Clean up stale pid file if process died without removing it
   local pf
   pf=$(watcher_pid_file "$sandbox")
+
+  # Belt-and-suspenders cleanup: kill any orphaned watchers for THIS sandbox
+  # by pgrep pattern. The pid file only tracks the most recently started
+  # watcher; if two were spawned via a race (separate `claude` invocations
+  # in different shells, or a stop+pkill that missed a child subshell), we
+  # end up with concurrent watchers that race on `openshell policy update`
+  # — each reads policy version N, pushes N+1 with their addition, and
+  # the last write wins (overwriting the others' Allow). This is THE
+  # cause of "I clicked Allow but the policy didn't actually update".
+  local pattern="agentbox.sh __watch $sandbox"
+  local orphans
+  orphans=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
+  if [ -n "$orphans" ]; then
+    # Distinguish "the one we already have tracked" from "orphans"
+    local tracked=""
+    [ -f "$pf" ] && tracked=$(cat "$pf" 2>/dev/null)
+    local to_kill=""
+    for p in $orphans; do
+      [ "$p" = "$tracked" ] && continue
+      to_kill+=" $p"
+    done
+    if [ -n "$to_kill" ]; then
+      log "killing orphan watcher pid(s) for $sandbox:$to_kill"
+      kill $to_kill 2>/dev/null || true
+      sleep 0.3
+      # If anything survived SIGTERM, escalate
+      local stubborn
+      stubborn=$(pgrep -f "$pattern" 2>/dev/null | grep -vFx "${tracked:-NONE}" | tr '\n' ' ')
+      [ -n "$stubborn" ] && kill -9 $stubborn 2>/dev/null || true
+    fi
+  fi
+
+  # Now check the pid-file-tracked watcher: alive? then we're done.
   if [ -f "$pf" ]; then
     local existing_pid
     existing_pid=$(cat "$pf" 2>/dev/null)
@@ -264,14 +296,20 @@ watcher_ensure() {
 
 watcher_stop() {
   local sandbox="$1"
-  local pf
-  pf=$(watcher_pid_file "$sandbox")
-  if [ -f "$pf" ]; then
-    local pid
-    pid=$(cat "$pf" 2>/dev/null)
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-    rm -f "$pf"
+  # Kill ALL watchers for this sandbox (not just the one in the pid file).
+  # The pid file only tracks the most recent watcher; orphans from races
+  # would survive a pid-file-only kill and continue to interfere.
+  local pattern="agentbox.sh __watch $sandbox"
+  local pids
+  pids=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
+  if [ -n "$pids" ]; then
+    kill $pids 2>/dev/null || true
+    sleep 0.3
+    local stubborn
+    stubborn=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
+    [ -n "$stubborn" ] && kill -9 $stubborn 2>/dev/null || true
   fi
+  rm -f "$(watcher_pid_file "$sandbox")"
 }
 
 # Freeze the agent process(es) inside the sandbox so the TUI visibly pauses
