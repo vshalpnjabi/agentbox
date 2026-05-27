@@ -1538,7 +1538,9 @@ cmd_attach() {
     err "already inside tmux. Detach (Ctrl-B d) first, then run: agentbox attach"
   fi
   apply_agentbox_tmux_settings "$session"
-  exec agb_tmux attach -d -t "$session"
+  # exec replaces this shell with tmux, so the agb_tmux function wouldn't be
+  # available — inline `tmux -L "$AGB_TMUX_SOCKET"` instead.
+  exec tmux -L "$AGB_TMUX_SOCKET" attach -d -t "$session"
 }
 
 cmd_auth() {
@@ -2624,7 +2626,9 @@ if [ "$agb_want_tty" -eq 1 ]; then
     fi
     apply_agentbox_tmux_settings "$tmux_session"
     # -d detaches any other clients so a fresh window owns the session.
-    exec agb_tmux attach -d -t "$tmux_session"
+    # exec replaces this shell, so `agb_tmux` (a function) wouldn't be visible —
+    # inline `tmux -L "$AGB_TMUX_SOCKET"` instead.
+    exec tmux -L "$AGB_TMUX_SOCKET" attach -d -t "$tmux_session"
   else
     if [ -n "${TMUX:-}" ]; then
       warn "already inside tmux (TMUX=$TMUX); skipping agentbox tmux wrap (retry-injection will fall back to keystroke). Run from outside tmux to use the wrap."
