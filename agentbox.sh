@@ -533,25 +533,26 @@ prompt_approval() {
     fi
   fi
 
-  # macOS: alerter banner notification is the default. All three options
-  # (Allow / Allow all *.x / Deny) live in the macOS-native "Options"
-  # dropdown so the dropdown is the single point of interaction. The X
-  # close button (label = "Close" by default) also maps to Deny.
+  # macOS: alerter banner notification is the default. Only TWO actions so
+  # macOS doesn't collapse into a "Show" dropdown — "Allow" as the primary
+  # button and "Deny" as the close-button label. "Allow" semantically means
+  # "Allow all *.parent.host" (wildcard); the narrower exact-host grant is
+  # only available in the osascript / ntfy / zenity backends.
   if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
     local response
     response=$(alerter \
       --title "$title" \
       --subtitle "$subtitle" \
       --message "$message" \
-      --actions "Allow,$wild_label,Deny" \
+      --actions "Allow" \
+      --close-label "Deny" \
       --timeout 300 \
       --sound default \
       2>/dev/null)
     case "$response" in
-      Allow)         echo "Allow" ;;
-      "$wild_label") echo "AllowWildcard:$wild" ;;
-      Deny|@CLOSED)  echo "Deny" ;;
-      *)             echo "" ;;
+      Allow)              echo "AllowWildcard:$wild" ;;
+      Deny|@CLOSED)       echo "Deny" ;;
+      *)                  echo "" ;;
     esac
     return 0
   fi
