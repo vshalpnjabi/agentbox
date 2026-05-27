@@ -346,37 +346,59 @@ ntfy_get_topic() {
   [ -n "$t" ] && printf '%s\n' "$t"
 }
 
+# Derive a wildcard parent zone from a hostname for the "Approve *.parent" UX:
+#   static.rust-lang.org → *.rust-lang.org    (strip leftmost label)
+#   crates.io            → *.crates.io        (2-label apex stays prefixed)
+#   download.crates.io   → *.crates.io        (strip leftmost label)
+#   cdn.s.example.com    → *.s.example.com    (strip leftmost label)
+# The wildcard matches subdomains of the parent zone but typically not the
+# apex itself (openshell's pattern); that's the desired semantics — apex is
+# already in front of you as "host" and approved separately on this prompt.
+wildcard_for_host() {
+  local h="$1"
+  local dots="${h//[^.]/}"
+  local count=${#dots}
+  if [ "$count" -ge 2 ]; then
+    echo "*.${h#*.}"
+  else
+    echo "*.${h}"
+  fi
+}
+
 ntfy_prompt() {
-  # Send an actionable ntfy notification with two HTTP action buttons that
+  # Send an actionable ntfy notification with three HTTP action buttons that
   # POST back to the same topic. Long-poll the topic for the user's response
-  # (filtered by a unique request id) and echo "Allow"/"Deny"/"".
+  # (filtered by a unique request id). Echos "Allow" / "Deny" /
+  # "AllowWildcard:*.parent.host" / "" (timeout).
   local topic="$1" sandbox="$2" host="$3" port="$4" binary="$5"
   local bname; bname=$(basename "$binary")
+  local wild; wild=$(wildcard_for_host "$host")
   local req_id; req_id=$(printf '%s%s' "$(date +%s%N 2>/dev/null || date +%s)" "$$" | shasum -a 256 | cut -c1-16)
   local since; since=$(date +%s)
   local url="$AGB_NTFY_BASE/$topic"
 
-  # POST the notification. Actions: two http buttons that POST back with
-  # "ALLOW <req_id>" / "DENY <req_id>" so we can match this specific prompt.
+  # POST the notification with THREE actions: Allow, Approve <wildcard>, Deny.
+  # ntfy allows up to 3 action buttons per notification.
   curl -fsS -X POST \
     -H "Title: agentbox: approve network access?" \
     -H "Priority: high" \
     -H "Tags: warning,lock" \
-    -H "Actions: http, Allow, $url, method=POST, body=ALLOW $req_id; http, Deny, $url, method=POST, body=DENY $req_id" \
+    -H "Actions: http, Allow, $url, method=POST, body=ALLOW $req_id; http, Approve $wild, $url, method=POST, body=WILDCARD $req_id; http, Deny, $url, method=POST, body=DENY $req_id" \
     -d "$bname -> $host:$port (sandbox: $sandbox)" \
     "$url" >/dev/null 2>&1 || { echo ""; return; }
 
-  # Long-poll for response. ntfy supports ?poll=1&since=<sec>s to fetch all
-  # messages since N seconds ago in one batch — repeat until match or timeout.
+  # Long-poll for response.
   local timeout=300
   local deadline=$(( since + timeout ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local result
     result=$(curl -fsS --max-time 10 "$url/json?poll=1&since=${since}s" 2>/dev/null \
-      | jq -r --arg id "$req_id" 'select(.message? | strings | test("^(ALLOW|DENY) " + $id + "$")) | .message' \
+      | jq -r --arg id "$req_id" 'select(.message? | strings | test("^(ALLOW|DENY|WILDCARD) " + $id + "$")) | .message' \
       | head -1)
     if [[ "$result" =~ ^ALLOW ]]; then
       echo "Allow"; return
+    elif [[ "$result" =~ ^WILDCARD ]]; then
+      echo "AllowWildcard:$wild"; return
     elif [[ "$result" =~ ^DENY ]]; then
       echo "Deny"; return
     fi
@@ -422,9 +444,11 @@ prompt_approval() {
   local title="agentbox: approve network access?"
   local bname; bname=$(basename "$binary")
   local subtitle="${bname} -> ${host}:${port}"
+  local wild; wild=$(wildcard_for_host "$host")
   local message="(sandbox: ${sandbox})"
+  local wild_label="Approve $wild"
 
-  # ntfy.sh backend (cross-device push, two-button inline). STRICTLY opt-in:
+  # ntfy.sh backend (cross-device push, three-button inline). STRICTLY opt-in:
   # both AGENTBOX_NTFY=1 must be exported AND a topic must be configured via
   # `agentbox notify setup`. Without the env var, alerter is used even if a
   # topic is saved (so the topic file isn't a hidden on-switch).
@@ -433,61 +457,74 @@ prompt_approval() {
     if topic=$(ntfy_get_topic) && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
       local result
       result=$(ntfy_prompt "$topic" "$sandbox" "$host" "$port" "$binary")
-      if [ "$result" = "Allow" ] || [ "$result" = "Deny" ]; then
-        echo "$result"
-        return 0
-      fi
+      case "$result" in
+        Allow|Deny|AllowWildcard:*)
+          echo "$result"
+          return 0
+          ;;
+      esac
       echo "[watcher] ntfy returned no decision; falling back to alerter" >&2
     elif ! topic=$(ntfy_get_topic); then
       echo "[watcher] AGENTBOX_NTFY=1 set but no topic configured (agentbox notify setup)" >&2
     fi
   fi
 
-  # macOS: alerter is the preferred local prompt (banner + Allow/Deny buttons).
+  # macOS: alerter is the preferred local prompt. Three-state result: Allow
+  # button, "Approve *.parent" action button, close = Deny.
   if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
     local response
     response=$(alerter \
       --title "$title" \
       --subtitle "$subtitle" \
       --message "$message" \
-      --actions "Allow" \
+      --actions "Allow,$wild_label" \
       --close-label "Deny" \
       --timeout 300 \
       --sound default \
       2>/dev/null)
     case "$response" in
-      Allow)   echo "Allow" ;;
-      @CLOSED) echo "Deny" ;;
-      *)       echo "" ;;
+      Allow)         echo "Allow" ;;
+      "$wild_label") echo "AllowWildcard:$wild" ;;
+      @CLOSED)       echo "Deny" ;;
+      *)             echo "" ;;
     esac
     return 0
   fi
 
-  # macOS fallback: osascript display alert (focused modal with buttons).
+  # macOS fallback: osascript display alert (3-button modal).
   if [ "$(uname)" = "Darwin" ] && command -v osascript >/dev/null 2>&1; then
     local response
     response=$(osascript 2>/dev/null <<APPLESCRIPT
-display alert "${title}" message "${subtitle}\n${message}" as informational buttons {"Deny", "Allow"} default button "Allow"
+display alert "${title}" message "${subtitle}\n${message}" as informational buttons {"Deny", "${wild_label}", "Allow"} default button "Allow"
 APPLESCRIPT
 )
     case "$response" in
-      *Allow*) echo "Allow" ;;
-      *Deny*)  echo "Deny" ;;
-      *)       echo "" ;;
+      *Allow*)   echo "Allow" ;;
+      *Approve*) echo "AllowWildcard:$wild" ;;
+      *Deny*)    echo "Deny" ;;
+      *)         echo "" ;;
     esac
     return 0
   fi
 
-  # Linux: notify-send for the notification + read response from a tiny zenity/yad/whiptail
-  # dialog or terminal prompt. We use zenity if available (graphical), otherwise fall back
-  # to a terminal prompt on the controlling tty.
+  # Linux: zenity --list with three rows (Allow / Approve wildcard / Deny).
+  # The default --question is binary; --list lets us offer the 3rd option.
   if command -v zenity >/dev/null 2>&1; then
-    if zenity --question --title="$title" --text="${subtitle}\n\n${message}\n\nAllow this and add to workspace policy?" --ok-label="Allow" --cancel-label="Deny" --timeout=300 2>/dev/null; then
-      echo "Allow"
-    else
-      # zenity returns 1 on Cancel/Deny, 5 on timeout
-      [ "$?" -eq 1 ] && echo "Deny" || echo ""
-    fi
+    local choice
+    choice=$(zenity --list \
+      --title="$title" \
+      --text="${subtitle}\n\n${message}\n\nSelect a decision:" \
+      --column "Decision" \
+      "Allow" \
+      "$wild_label" \
+      "Deny" \
+      --width=480 --height=260 --timeout=300 2>/dev/null) || true
+    case "$choice" in
+      Allow)         echo "Allow" ;;
+      "$wild_label") echo "AllowWildcard:$wild" ;;
+      Deny)          echo "Deny" ;;
+      *)             echo "" ;;
+    esac
     return 0
   fi
 
@@ -495,12 +532,18 @@ APPLESCRIPT
     notify-send -t 0 "$title" "$subtitle"$'\n'"$message"$'\n\nNo GUI dialog available; answer in the terminal.' 2>/dev/null || true
   fi
 
-  # Last-resort fallback: read from /dev/tty (works on any platform when interactive)
+  # Last-resort fallback: read from /dev/tty (works on any platform when interactive).
+  # Three keys: a=Allow, w=Wildcard, d=Deny.
   if [ -r /dev/tty ]; then
-    printf '\n[agentbox] %s\n  %s\n  %s\n  Allow/Deny? [a/D]: ' "$title" "$subtitle" "$message" > /dev/tty
+    printf '\n[agentbox] %s\n  %s\n  %s\n  [a]llow / [w]ildcard (%s) / [d]eny: ' \
+      "$title" "$subtitle" "$message" "$wild" > /dev/tty
     local ans
     read -r ans < /dev/tty
-    case "$ans" in a|A|allow|Allow|y|Y|yes|Yes) echo "Allow" ;; *) echo "Deny" ;; esac
+    case "$ans" in
+      a|A|allow|Allow|y|Y|yes|Yes) echo "Allow" ;;
+      w|W|wildcard|Wildcard)       echo "AllowWildcard:$wild" ;;
+      *)                            echo "Deny" ;;
+    esac
     return 0
   fi
 
@@ -801,30 +844,42 @@ cmd_watch_internal() {
         response=$(prompt_approval "$sandbox" "$host" "$port" "$binary")
         echo "[watcher] user response: [$response]" >&2
 
-        if [[ "$response" == *"Allow"* ]]; then
+        # Three possible decisions from prompt_approval:
+        #   AllowWildcard:*.parent.host  → add *.parent as endpoint
+        #   Allow                        → add specific host as endpoint
+        #   Deny / "" (timeout)          → no policy change
+        local rule_host="$host"
+        local decision_tag="DENY"
+        local should_add=0
+        local approval_kind=""
+        if [[ "$response" == AllowWildcard:* ]]; then
+          rule_host="${response#AllowWildcard:}"
+          decision_tag="ALLOW_WILDCARD"
+          approval_kind="wildcard"
+          should_add=1
+        elif [[ "$response" == *"Allow"* ]]; then
+          decision_tag="ALLOW"
+          approval_kind="exact"
+          should_add=1
+        fi
+
+        if [ "$should_add" -eq 1 ]; then
           if openshell policy update "$sandbox" \
-              --add-endpoint "${host}:${port}" \
+              --add-endpoint "${rule_host}:${port}" \
               --binary "$binary" \
               --wait >/dev/null 2>&1; then
-            audit_emit "$sandbox" "decision" "ALLOW $binary -> $host:$port (policy hot-reloaded by user)"
-            echo "[watcher] approved: $host:$port for $binary (policy hot-reloaded)" >&2
-            # Unfreeze BEFORE injecting the retry. Otherwise our typed chars
-            # accumulate in the pty buffer while the agent is SIGSTOPped and
-            # arrive in one burst on SIGCONT — exactly the paste-detect
-            # trigger that char-by-char typing exists to avoid.
+            audit_emit "$sandbox" "decision" "$decision_tag $binary -> $rule_host:$port (policy hot-reloaded by user)"
+            echo "[watcher] approved ($approval_kind): $rule_host:$port for $binary (policy hot-reloaded)" >&2
+            # Unfreeze BEFORE injecting the retry. Chars typed while frozen
+            # accumulate in the pty buffer and arrive in one burst on SIGCONT
+            # — exactly the paste-detect trigger char-by-char typing exists
+            # to avoid.
             unfreeze_sandbox_agents "$sandbox" "$pid"
             echo "[watcher] unfroze agents in $sandbox" >&2
-            # The agent already saw the 403 before approval (this is the watcher
-            # path; the decide-server path doesn't have this problem). Two modes
-            # for telling the agent to retry:
-            #   AGENTBOX_FORCE_RETRY=1  → inject a retry prompt (tmux send-keys
-            #                             preferred; osascript/xdotool fallback).
-            #   default                 → show a passive notification; user
-            #                             types the retry themselves.
             if is_truthy "${AGENTBOX_FORCE_RETRY:-}"; then
               inject_retry_to_agent "$sandbox" "$host" "$port" "$binary"
             else
-              osascript -e "display notification \"$host:$port allowed. Tell agent to retry.\" with title \"agentbox\"" 2>/dev/null || true
+              osascript -e "display notification \"$rule_host:$port allowed. Tell agent to retry.\" with title \"agentbox\"" 2>/dev/null || true
             fi
           else
             echo "[watcher] approval failed: openshell policy update returned non-zero" >&2
@@ -1021,6 +1076,24 @@ cmd_decide_handler_internal() {
       printf '%s|allow\n' "$key" >> "$seen_file"
       audit_emit "$sandbox" "decide" "USER_ALLOW ${req_id:-?}: $binary -> $host:$port"
       printf '{"decision":"allow","reason":"user approved"}\n'
+      ;;
+    AllowWildcard:*)
+      # User picked "Approve *.parent.host". Hot-reload the openshell policy
+      # to add the wildcard endpoint so future requests under that zone
+      # pass without prompting. Then return allow for the current request.
+      local wild="${response#AllowWildcard:}"
+      if openshell policy update "$sandbox" \
+          --add-endpoint "${wild}:${port}" \
+          --binary "$binary" \
+          --wait >/dev/null 2>&1; then
+        printf '%s|allow\n' "$key" >> "$seen_file"
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD ${req_id:-?}: $binary -> $wild:$port (policy hot-reloaded)"
+        printf '{"decision":"allow","reason":"user approved wildcard %s"}\n' "$wild"
+      else
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD_FAIL ${req_id:-?}: $binary -> $wild:$port (policy update returned non-zero; allowing this request only)"
+        printf '%s|allow\n' "$key" >> "$seen_file"
+        printf '{"decision":"allow","reason":"user approved wildcard (but policy update failed)"}\n'
+      fi
       ;;
     Deny)
       printf '%s|deny\n' "$key" >> "$seen_file"
