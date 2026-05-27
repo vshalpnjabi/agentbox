@@ -639,9 +639,14 @@ prompt_approval() {
 
   # macOS: alerter banner notification is the default. Only TWO actions so
   # macOS doesn't collapse into a "Show" dropdown — "Allow" as the primary
-  # button and "Deny" as the close-button label. "Allow" semantically means
-  # "Allow all *.parent.host" (wildcard); the narrower exact-host grant is
-  # only available in the osascript / ntfy / zenity backends.
+  # button and "Deny" as the close-button label.
+  #
+  # "Allow" semantically grants the wildcard zone *.parent.host. The
+  # AllowWildcard handler ALSO adds the exact host as a separate endpoint
+  # in the same policy rule, because openshell wildcards match subdomains
+  # only (apex would otherwise silently still be denied). The narrower
+  # exact-only grant remains available in the osascript / ntfy / zenity
+  # backends.
   if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
     local response
     response=$(alerter \
@@ -1334,20 +1339,30 @@ cmd_decide_handler_internal() {
       fi
       ;;
     AllowWildcard:*)
-      # User picked "Allow all *.parent.host". Hot-reload the openshell policy
-      # to add the wildcard endpoint so future requests under that zone
-      # pass without prompting. Then return allow for the current request.
+      # User picked "Allow all *.parent.host" (or clicked Allow on the 2-action
+      # alerter, which maps to this path). Add BOTH the wildcard zone AND the
+      # exact apex host to the policy in one shot — openshell wildcards match
+      # subdomains only, so granting just *.github.com would still leave the
+      # apex github.com denied. The "allow" reply covers the current request
+      # (which is for $host); future requests under either pattern pass.
       local wild="${response#AllowWildcard:}"
-      if openshell policy update "$sandbox" \
-          --add-endpoint "${wild}:${port}" \
-          --binary "$binary" \
-          --wait >/dev/null 2>&1; then
+      local ok_w=0 ok_h=0
+      openshell policy update "$sandbox" \
+        --add-endpoint "${wild}:${port}" \
+        --binary "$binary" \
+        --wait >/dev/null 2>&1 && ok_w=1
+      openshell policy update "$sandbox" \
+        --add-endpoint "${host}:${port}" \
+        --binary "$binary" \
+        --wait >/dev/null 2>&1 && ok_h=1
+      if [ "$ok_w" = "1" ] || [ "$ok_h" = "1" ]; then
         printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
-        auto_policy_append "$wild" "$port" "$binary"
-        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> $wild:$port (policy hot-reloaded + persisted)"
-        _decide_reply "allow" "user approved wildcard $wild" "wildcard" "$wild"
+        [ "$ok_w" = "1" ] && auto_policy_append "$wild" "$port" "$binary"
+        [ "$ok_h" = "1" ] && auto_policy_append "$host" "$port" "$binary"
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (wildcard_ok=$ok_w apex_ok=$ok_h, persisted)"
+        _decide_reply "allow" "user approved wildcard $wild + apex $host" "wildcard" "$wild"
       else
-        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD_FAIL [src=$source] ${req_id:-?}: $binary -> $wild:$port (policy update returned non-zero)"
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD_FAIL [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (both policy updates returned non-zero)"
         printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
         _decide_reply "allow" "user approved wildcard $wild (policy update failed)" "wildcard" "$wild"
       fi
