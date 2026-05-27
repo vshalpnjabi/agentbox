@@ -533,25 +533,24 @@ prompt_approval() {
     fi
   fi
 
-  # macOS: alerter banner notification is the default — less intrusive than
-  # a modal dialog. The 3rd option ("Allow all *.x") goes into the macOS-
-  # native dropdown labeled "Options" / "Show". That label is rendered by
-  # macOS, not configurable via alerter or NSUserNotification.
+  # macOS: alerter banner notification is the default. All three options
+  # (Allow / Allow all *.x / Deny) live in the macOS-native "Options"
+  # dropdown so the dropdown is the single point of interaction. The X
+  # close button (label = "Close" by default) also maps to Deny.
   if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
     local response
     response=$(alerter \
       --title "$title" \
       --subtitle "$subtitle" \
       --message "$message" \
-      --actions "Allow,$wild_label" \
-      --close-label "Deny" \
+      --actions "Allow,$wild_label,Deny" \
       --timeout 300 \
       --sound default \
       2>/dev/null)
     case "$response" in
       Allow)         echo "Allow" ;;
       "$wild_label") echo "AllowWildcard:$wild" ;;
-      @CLOSED)       echo "Deny" ;;
+      Deny|@CLOSED)  echo "Deny" ;;
       *)             echo "" ;;
     esac
     return 0
