@@ -453,6 +453,67 @@ ntfy_topic_source() {
   fi
 }
 
+# Locate the user's login-shell rc file. Falls back to ~/.profile if the
+# shell is unknown so the env block lands SOMEWHERE sourceable. fish has
+# its own syntax, so we report it for the caller to handle differently.
+# Echoes "<kind>|<path>"; kind is one of: zsh|bash|fish|profile.
+_shell_rc_target() {
+  local s="${SHELL:-}"
+  case "$s" in
+    */zsh)  printf 'zsh|%s\n'  "$HOME/.zshrc" ;;
+    */bash) printf 'bash|%s\n' "$HOME/.bashrc" ;;
+    */fish) printf 'fish|%s\n' "$HOME/.config/fish/config.fish" ;;
+    *)      printf 'profile|%s\n' "$HOME/.profile" ;;
+  esac
+}
+
+# Idempotently persist (or remove) the agentbox ntfy env block in the user's
+# shell rc. The block is delimited by markers so re-running `notify setup
+# --global` updates the topic in place instead of duplicating.
+# Args:
+#   $1 = "set" | "unset"
+#   $2 = topic value (only when "set")
+# Returns 0 on success, prints the path it wrote to on stderr.
+_persist_ntfy_env() {
+  local op="$1" topic="${2:-}"
+  local target kind rc
+  target=$(_shell_rc_target)
+  kind="${target%%|*}"
+  rc="${target#*|}"
+  mkdir -p "$(dirname "$rc")"
+  [ -f "$rc" ] || : > "$rc"
+
+  # Strip any existing block (idempotent for both set + unset).
+  local tmp
+  tmp=$(mktemp -t agentbox-rc-edit.XXXXXX 2>/dev/null) || tmp="/tmp/agentbox-rc-edit-$$"
+  awk '
+    BEGIN { in_block = 0 }
+    /^# >>> agentbox notify/ { in_block = 1; next }
+    in_block && /^# <<< agentbox notify/ { in_block = 0; next }
+    !in_block { print }
+  ' "$rc" > "$tmp"
+  mv "$tmp" "$rc"
+
+  if [ "$op" = "set" ]; then
+    {
+      printf '\n# >>> agentbox notify (managed by `agentbox notify setup --global`; do not edit by hand)\n'
+      case "$kind" in
+        fish)
+          printf 'set -gx AGENTBOX_NTFY_TOPIC %s\n' "$topic"
+          printf 'set -gx AGENTBOX_NTFY 1\n'
+          ;;
+        *)
+          printf 'export AGENTBOX_NTFY_TOPIC=%s\n' "$topic"
+          printf 'export AGENTBOX_NTFY=1\n'
+          ;;
+      esac
+      printf '# <<< agentbox notify\n'
+    } >> "$rc"
+  fi
+
+  echo "$rc"
+}
+
 # Derive a wildcard parent zone from a hostname for the "Allow all *.parent" UX:
 #   static.rust-lang.org → *.rust-lang.org    (strip leftmost label)
 #   crates.io            → *.crates.io        (2-label apex stays prefixed)
@@ -2801,13 +2862,25 @@ cmd_notify() {
 
   case "$sub" in
     setup)
-      # Optional positional arg: reuse an existing topic instead of generating
-      # one. Accepts bare topic ("my-topic"), full URL ("https://ntfy.sh/foo"),
-      # or host+path ("ntfy.sh/foo") — ntfy_sanitize_topic normalizes them.
-      # This is the cross-host workflow: run the same `agentbox notify setup
-      # <topic>` on every Mac and they all push to the same feed.
-      local provided="${1:-}"
-      [ "$#" -gt 0 ] && shift
+      # Args:
+      #   [TOPIC]            Reuse an existing topic instead of generating one.
+      #                      Bare ("my-topic"), URL, or host+path all accepted.
+      #   --global | -g      Also persist AGENTBOX_NTFY_TOPIC + AGENTBOX_NTFY=1
+      #                      to the user's shell rc (zsh/bash/fish/profile) so
+      #                      every new shell picks it up automatically.
+      # Cross-host workflow: pick a shared topic name, run
+      #   agentbox notify setup --global my-shared-topic
+      # on every Mac, subscribe once on your phone, done.
+      local provided="" global=0
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --global|-g) global=1; shift ;;
+          --) shift; break ;;
+          -*) err "unknown flag: $1 (use: agentbox notify setup [--global] [TOPIC])" ;;
+          *)  [ -z "$provided" ] && provided="$1" || err "unexpected extra argument: $1"
+              shift ;;
+        esac
+      done
       local existing
       if existing=$(ntfy_get_topic); then
         local src; src=$(ntfy_topic_source)
@@ -2835,6 +2908,11 @@ cmd_notify() {
       printf '%s\n' "$topic" > "$AGB_NTFY_TOPIC_FILE"
       chmod 600 "$AGB_NTFY_TOPIC_FILE"
       log "saved ntfy topic to $AGB_NTFY_TOPIC_FILE"
+      if [ "$global" = "1" ]; then
+        local rc; rc=$(_persist_ntfy_env set "$topic")
+        log "persisted AGENTBOX_NTFY_TOPIC + AGENTBOX_NTFY=1 to $rc"
+        log "open a new shell (or 'source $rc') to pick it up in this session"
+      fi
       echo
       echo "============================================================"
       echo "Topic URL:  $AGB_NTFY_BASE/$topic"
@@ -2936,12 +3014,26 @@ cmd_notify() {
       echo "you clicked: [$result]"
       ;;
     clear|remove)
+      # Also accepts --global to strip the env block from the shell rc.
+      local clear_global=0
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --global|-g) clear_global=1; shift ;;
+          *) shift ;;
+        esac
+      done
+      local cleared=0
       if [ -f "$AGB_NTFY_TOPIC_FILE" ]; then
         rm -f "$AGB_NTFY_TOPIC_FILE"
-        log "removed ntfy topic"
-      else
-        echo "(already cleared)"
+        log "removed ntfy topic file"
+        cleared=1
       fi
+      if [ "$clear_global" = "1" ]; then
+        local rc; rc=$(_persist_ntfy_env unset)
+        log "removed agentbox ntfy env block from $rc (open a new shell to pick up)"
+        cleared=1
+      fi
+      [ "$cleared" = "0" ] && echo "(already cleared; pass --global to also strip shell rc)"
       ;;
     open)
       local t
@@ -3219,28 +3311,35 @@ Notification appearance (macOS):
                                          approval prompts with action buttons.
 
 ntfy.sh (OPT-IN cross-device push with two-button inline actions):
-  agentbox notify setup [TOPIC]          Generate (or reuse, if TOPIC given) a
+  agentbox notify setup [--global] [TOPIC]
+                                         Generate (or reuse, if TOPIC given) a
                                          topic, offer to open ntfy app / browser
                                          to subscribe, and send a test push.
                                          TOPIC can be bare ("my-topic") or a
                                          full URL ("https://ntfy.sh/my-topic").
+                                         --global persists AGENTBOX_NTFY_TOPIC
+                                         and AGENTBOX_NTFY=1 to your shell rc
+                                         (zsh/bash/fish/profile) so every new
+                                         shell auto-reuses it.
   agentbox notify status                 Topic + URL + source + enabled-or-not.
   agentbox notify open                   Re-open subscribe target (app/browser).
   agentbox notify browser                Re-open in browser specifically.
   agentbox notify qr                     Re-print the subscribe QR.
   agentbox notify test                   Trigger a test Allow/Deny prompt.
-  agentbox notify clear                  Remove the saved topic.
+  agentbox notify clear [--global]       Remove the saved topic (and the env
+                                         block from your shell rc with --global).
 
-  Enable: export AGENTBOX_NTFY=1 in your shell. Without that env var, ntfy
-  stays dormant and approval prompts go through alerter (the default).
+  Enable: export AGENTBOX_NTFY=1 in your shell, or use --global once. Without
+  it ntfy stays dormant and prompts go through alerter (the default).
   Subscribe UX: AGENTBOX_NTFY_SUBSCRIBE=auto|app|browser|none
 
   Shared topic across hosts (laptop + remote Mac + phone subscribe once):
-    pick a topic name, then on EACH host run:
-      agentbox notify setup my-shared-topic
-      export AGENTBOX_NTFY=1
-    Or per-shell only (no file): export AGENTBOX_NTFY_TOPIC=my-shared-topic.
-    The env var beats the file when both are set.
+    Pick a topic name, then on EACH host run:
+      agentbox notify setup --global my-shared-topic
+    Subsequent new shells automatically have AGENTBOX_NTFY_TOPIC=my-shared-topic
+    and AGENTBOX_NTFY=1 exported. Subscribe once on your phone — done.
+    (Per-shell-only alternative: just export AGENTBOX_NTFY_TOPIC=<topic>
+     manually; the env var beats the file when both are set.)
 
 Per-agent host-side auth setup (so sandboxes auto-authenticate):
   agentbox auth status                          Show which agents are set up
