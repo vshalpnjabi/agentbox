@@ -533,31 +533,36 @@ prompt_approval() {
     fi
   fi
 
-  # macOS: alerter is the preferred local prompt. Two-state result: Allow
-  # button + close=Deny. The wildcard option is intentionally NOT offered
-  # here — macOS notification banners (NSUserNotification API) support
-  # exactly one primary action button. Passing multiple via --actions
-  # makes alerter render them as a dropdown labeled "Options"/"Show",
-  # which clutters the UX. For users who want the wildcard option on
-  # macOS, use ntfy push notifications (3 inline buttons natively
-  # supported by ntfy clients): export AGENTBOX_NTFY=1 + agentbox notify setup.
-  # The osascript modal fallback below also offers 3 buttons but only
-  # fires when alerter isn't installed.
+  # macOS: alerter is the preferred local prompt. Three-state result:
+  #   Allow  → exact host
+  #   Allow all *.x → wildcard zone
+  #   close (Deny)
+  #
+  # macOS UX limit: NSUserNotification (what alerter uses) supports exactly
+  # ONE primary action button on a banner notification. When --actions has
+  # multiple comma-separated values, macOS renders them as a dropdown menu
+  # labeled "Options"/"Show". That label is macOS-native — alerter cannot
+  # customize or remove it.
+  #
+  # If you find the dropdown UX too cluttered, enable ntfy push
+  # notifications (`export AGENTBOX_NTFY=1`) — ntfy's notification format
+  # supports 3 inline buttons without a dropdown.
   if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
     local response
     response=$(alerter \
       --title "$title" \
       --subtitle "$subtitle" \
       --message "$message" \
-      --actions "Allow" \
+      --actions "Allow,$wild_label" \
       --close-label "Deny" \
       --timeout 300 \
       --sound default \
       2>/dev/null)
     case "$response" in
-      Allow)   echo "Allow" ;;
-      @CLOSED) echo "Deny" ;;
-      *)       echo "" ;;
+      Allow)         echo "Allow" ;;
+      "$wild_label") echo "AllowWildcard:$wild" ;;
+      @CLOSED)       echo "Deny" ;;
+      *)             echo "" ;;
     esac
     return 0
   fi
