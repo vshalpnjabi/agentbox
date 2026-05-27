@@ -309,32 +309,27 @@ network_policies:
 
 ---
 
-## What's been verified (and what hasn't)
+## What's been verified
 
-### Confirmed working
+**End-to-end confirmed working** against agentbox `interactive-decide-server`
+(2026-05-27) with OpenShell built from `9a59c33`.
 
-The OPA/Rego evaluation layer is verified correct by two unit tests
-(`opa::tests::deny_rules_force_deny_request_*` in `crates/openshell-sandbox/src/opa.rs`):
+- OPA evaluation: `deny_request=true`, `allow_request=false` for the
+  three-ingredient policy. ✅
+- Proxy wiring: Interactive arm fires; supervisor POSTs to `/decide` and
+  holds the TCP connection until a response or timeout. ✅
+- Fallback: connection denied cleanly when `timeout_seconds` elapses. ✅
+- agentbox decide-server: required zero changes to participate. ✅
 
-- With `access: full` + `deny_rules: [{method: "*", path: "**"}]`, regorus
-  evaluates `deny_request = true` and `allow_request = false`. ✅
-- The proxy code in `relay.rs` and `proxy.rs` has the `Interactive` arm fully
-  wired: when `allowed = false` and `enforcement = Interactive`, it calls
-  `consult_interactive_endpoint()`. ✅
-- The `L7DenyRuleDef` schema does **not** have a `name` field — the template
-  previously had `name: gate-all` inside deny_rules which would have been
-  rejected by `serde(deny_unknown_fields)`. Fixed in this doc. ✅
+**Root cause of earlier `L7_DENY_RULES_NOT_FIRING.md` report:** the live
+supervisor inside the container was running a stale registry image that
+pre-dated the Interactive implementation. Solution: rebuild OpenShell from
+`9a59c33` or later **and** recreate the sandbox container so it pulls the
+updated image. Policy code and proto round-trip were correct all along.
 
-### Still needs live validation
-
-The unit tests load policy data from YAML directly into regorus. In production
-the data travels: YAML → `NetworkPolicyDef` → proto `NetworkEndpoint` →
-`proto_to_opa_data_json` → regorus. Code review confirms deny_rules are
-preserved through this path, but it hasn't been tested with a running
-supervisor. **The smoke test below is the critical validation step.** If the
-mock decider receives no POST after applying the three-ingredient policy, the
-proto round-trip is the remaining suspect — add a test calling
-`OpaEngine::from_proto` with a `ProtoSandboxPolicy` containing deny_rules.
+> **Operational note:** always recreate the sandbox after upgrading the
+> supervisor binary — a cached container image will keep running the old
+> supervisor regardless of what the host binary reports.
 
 ---
 
@@ -402,21 +397,49 @@ the incoming decision request back to the right sandbox in its registry.
 
 ## OpenShell installation (from the fork)
 
+> **Critical:** `cargo install --path crates/openshell-cli` builds the
+> gateway and CLI but **not the supervisor binary that runs inside the
+> container**. The supervisor (`crates/openshell-sandbox`) must also be
+> rebuilt and the cached image overwritten, then the sandbox recreated.
+> If you skip these steps, the new proxy code runs on the gateway but the
+> **old OPA evaluator runs inside the container** — interactive enforcement
+> silently falls back to the old behaviour.
+
 ```bash
 # On your Mac — build from the interactive-enforcement branch
 # Minimum commit: 9a59c33 (websocket Interactive arm compile fix)
 brew uninstall openshell 2>/dev/null || true
 cd ~/Library/CloudStorage/Dropbox/github.com/openshell-interactive-enforcement
 git pull   # ensure you're at 9a59c33 or later
-cargo install --path crates/openshell-cli
 
-# Restart the daemon
+# 1. Build and install the gateway + CLI
+cargo install --path crates/openshell-cli
+cargo install --path crates/openshell-server
+
+# 2. Rebuild the supervisor binary and overwrite the cached copy
+cargo build --release --package openshell-sandbox
+# Find and overwrite the cached supervisor image:
+CACHED=$(ls ~/.local/share/openshell/docker-supervisor/sha256-*/openshell-sandbox 2>/dev/null | head -1)
+if [ -n "$CACHED" ]; then
+  cp target/release/openshell-sandbox "$CACHED"
+  echo "Overwrote cached supervisor at $CACHED"
+else
+  echo "No cached supervisor found — a fresh 'openshell sandbox create' will pull the right binary."
+fi
+
+# 3. Restart the daemon
 brew services stop openshell 2>/dev/null || true
 openshell serve &
+
+# 4. Destroy and recreate any existing sandboxes
+# (cached containers keep running the old supervisor image)
+openshell sandbox destroy <name>
+openshell sandbox create <name> ...
 ```
 
 The feature is behind the policy YAML — existing sandboxes using
-`enforcement: enforce` or `enforcement: audit` are unaffected.
+`enforcement: enforce` or `enforcement: audit` are unaffected once
+recreated with the updated supervisor.
 
 ---
 
