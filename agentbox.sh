@@ -1208,19 +1208,33 @@ decide_server_ensure() {
   log_file=$(decide_server_log_file "$sandbox")
   mkdir -p "$(dirname "$pf")"
 
+  local port
+  port=$(decide_server_port_for_sandbox "$sandbox")
+
   if [ -f "$pf" ]; then
     local existing_pid
     existing_pid=$(cat "$pf" 2>/dev/null)
     if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-      log "decide-server already running (pid $existing_pid) for $sandbox"
-      return 0
+      # Verify the process is actually responsive, not just alive. Earlier we
+      # saw the single-threaded HTTPServer get wedged (process alive, port
+      # listening, but connections time out). The threaded server should
+      # make this rare, but a defensive health-probe is cheap insurance.
+      local bind_probe="${AGENTBOX_DECIDE_BIND:-127.0.0.1}"
+      [ "$bind_probe" = "0.0.0.0" ] && bind_probe="127.0.0.1"
+      if command -v curl >/dev/null 2>&1 && \
+         curl -fsS -m 2 "http://${bind_probe}:${port}/health" >/dev/null 2>&1; then
+        log "decide-server already running (pid $existing_pid) for $sandbox"
+        return 0
+      fi
+      warn "decide-server pid $existing_pid is alive but unresponsive — restarting"
+      kill "$existing_pid" 2>/dev/null
+      sleep 1
+      kill -9 "$existing_pid" 2>/dev/null
+    else
+      log "removing stale decide-server pid file (pid $existing_pid not alive)"
     fi
-    log "removing stale decide-server pid file (pid $existing_pid not alive)"
     rm -f "$pf"
   fi
-
-  local port
-  port=$(decide_server_port_for_sandbox "$sandbox")
 
   # Handler invokes agentbox.sh's __decide subcommand. The python server runs
   # this via /bin/sh -c, so we hand it a single shell-quoted command line.
@@ -1256,7 +1270,16 @@ decide_server_stop() {
   if [ -f "$pf" ]; then
     local pid
     pid=$(cat "$pf" 2>/dev/null)
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true
+      # If the process has a stuck request and ignores SIGTERM, escalate.
+      local i
+      for i in 1 2 3 4; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
     rm -f "$pf"
   fi
   rm -f "$(decide_server_port_file "$sandbox")"
@@ -1642,13 +1665,26 @@ YAML
     local sb port
     sb=$(workspace_sandbox_name)
     port=$(decide_server_port_for_sandbox "$sb")
+
+    # Hosts to put behind interactive enforcement. Comma-separated; each
+    # entry becomes its own endpoint block under interactive_gate.
+    # Default is *.example.com so the demo runs out of the box; override
+    # in real use with something like:
+    #   AGENTBOX_INTERACTIVE_HOSTS="*.github.com,api.openai.com,*.stripe.com"
+    # Note: openshell's OPA glob treats '.' as a segment delimiter — bare '*'
+    # is rejected by the L7 validator. Use '*.zone' patterns.
+    local hosts="${AGENTBOX_INTERACTIVE_HOSTS:-*.example.com}"
+
     cat >> "$target" <<YAML
 
   # ---- interactive enforcement (opt-in via AGENTBOX_INTERACTIVE_POLICY=1) ----
   #
-  # Holds every request to *.example.com at the openshell proxy while
+  # Holds every request to the listed hosts at the openshell proxy while
   # agentbox prompts you (ntfy / alerter / osascript). Allow → tunnel
   # proceeds; Deny / timeout → agent sees 403.
+  #
+  # Hosts come from \$AGENTBOX_INTERACTIVE_HOSTS (default: *.example.com).
+  # Reset the policy with \`agentbox policy reset\` after changing the env var.
   #
   # The three required ingredients (see docs/openshell-interactive-enforcement.md
   # for why each is needed; getting any one wrong silently disables the path):
@@ -1661,19 +1697,22 @@ YAML
   #                             every request, which is what triggers the
   #                             Interactive arm of the proxy decision
   #
-  # Wildcard semantics: openshell's OPA glob treats '.' as a segment delimiter,
-  # so '*' only matches single-label hostnames. To gate a domain tree, use
-  # '*.zone' and duplicate this block for each base domain you want held.
-  # Bare '*' as host does NOT work — the L7 validator rejects it.
-  #
   # Requires openshell built from the interactive-enforcement branch:
   #   https://github.com/vshalpnjabi/OpenShell/tree/interactive-enforcement
   # Stock openshell silently downgrades this to plain \`enforce\` (no
   # held-connection prompt); the L4 watcher path continues to work.
-  example_interactive_gate:
-    name: example-interactive-gate
+  interactive_gate:
+    name: interactive-gate
     endpoints:
-      - host: "*.example.com"
+YAML
+    # Emit one endpoint block per host from the comma-separated list.
+    local h
+    local IFS=','
+    for h in $hosts; do
+      h="${h# }"; h="${h% }"  # trim surrounding spaces
+      [ -z "$h" ] && continue
+      cat >> "$target" <<YAML
+      - host: "$h"
         port: 443
         protocol: rest
         enforcement:
@@ -1685,6 +1724,9 @@ YAML
         deny_rules:
           - method: "*"
             path: "**"
+YAML
+    done
+    cat >> "$target" <<YAML
     binaries:
       - { path: "**" }
 YAML

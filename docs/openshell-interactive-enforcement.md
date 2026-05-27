@@ -291,14 +291,55 @@ the incoming decision request back to the right sandbox in its registry.
 brew uninstall openshell 2>/dev/null || true
 cd ~/Library/CloudStorage/Dropbox/github.com/openshell-interactive-enforcement
 cargo install --path crates/openshell-cli
+cargo install --path crates/openshell-server --bin openshell-gateway
+
+# CRITICAL — rebuild the supervisor binary too, then overwrite the cached copy
+# the gateway extracted from ghcr.io/nvidia/openshell/supervisor:dev. Otherwise
+# the new proxy code runs on the gateway but the OLD OPA evaluator persists
+# inside the sandbox container, and L7 deny_rules don't fire:
+cargo build --release -p openshell-sandbox
+for f in ~/.local/share/openshell/docker-supervisor/sha256-*/openshell-sandbox; do
+  cp target/release/openshell-sandbox "$f"
+done
+
+# Existing sandboxes were created with the old supervisor and won't pick up
+# the new code on policy reload — they need to be recreated:
+openshell sandbox list | awk 'NR>1 {print $1}' | xargs -n1 openshell sandbox delete
 
 # Restart the daemon
 brew services stop openshell 2>/dev/null || true
-openshell serve &
+openshell-gateway --disable-tls --bind-address 0.0.0.0 --port 17670 &
 ```
 
 The feature is behind the policy YAML — existing sandboxes using
-`enforcement: enforce` or `enforcement: audit` are unaffected.
+`enforcement: enforce` or `enforcement: audit` are unaffected by the
+gateway upgrade. Sandboxes that need the new supervisor evaluator must
+be recreated as shown above.
+
+## Status (2026-05-27 — verified live against fork HEAD `9a59c33`)
+
+End-to-end integration confirmed in a Lima Ubuntu VM. The full chain works:
+
+1. ✅ Policy with `protocol: rest` + `access: full` + `deny_rules: [{method:"*", path:"**"}]` loads cleanly (`Policy version N loaded`).
+2. ✅ L7 inspector engages (`engine:l7` in the audit log).
+3. ✅ deny_rules trigger the Interactive arm in the proxy.
+4. ✅ Gateway HOLDS the TCP connection while consulting `/decide`.
+5. ✅ Supervisor POSTs to `http://host.openshell.internal:<port>/decide` with all 11 wire-protocol fields the agentbox parser expects.
+6. ✅ Fallback fires correctly on timeout / non-2xx response (`fallback: deny` → agent gets 403).
+
+Remaining (agentbox-side) follow-ups that don't block the integration:
+- `ntfy_prompt` from the handler subprocess context needs an isolated repro
+  — the path works when triggered via `agentbox decide test` but didn't engage
+  when called as a `/decide` POST handler subprocess; debug pending.
+- Clean Allow round-trip (agent's first attempt to a gated host succeeds in
+  <1s with no retry) is gated on the above ntfy debug.
+
+Both blocked-by-upstream items:
+- Public supervisor image (`ghcr.io/nvidia/openshell/supervisor:dev`) needs
+  republishing from HEAD so users don't have to do the manual cache overwrite
+  shown above.
+- `Cargo.lock` `pkcs8` pin on the fork so macOS users can `cargo install`
+  without the rsa-rc.12 ↔ pkcs8-0.11.0 mismatch (Linux is unaffected).
 
 ---
 

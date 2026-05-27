@@ -101,10 +101,30 @@ cd ~/openshell-fork
 cargo install --path crates/openshell-cli    --bin openshell         --force
 cargo install --path crates/openshell-server --bin openshell-gateway --force
 # Binaries land at ~/.cargo/bin/{openshell,openshell-gateway}
+
+# CRITICAL — also rebuild the supervisor binary. It's the OPA evaluator that
+# runs *inside* sandbox containers; if you skip this, the new proxy on the
+# gateway will run but the old OPA in the container will silently allow
+# everything that touches L7 deny_rules.
+cargo build --release -p openshell-sandbox
 ```
 
 `cargo install` defaults to release profile — first build is ~5-10 min on
 4 vCPUs. Subsequent rebuilds (after source edits) are seconds.
+
+After the gateway starts once (next step), it'll pull
+`ghcr.io/nvidia/openshell/supervisor:dev` and cache the supervisor
+binary under `~/.local/share/openshell/docker-supervisor/sha256-*/`.
+Overwrite that cached copy with the one you just rebuilt, then destroy
+any existing sandboxes so they get recreated with the fresh supervisor:
+
+```bash
+for f in ~/.local/share/openshell/docker-supervisor/sha256-*/openshell-sandbox; do
+  cp target/release/openshell-sandbox "$f"
+done
+~/.cargo/bin/openshell sandbox list | awk 'NR>1 {print $1}' \
+  | xargs -n1 ~/.cargo/bin/openshell sandbox delete 2>/dev/null
+```
 
 ## 6. Start the gateway daemon
 

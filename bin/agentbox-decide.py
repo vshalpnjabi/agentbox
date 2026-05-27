@@ -24,7 +24,7 @@ import os
 import signal
 import subprocess
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_TIMEOUT_SECONDS = 300
 
@@ -161,7 +161,11 @@ def main() -> int:
         except OSError as e:
             _log(f"could not write pid file {args.pid_file}: {e}")
 
-    server = HTTPServer((args.bind, args.port), DecideHandler)
+    # ThreadingHTTPServer spawns a thread per request so a long-running handler
+    # (e.g. waiting on an ntfy user response for ~120 s) doesn't stall the
+    # accept() loop or block parallel /decide POSTs from concurrent agents.
+    server = ThreadingHTTPServer((args.bind, args.port), DecideHandler)
+    server.daemon_threads = True  # don't block shutdown on in-flight requests
     # 0.5s timeout on accept() — lets the main loop respond to SIGTERM/SIGINT
     # promptly without depending on serve_forever's internals. Calling
     # server.shutdown() from a signal handler deadlocks against serve_forever's
