@@ -1038,11 +1038,14 @@ setup_sandbox_sudo() {
 
   log "configuring NOPASSWD sudo inside $sandbox (opt-in via AGENTBOX_SUDO)"
 
-  # Single-line script — openshell's gRPC exec rejects multi-line command
-  # args. (Though we're using docker exec here, keep it one-line for
-  # parity in case we route through openshell again in the future.)
+  # Single-line script (kept for parity even though docker exec doesn't
+  # enforce the same newline restriction openshell does). Tries to install
+  # sudo via the container's package manager if missing. apt-get / apk /
+  # dnf / yum supported. Requires network access from inside the container
+  # for the apt repos — openshell's network policy may block this; if so
+  # we fall through to a clear error.
   local setup_script
-  setup_script='set -e; if ! command -v sudo >/dev/null 2>&1; then echo "agentbox: sudo binary not present in sandbox image. Either (a) bake sudo into a custom base image, or (b) temporarily allow apt repos in policy and apt-get install sudo." >&2; exit 1; fi; USER_NAME=$(stat -c "%U" /sandbox 2>/dev/null || stat -f "%Su" /sandbox 2>/dev/null || echo sandbox); mkdir -p /etc/sudoers.d; printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$USER_NAME" > /etc/sudoers.d/agentbox; chmod 0440 /etc/sudoers.d/agentbox; echo "agentbox-sudo: NOPASSWD configured for user $USER_NAME"'
+  setup_script='set -e; if ! command -v sudo >/dev/null 2>&1; then echo "agentbox-sudo: sudo not in image, attempting install..." >&2; if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo >/dev/null 2>&1 || { echo "agentbox-sudo: apt-get install sudo failed (network blocked by openshell policy?)" >&2; exit 1; }; elif command -v apk >/dev/null 2>&1; then apk add --no-cache sudo >/dev/null 2>&1 || { echo "agentbox-sudo: apk add sudo failed" >&2; exit 1; }; elif command -v dnf >/dev/null 2>&1; then dnf install -y -q sudo >/dev/null 2>&1 || { echo "agentbox-sudo: dnf install sudo failed" >&2; exit 1; }; elif command -v yum >/dev/null 2>&1; then yum install -y -q sudo >/dev/null 2>&1 || { echo "agentbox-sudo: yum install sudo failed" >&2; exit 1; }; else echo "agentbox-sudo: no known package manager (apt/apk/dnf/yum)" >&2; exit 1; fi; fi; USER_NAME=$(stat -c "%U" /sandbox 2>/dev/null || stat -f "%Su" /sandbox 2>/dev/null || echo sandbox); mkdir -p /etc/sudoers.d; printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$USER_NAME" > /etc/sudoers.d/agentbox; chmod 0440 /etc/sudoers.d/agentbox; echo "agentbox-sudo: NOPASSWD configured for user $USER_NAME"'
 
   local container
   if ! container=$(find_sandbox_container "$sandbox"); then
