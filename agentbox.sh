@@ -818,21 +818,34 @@ cmd_watch_internal() {
         local port="${BASH_REMATCH[4]}"
         local key="${binary}|${host}|${port}"
 
-        # Seen-list: by default we re-prompt for every deny, even ones
-        # you've decided on before. (This catches the case where an
-        # earlier Allow's policy hot-reload didn't actually stick.)
-        # AGENTBOX_SUPPRESS_REPEATS=1 enables the older "decide once,
-        # remember forever" mode for users who don't want a flood of
-        # repeated dialogs.
-        if grep -Fxq "$key" "$seen_file"; then
-          if is_truthy "${AGENTBOX_SUPPRESS_REPEATS:-}"; then
-            echo "[watcher] suppressed (in seen-list, AGENTBOX_SUPPRESS_REPEATS=1): $key" >&2
-            continue
-          fi
-          echo "[watcher] re-prompting (was in seen-list; default is always-prompt): $key" >&2
-        else
-          echo "$key" >> "$seen_file"
+        # Seen-list gates re-prompting by the LAST decision for this tuple:
+        #   allow / allow_wildcard → suppress (you've already said yes)
+        #   deny                   → re-prompt (lets you change your mind,
+        #                             catches openshell hot-reload misses)
+        #   legacy (pre-v0.2.1)    → re-prompt once; the new decision will
+        #                             be stored with the format suffix
+        #   not in list            → prompt fresh
+        # AGENTBOX_SUPPRESS_REPEATS=1 suppresses everything (v0.1.0 behavior).
+        local seen_decision=""
+        if [ -s "$seen_file" ]; then
+          seen_decision=$(awk -F '|' -v k="$key" '
+            $1"|"$2"|"$3 == k { d = (NF >= 4 ? $4 : "legacy") }
+            END { print d }
+          ' "$seen_file" 2>/dev/null || echo "")
         fi
+        case "$seen_decision" in
+          allow|allow_wildcard)
+            echo "[watcher] suppressed (previously $seen_decision): $key" >&2
+            continue
+            ;;
+          deny|legacy)
+            if is_truthy "${AGENTBOX_SUPPRESS_REPEATS:-}"; then
+              echo "[watcher] suppressed (previous $seen_decision; AGENTBOX_SUPPRESS_REPEATS=1): $key" >&2
+              continue
+            fi
+            echo "[watcher] re-prompting (previous: $seen_decision): $key" >&2
+            ;;
+        esac
 
         echo "[watcher] denied: $binary($pid) -> $host:$port — freezing + prompting" >&2
 
@@ -852,15 +865,18 @@ cmd_watch_internal() {
         local decision_tag="DENY"
         local should_add=0
         local approval_kind=""
+        local seen_decision_value="deny"
         if [[ "$response" == AllowWildcard:* ]]; then
           rule_host="${response#AllowWildcard:}"
           decision_tag="ALLOW_WILDCARD"
           approval_kind="wildcard"
           should_add=1
+          seen_decision_value="allow_wildcard"
         elif [[ "$response" == *"Allow"* ]]; then
           decision_tag="ALLOW"
           approval_kind="exact"
           should_add=1
+          seen_decision_value="allow"
         fi
 
         if [ "$should_add" -eq 1 ]; then
@@ -870,6 +886,7 @@ cmd_watch_internal() {
               --wait >/dev/null 2>&1; then
             audit_emit "$sandbox" "decision" "$decision_tag $binary -> $rule_host:$port (policy hot-reloaded by user)"
             echo "[watcher] approved ($approval_kind): $rule_host:$port for $binary (policy hot-reloaded)" >&2
+            printf '%s|%s\n' "$key" "$seen_decision_value" >> "$seen_file"
             # Unfreeze BEFORE injecting the retry. Chars typed while frozen
             # accumulate in the pty buffer and arrive in one burst on SIGCONT
             # — exactly the paste-detect trigger char-by-char typing exists
@@ -887,8 +904,9 @@ cmd_watch_internal() {
             echo "[watcher] unfroze agents in $sandbox" >&2
           fi
         else
-          audit_emit "$sandbox" "decision" "DENY $binary -> $host:$port (user declined; remembered in seen-list)"
-          echo "[watcher] denied by user: $host:$port for $binary (won't prompt again)" >&2
+          audit_emit "$sandbox" "decision" "DENY $binary -> $host:$port (user declined)"
+          echo "[watcher] denied by user: $host:$port for $binary (will re-prompt next time)" >&2
+          printf '%s|deny\n' "$key" >> "$seen_file"
           unfreeze_sandbox_agents "$sandbox" "$pid"
           echo "[watcher] unfroze agents in $sandbox" >&2
         fi
@@ -1048,22 +1066,26 @@ cmd_decide_handler_internal() {
 
   local key="${binary}|${host}|${port}"
   local cached=""
-  # Decision cache: by default we re-prompt every time (parallel to the
-  # watcher path). AGENTBOX_SUPPRESS_REPEATS=1 opts in to the older
-  # "honor cached allow/deny without re-prompting" mode.
-  if [ -s "$seen_file" ] && is_truthy "${AGENTBOX_SUPPRESS_REPEATS:-}"; then
-    cached=$(awk -F '|' -v k="$key" '$1"|"$2"|"$3 == k {d=$4} END{print d}' "$seen_file" || true)
+  # Decision cache, gated by previous decision direction:
+  #   allow / allow_wildcard → always return cached (user said yes)
+  #   deny                   → re-prompt by default; cached only if
+  #                            AGENTBOX_SUPPRESS_REPEATS=1
+  if [ -s "$seen_file" ]; then
+    cached=$(awk -F '|' -v k="$key" '$1"|"$2"|"$3 == k {d=$4} END{print d}' "$seen_file" 2>/dev/null || echo "")
   fi
   case "$cached" in
-    allow)
+    allow|allow_wildcard)
       audit_emit "$sandbox" "decide" "CACHED_ALLOW ${req_id:-?}: $binary -> $host:$port"
       printf '{"decision":"allow","reason":"cached"}\n'
       return 0
       ;;
     deny)
-      audit_emit "$sandbox" "decide" "CACHED_DENY ${req_id:-?}: $binary -> $host:$port"
-      printf '{"decision":"deny","reason":"cached"}\n'
-      return 0
+      if is_truthy "${AGENTBOX_SUPPRESS_REPEATS:-}"; then
+        audit_emit "$sandbox" "decide" "CACHED_DENY ${req_id:-?}: $binary -> $host:$port"
+        printf '{"decision":"deny","reason":"cached"}\n'
+        return 0
+      fi
+      # Fall through to re-prompt
       ;;
   esac
 
@@ -1086,12 +1108,12 @@ cmd_decide_handler_internal() {
           --add-endpoint "${wild}:${port}" \
           --binary "$binary" \
           --wait >/dev/null 2>&1; then
-        printf '%s|allow\n' "$key" >> "$seen_file"
+        printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
         audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD ${req_id:-?}: $binary -> $wild:$port (policy hot-reloaded)"
         printf '{"decision":"allow","reason":"user approved wildcard %s"}\n' "$wild"
       else
         audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD_FAIL ${req_id:-?}: $binary -> $wild:$port (policy update returned non-zero; allowing this request only)"
-        printf '%s|allow\n' "$key" >> "$seen_file"
+        printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
         printf '{"decision":"allow","reason":"user approved wildcard (but policy update failed)"}\n'
       fi
       ;;
@@ -2835,18 +2857,14 @@ persisted to host so they survive gateway restarts):
   agentbox audit path [NAME]               Print log file path (~/.local/share/agentbox/state/<sandbox>/audit.log)
   agentbox audit clear [NAME]              Truncate the audit log
 
-Approval prompts (DEFAULT: every deny re-prompts, even tuples you've
-decided on before. Catches the case where a previous Allow's policy
-hot-reload didn't actually take effect.):
-  agentbox approve list [N]              Show seen-list (audit only;
-                                         doesn't affect prompting by default)
-  agentbox approve forget <pattern> [N]  Remove entries (no-op unless
-                                         AGENTBOX_SUPPRESS_REPEATS=1)
+Approval prompts (DEFAULT: re-prompt on previously-denied tuples;
+remember allows. Allow once → that host won't ask again. Deny → next
+attempt will ask again so you can change your mind):
+  agentbox approve list [N]              Show seen-list with decisions
+  agentbox approve forget <pattern> [N]  Remove entries (so they prompt)
   agentbox approve reset [N]             Clear the entire seen-list
-  export AGENTBOX_SUPPRESS_REPEATS=1     Opt INTO the old "decide once,
-                                         never re-prompt" mode. Use if
-                                         the default re-prompting is too
-                                         chatty for your workflow.
+  export AGENTBOX_SUPPRESS_REPEATS=1     Suppress re-prompts for previously-
+                                         denied tuples too (v0.1.0 mode).
                                          (Restart watcher: agentbox stop && claude)
 
 Decide-server (host-side HTTP endpoint for openshell Interactive enforcement;
