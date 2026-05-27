@@ -2,6 +2,26 @@
 
 All notable changes to agentbox.
 
+## Unreleased (post-v0.2.0 on `main`)
+
+Five commits land on top of the v0.2.0 tag; cut a v0.2.1 to release.
+
+### New features
+
+- **`Approve *.parent.host` — a third option in every approval prompt** (`6e9607b`). Wildcard derived automatically from the host (strip leftmost label): `static.rust-lang.org` → `*.rust-lang.org`; `download.crates.io` → `*.crates.io`. Wired into all backends — alerter (3rd `--actions` button), osascript modal (3rd button), zenity (`--list`), ntfy (3rd inline http action), `/dev/tty` (a/w/d keys). When clicked, calls `openshell policy update --add-endpoint *.parent:port` so one click covers the whole zone (rustup, cargo, etc.). Audit log distinguishes `ALLOW` vs `ALLOW_WILDCARD`.
+
+### Behavioral changes
+
+- **Direction-aware seen-list** (`cb5ae58`). v0.2.0 re-prompted on every deny including tuples you'd previously *allowed*, which became chatty. New default: `allow` / `allow_wildcard` decisions suppress future prompts (you said yes once, no need to ask again); `deny` decisions re-prompt (so you can change your mind, and so openshell hot-reload misses still surface). `AGENTBOX_SUPPRESS_REPEATS=1` opts back into the v0.1.0 "decide once, never re-prompt" mode (suppress denies too). `watcher-seen.txt` format extended from `binary|host|port` to `binary|host|port|decision`; legacy entries are treated as `legacy` and re-prompted once, then stored with the new format going forward.
+
+- **Cleaner post-approval notification** (`f5cb8f2`). Dropped the `Tell agent to retry` suffix from the macOS notification — it was visual noise when `AGENTBOX_FORCE_RETRY=1` handles retry automatically and informational otherwise. Now reads just `host:port allowed.`
+
+### Bug fixes
+
+- **Watcher silent-exit at first launch** (`40398ea`). `pgrep -f <pattern>` returns exit code 1 when no orphan watchers match — which is the *correct* state immediately after the previous orphan-fix landed. Under the script's `set -euo pipefail`, the failing command substitution silently aborted the entire dispatch at `watcher_ensure`, so `claude` printed two credential-sync lines and exited without opening the TUI. Fix: add `|| true` to all four pgrep pipelines in `watcher_ensure` and `watcher_stop`.
+
+- **Concurrent watchers racing on `--add-endpoint`** (`cc5a4e8`). Root cause of the prior "I clicked Allow but the policy didn't update" complaint. Multiple watcher processes were accumulating (each `claude` launch spawned a new one and the pid file only tracked the latest), and each Allow's `openshell policy update --add-endpoint` read policy version N, pushed N+1 with their addition, and the last write won — overwriting the others' updates. Fix: both `watcher_ensure` and `watcher_stop` now use `pgrep -f "agentbox.sh __watch $sandbox"` to find ALL watchers for the sandbox (not just the tracked one). `watcher_ensure` kills orphans defensively at start; `watcher_stop` SIGTERMs then SIGKILLs all matches. Watcher count is now strictly 0 or 1 per sandbox.
+
 ## [v0.2.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.2.0) — 2026-05-26
 
 ### Highlights
