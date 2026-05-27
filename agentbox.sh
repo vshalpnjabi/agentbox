@@ -1635,35 +1635,49 @@ YAML
     cat >> "$target" <<YAML
 
   # ---- interactive enforcement (opt-in via AGENTBOX_INTERACTIVE_POLICY=1) ----
-  # Wildcard "*" host with mode: interactive holds every NOT-already-allowed
-  # outbound TCP connection open at the proxy while agentbox prompts the
-  # user. Allow → 200 from /decide → tunnel proceeds. Deny / timeout →
-  # \`fallback\` (deny by default) → agent sees 403.
+  #
+  # Holds every request to *.example.com at the openshell proxy while
+  # agentbox prompts you (ntfy / alerter / osascript). Allow → tunnel
+  # proceeds; Deny / timeout → agent sees 403.
+  #
+  # The three required ingredients (see docs/openshell-interactive-enforcement.md
+  # for why each is needed; getting any one wrong silently disables the path):
+  #
+  #   - protocol: rest        - enables openshell's L7 inspector, which is the
+  #                             only path that consults \`enforcement.mode\`
+  #   - access: full          - satisfies the L7 validator's "rules or access"
+  #                             requirement; establishes the base allow set
+  #   - deny_rules: [...]     - overrides the base allow with allowed=false on
+  #                             every request, which is what triggers the
+  #                             Interactive arm of the proxy decision
+  #
+  # Wildcard semantics: openshell's OPA glob treats '.' as a segment delimiter,
+  # so '*' only matches single-label hostnames. To gate a domain tree, use
+  # '*.zone' and duplicate this block for each base domain you want held.
+  # Bare '*' as host does NOT work — the L7 validator rejects it.
   #
   # Requires openshell built from the interactive-enforcement branch:
   #   https://github.com/vshalpnjabi/OpenShell/tree/interactive-enforcement
-  # Without that build, openshell falls back to plain \`enforce\` semantics
-  # and this block is effectively ignored (the L4 watcher path still works).
-  interactive_gate:
-    name: interactive-gate
+  # Stock openshell silently downgrades this to plain \`enforce\` (no
+  # held-connection prompt); the L4 watcher path continues to work.
+  example_interactive_gate:
+    name: example-interactive-gate
     endpoints:
-      - host: "*"
+      - host: "*.example.com"
         port: 443
+        protocol: rest
         enforcement:
           mode: interactive
           endpoint: http://host.openshell.internal:${port}/decide
           timeout_seconds: 120
           fallback: deny
+        access: full
+        deny_rules:
+          - name: gate-all
+            method: "*"
+            path: "**"
     binaries:
-      - { path: /usr/local/bin/claude }
-      - { path: /usr/bin/codex }
-      - { path: /usr/bin/opencode }
-      - { path: /usr/bin/git }
-      - { path: /usr/bin/curl }
-      - { path: /usr/bin/wget }
-      - { path: /usr/bin/gh }
-      - { path: /sandbox/.cargo/bin/cargo }
-      - { path: /sandbox/.cargo/bin/rustup }
+      - { path: "**" }
 YAML
   fi
 }

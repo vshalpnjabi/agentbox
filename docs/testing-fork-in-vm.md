@@ -161,18 +161,12 @@ mkdir -p ~/test-workspace && cd ~/test-workspace && git init -q
 # Write the policy with the interactive_gate block
 AGENTBOX_INTERACTIVE_POLICY=1 claude --version
 
-# Confirm the policy has the interactive enforcement block
-grep -A 12 "interactive_gate:" .agentbox.policy.yaml
-# Expect:
-#   interactive_gate:
-#     endpoints:
-#       - host: "*"
-#         port: 443
-#         enforcement:
-#           mode: interactive
-#           endpoint: http://host.openshell.internal:<port>/decide
-#           timeout_seconds: 120
-#           fallback: deny
+# Confirm the policy has the interactive enforcement block (note: the template
+# uses *.example.com as a demo target — change to your real gated host before
+# real use; bare "*" does NOT work, see policy-gotchas note below)
+grep -A 18 "example_interactive_gate:" .agentbox.policy.yaml
+# Expect the three required pieces: protocol: rest, access: full, deny_rules
+# (see docs/openshell-interactive-enforcement.md for why each matters)
 
 # Get a shell inside the sandbox
 agentbox ssh
