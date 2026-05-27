@@ -522,6 +522,20 @@ apply_agentbox_tmux_settings() {
   agb_tmux set-option -t "$session" mouse "${AGENTBOX_TMUX_MOUSE:-on}" >/dev/null 2>&1 || true
   # Bigger scrollback than tmux's default of 2000 lines.
   agb_tmux set-option -t "$session" history-limit "${AGENTBOX_TMUX_HISTORY:-10000}" >/dev/null 2>&1 || true
+  # Status-left: show the full sandbox name. Default tmux truncates to 10
+  # chars (so a long agentbox-<basename>-<hash> name gets cut to just
+  # "agentbox-0:ssh"). Override with AGENTBOX_TMUX_STATUS_LEFT for a custom
+  # format string; AGENTBOX_TMUX_STATUS_OFF=1 turns the whole bar off.
+  if is_truthy "${AGENTBOX_TMUX_STATUS_OFF:-}"; then
+    agb_tmux set-option -t "$session" status off >/dev/null 2>&1 || true
+  else
+    agb_tmux set-option -t "$session" status on >/dev/null 2>&1 || true
+    agb_tmux set-option -t "$session" status-left \
+      "${AGENTBOX_TMUX_STATUS_LEFT:- #[fg=cyan,bold]agentbox #[fg=default,nobold]#S #[fg=cyan]| }" \
+      >/dev/null 2>&1 || true
+    agb_tmux set-option -t "$session" status-left-length \
+      "${AGENTBOX_TMUX_STATUS_LEFT_LENGTH:-80}" >/dev/null 2>&1 || true
+  fi
   # Make copy-mode less sticky: any mouse click (no drag) immediately
   # cancels and returns to live input. Default tmux behavior keeps you
   # in copy-mode after scroll-wheel triggers it, which surprises users
@@ -2573,6 +2587,10 @@ bindings + options don't pollute your normal tmux config:
   Scrollback depth:           AGENTBOX_TMUX_HISTORY=10000 (default)
   Click in copy-mode:         exits back to live input (override default
                               tmux behavior, which is sticky).
+  Status bar (bottom):        shows 'agentbox <sandbox-name> | window-list'.
+                              Override: AGENTBOX_TMUX_STATUS_LEFT="..."
+                              (tmux format string), or
+                              AGENTBOX_TMUX_STATUS_OFF=1 to hide entirely.
   Auto-skipped when already inside a tmux session (TMUX env set) — agentbox
   doesn't nest. Inside an outer tmux, retry-injection falls back to the
   keystroke path (which IS focus-dependent — see Force-retry caveats below).
