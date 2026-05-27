@@ -530,8 +530,15 @@ apply_agentbox_tmux_settings() {
     agb_tmux set-option -t "$session" status off >/dev/null 2>&1 || true
   else
     agb_tmux set-option -t "$session" status on >/dev/null 2>&1 || true
+    # Strip the LEADING "agentbox-" prefix from the displayed session name
+    # — the label already says "agentbox", so the full name "agentbox-foo-..."
+    # is redundant. The `^` anchor is load-bearing: tmux's #{s/.../.../:var}
+    # is global by default (no `g` flag needed), and without `^` it would
+    # also strip the middle "agentbox-" when the workspace folder itself
+    # is named "agentbox" (sandbox name = "agentbox-agentbox-<hash>") —
+    # leaving just the bare hash.
     agb_tmux set-option -t "$session" status-left \
-      "${AGENTBOX_TMUX_STATUS_LEFT:- #[fg=cyan,bold]agentbox #[fg=default,nobold]#S #[fg=cyan]| }" \
+      "${AGENTBOX_TMUX_STATUS_LEFT:- #[fg=cyan,bold]agentbox#[fg=default,nobold]:#[fg=green]#{s/^agentbox-//:session_name}#[default] #[fg=cyan]| }" \
       >/dev/null 2>&1 || true
     agb_tmux set-option -t "$session" status-left-length \
       "${AGENTBOX_TMUX_STATUS_LEFT_LENGTH:-80}" >/dev/null 2>&1 || true
