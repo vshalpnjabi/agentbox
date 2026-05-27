@@ -1002,15 +1002,35 @@ load_config() {
   done < .agentbox.toml
 }
 
+# Find the Docker container ID backing an openshell sandbox. Openshell
+# names its containers including the sandbox name; we filter docker ps.
+# Returns the ID on stdout (one line) or non-zero exit if not found.
+find_sandbox_container() {
+  local sandbox="$1"
+  command -v docker >/dev/null 2>&1 || return 1
+  local cid
+  # Strategy 1: container name contains the sandbox name
+  cid=$(docker ps --filter "name=$sandbox" --format '{{.ID}}' 2>/dev/null | head -1)
+  if [ -n "$cid" ]; then printf '%s\n' "$cid"; return 0; fi
+  # Strategy 2: openshell may set a sandbox label
+  cid=$(docker ps --filter "label=openshell.sandbox=$sandbox" --format '{{.ID}}' 2>/dev/null | head -1)
+  if [ -n "$cid" ]; then printf '%s\n' "$cid"; return 0; fi
+  return 1
+}
+
 # Grant the sandbox user NOPASSWD sudo so the agent can run privileged
 # operations (apt install, systemctl, edit /etc/*) inside its own sandbox.
 # Stays fully contained — sudo here cannot reach the host. Opt-in via
 # AGENTBOX_SUDO=1 env or `sudo = true` in .agentbox.toml. Default off.
+#
+# openshell sandbox exec has no --user flag, so we go straight to
+# `docker exec -u 0 <container>` against the underlying Docker container.
+# Docker Desktop on macOS doesn't require host sudo for this; openshell's
+# gRPC gateway runs Docker on our behalf as the same user.
 setup_sandbox_sudo() {
   local sandbox="$1"
 
-  # Idempotent: short-circuit if NOPASSWD sudo already works for the default
-  # sandbox user.
+  # Idempotent: short-circuit if NOPASSWD sudo already works.
   if openshell sandbox exec --name "$sandbox" --no-tty -- sudo -n true \
        </dev/null >/dev/null 2>&1; then
     return 0
@@ -1018,23 +1038,29 @@ setup_sandbox_sudo() {
 
   log "configuring NOPASSWD sudo inside $sandbox (opt-in via AGENTBOX_SUDO)"
 
-  # The setup runs as root inside the sandbox. The base openshell image
-  # ships sudo; if not, we error with a hint. The script MUST be a single
-  # line — openshell's gRPC exec API rejects command arguments containing
-  # newlines ("command argument N contains newline or carriage return
-  # characters"). Use `;` as statement separators.
+  # Single-line script — openshell's gRPC exec rejects multi-line command
+  # args. (Though we're using docker exec here, keep it one-line for
+  # parity in case we route through openshell again in the future.)
   local setup_script
   setup_script='set -e; if ! command -v sudo >/dev/null 2>&1; then echo "agentbox: sudo binary not present in sandbox image. Either (a) bake sudo into a custom base image, or (b) temporarily allow apt repos in policy and apt-get install sudo." >&2; exit 1; fi; USER_NAME=$(stat -c "%U" /sandbox 2>/dev/null || stat -f "%Su" /sandbox 2>/dev/null || echo sandbox); mkdir -p /etc/sudoers.d; printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$USER_NAME" > /etc/sudoers.d/agentbox; chmod 0440 /etc/sudoers.d/agentbox; echo "agentbox-sudo: NOPASSWD configured for user $USER_NAME"'
 
-  if openshell sandbox exec --name "$sandbox" --user root --no-tty \
-       -- /bin/sh -c "$setup_script" </dev/null; then
-    audit_emit "$sandbox" "sudo" "NOPASSWD sudo enabled (in-sandbox only)"
-    log "  ✓ sudo ready inside $sandbox (sudo apt install foo / sudo systemctl ... / etc.)"
+  local container
+  if ! container=$(find_sandbox_container "$sandbox"); then
+    warn "could not find Docker container for sandbox '$sandbox'"
+    warn "  Try: docker ps | grep $sandbox"
+    return 1
+  fi
+
+  if docker exec -u 0 "$container" /bin/sh -c "$setup_script"; then
+    audit_emit "$sandbox" "sudo" "NOPASSWD sudo enabled (via docker exec -u 0)"
+    log "  ✓ sudo ready inside $sandbox"
     return 0
   fi
 
-  warn "could not configure sudo (openshell --user root not supported, or sudo missing in image)"
-  warn "manual workaround: 'agentbox shell' then 'echo \"\$USER ALL=(ALL) NOPASSWD: ALL\" | sudo tee /etc/sudoers.d/agentbox'"
+  warn "docker exec -u 0 failed (see output above)"
+  warn "manual workaround:"
+  warn "  container=\$(docker ps --filter name=$sandbox --format '{{.ID}}' | head -1)"
+  warn "  docker exec -u 0 \$container /bin/sh -c 'USER_NAME=\$(stat -c \"%U\" /sandbox); printf \"%s ALL=(ALL) NOPASSWD: ALL\\\\n\" \"\$USER_NAME\" > /etc/sudoers.d/agentbox && chmod 0440 /etc/sudoers.d/agentbox'"
   return 1
 }
 
@@ -1795,13 +1821,15 @@ cmd_sudo_disable() {
   phase=$(sandbox_phase "$name" 2>/dev/null || echo "")
   if [ "$phase" = "Ready" ]; then
     log "removing /etc/sudoers.d/agentbox from $name"
-    if openshell sandbox exec --name "$name" --user root --no-tty \
-         -- /bin/sh -c 'rm -f /etc/sudoers.d/agentbox' </dev/null >/dev/null 2>&1; then
+    local container
+    if container=$(find_sandbox_container "$name") \
+       && docker exec -u 0 "$container" /bin/sh -c 'rm -f /etc/sudoers.d/agentbox' >/dev/null 2>&1; then
       audit_emit "$name" "sudo" "DISABLED (sudoers file removed)"
       log "  ✓ sudo revoked inside $name"
     else
-      warn "could not remove sudoers file (openshell --user root failed). Manual cleanup:"
-      warn "  openshell sandbox exec --name $name --user root -- rm -f /etc/sudoers.d/agentbox"
+      warn "could not remove sudoers file. Manual cleanup:"
+      warn "  container=\$(docker ps --filter name=$name --format '{{.ID}}' | head -1)"
+      warn "  docker exec -u 0 \$container rm -f /etc/sudoers.d/agentbox"
     fi
   fi
   cmd_sudo_status
