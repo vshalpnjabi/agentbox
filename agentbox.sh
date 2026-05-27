@@ -557,7 +557,13 @@ inject_retry_to_agent() {
   if tmux_have_session "$sandbox"; then
     local session
     session=$(tmux_session_for_sandbox "$sandbox")
-    sleep "${AGENTBOX_RETRY_DELAY:-1}"
+    # AGENTBOX_RETRY_DELAY is the focus-settle wait for the keystroke
+    # fallback (osascript/xdotool need active focus on the terminal
+    # after the alerter dismisses). For tmux send-keys it's pure
+    # latency — skip unless explicitly set.
+    if [ -n "${AGENTBOX_RETRY_DELAY:-}" ]; then
+      sleep "$AGENTBOX_RETRY_DELAY"
+    fi
 
     # Type char-by-char with a small per-char delay so the agent's TUI
     # doesn't detect a paste burst. Claude Code (and similar Ink-based
@@ -578,7 +584,7 @@ inject_retry_to_agent() {
     done
 
     if [ "$typed_ok" -eq 1 ]; then
-      sleep "${AGENTBOX_RETRY_SUBMIT_DELAY:-0.3}"
+      sleep "${AGENTBOX_RETRY_SUBMIT_DELAY:-0.15}"
       # Configurable submit-key sequence. Default Enter — works once
       # char-by-char typing has kept us out of paste-detect mode.
       # If the agent still doesn't submit, override:
@@ -714,12 +720,17 @@ cmd_watch_internal() {
               --wait >/dev/null 2>&1; then
             audit_emit "$sandbox" "decision" "ALLOW $binary -> $host:$port (policy hot-reloaded by user)"
             echo "[watcher] approved: $host:$port for $binary (policy hot-reloaded)" >&2
+            # Unfreeze BEFORE injecting the retry. Otherwise our typed chars
+            # accumulate in the pty buffer while the agent is SIGSTOPped and
+            # arrive in one burst on SIGCONT — exactly the paste-detect
+            # trigger that char-by-char typing exists to avoid.
+            unfreeze_sandbox_agents "$sandbox" "$pid"
+            echo "[watcher] unfroze agents in $sandbox" >&2
             # The agent already saw the 403 before approval (this is the watcher
             # path; the decide-server path doesn't have this problem). Two modes
             # for telling the agent to retry:
-            #   AGENTBOX_FORCE_RETRY=1  → keystroke-inject a retry prompt into
-            #                             the frontmost window (Accessibility
-            #                             permission needed on macOS).
+            #   AGENTBOX_FORCE_RETRY=1  → inject a retry prompt (tmux send-keys
+            #                             preferred; osascript/xdotool fallback).
             #   default                 → show a passive notification; user
             #                             types the retry themselves.
             if is_truthy "${AGENTBOX_FORCE_RETRY:-}"; then
@@ -729,14 +740,15 @@ cmd_watch_internal() {
             fi
           else
             echo "[watcher] approval failed: openshell policy update returned non-zero" >&2
+            unfreeze_sandbox_agents "$sandbox" "$pid"
+            echo "[watcher] unfroze agents in $sandbox" >&2
           fi
         else
           audit_emit "$sandbox" "decision" "DENY $binary -> $host:$port (user declined; remembered in seen-list)"
           echo "[watcher] denied by user: $host:$port for $binary (won't prompt again)" >&2
+          unfreeze_sandbox_agents "$sandbox" "$pid"
+          echo "[watcher] unfroze agents in $sandbox" >&2
         fi
-
-        unfreeze_sandbox_agents "$sandbox" "$pid"
-        echo "[watcher] unfroze agents in $sandbox" >&2
       fi
     done
 
@@ -2412,13 +2424,16 @@ so you don't have to type it yourself):
                                            osascript keystroke / Linux X11
                                            xdotool, both focus-dependent.
   export AGENTBOX_RETRY_PROMPT="..."       Override the injected text.
-  export AGENTBOX_RETRY_DELAY=1            Seconds to wait before sending
-                                           (alerter dismiss + focus settle).
+  export AGENTBOX_RETRY_DELAY=1            Seconds to wait before sending.
+                                           Default UNSET on tmux path (no
+                                           focus-settle needed). Keystroke
+                                           fallback uses 1s for alerter
+                                           dismiss + focus return.
   export AGENTBOX_RETRY_TYPING_DELAY=0.02  Per-char delay during the typing
                                            (defeats paste-detect mode in
                                            claude code; raising to 0.05 makes
                                            it more obviously human-paced).
-  export AGENTBOX_RETRY_SUBMIT_DELAY=0.3   Pause after typing, before submit.
+  export AGENTBOX_RETRY_SUBMIT_DELAY=0.15  Pause after typing, before submit.
   export AGENTBOX_RETRY_SUBMIT_KEY="Enter" Key(s) to send to submit.
                                            Try if Enter doesn't submit:
                                              "Escape Enter"  (vim-style)
