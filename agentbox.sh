@@ -248,11 +248,14 @@ watcher_ensure() {
   # cause of "I clicked Allow but the policy didn't actually update".
   local pattern="agentbox.sh __watch $sandbox"
   local orphans
-  orphans=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
+  # `|| true` is load-bearing: pgrep returns 1 when nothing matches (the
+  # CORRECT state when there are no orphans), and with `set -euo pipefail`
+  # the failing command substitution would silently exit the whole script.
+  orphans=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ' || true)
   if [ -n "$orphans" ]; then
     # Distinguish "the one we already have tracked" from "orphans"
     local tracked=""
-    [ -f "$pf" ] && tracked=$(cat "$pf" 2>/dev/null)
+    [ -f "$pf" ] && tracked=$(cat "$pf" 2>/dev/null) || true
     local to_kill=""
     for p in $orphans; do
       [ "$p" = "$tracked" ] && continue
@@ -264,7 +267,7 @@ watcher_ensure() {
       sleep 0.3
       # If anything survived SIGTERM, escalate
       local stubborn
-      stubborn=$(pgrep -f "$pattern" 2>/dev/null | grep -vFx "${tracked:-NONE}" | tr '\n' ' ')
+      stubborn=$(pgrep -f "$pattern" 2>/dev/null | grep -vFx "${tracked:-NONE}" | tr '\n' ' ' || true)
       [ -n "$stubborn" ] && kill -9 $stubborn 2>/dev/null || true
     fi
   fi
@@ -299,14 +302,16 @@ watcher_stop() {
   # Kill ALL watchers for this sandbox (not just the one in the pid file).
   # The pid file only tracks the most recent watcher; orphans from races
   # would survive a pid-file-only kill and continue to interfere.
+  # `|| true` on the pgrep pipelines: pgrep returns 1 when nothing matches,
+  # which would silently exit the script under `set -euo pipefail`.
   local pattern="agentbox.sh __watch $sandbox"
   local pids
-  pids=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
+  pids=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ' || true)
   if [ -n "$pids" ]; then
     kill $pids 2>/dev/null || true
     sleep 0.3
     local stubborn
-    stubborn=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')
+    stubborn=$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ' || true)
     [ -n "$stubborn" ] && kill -9 $stubborn 2>/dev/null || true
   fi
   rm -f "$(watcher_pid_file "$sandbox")"
