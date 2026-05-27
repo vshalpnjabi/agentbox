@@ -4,11 +4,11 @@ State of the project on pause. Pick this up next session.
 
 ## Release status (READ FIRST)
 
-- **`main`** is at commit `f8c0c95`, tagged `v0.2.0`. Pushed to `origin/main`.
-- **Latest release:** [v0.2.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.2.0) (2026-05-26).
-- **Previous release:** [v0.1.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.1.0).
+- **`main`** is on `v0.3.0` (after this commit + tag). Pushed to `origin/main`.
+- **Latest release:** [v0.3.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.3.0) (2026-05-27).
+- **Previous releases:** [v0.2.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.2.0), [v0.1.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.1.0).
 - **Install command:** `curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh | bash`.
-- **`decide-endpoint-server` branch:** merged to main, still exists on origin (not deleted; `git push origin --delete decide-endpoint-server` if desired).
+- **`decide-endpoint-server` branch:** fully merged to main; deleted from origin (2026-05-27). Local worktree at `.claude/worktrees/decide-endpoint-server/` still exists and is safe to remove.
 - **Working tree:** clean.
 
 ## What v0.2.0 shipped

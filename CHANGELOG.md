@@ -2,15 +2,15 @@
 
 All notable changes to agentbox.
 
-## Unreleased (post-v0.2.0 on `main`)
+## [v0.3.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.3.0) — 2026-05-27
 
-Six+ commits land on top of the v0.2.0 tag; cut a v0.2.1 to release.
+Headline: **L4 watcher decisions now route through the decide-server (default-on)**, giving us a single decision pipeline that's already exercised in production while we wait for openshell upstream to ship `enforcement: interactive`. Wildcard approvals (`Allow all *.parent.host`) gain a third button on every prompt UI.
 
 ### New features
 
-- **Decide-server is now default-on; watcher routes L4 decisions through it (L7-style decision pipeline)**. The watcher catches openshell's CONNECT denial (L4), SIGSTOPs the agent, POSTs the request to the local decide-server (`source: watcher`), receives a JSON decision, then unfreezes + optionally retry-injects. The decide-server is the single source of truth for prompts, policy updates, and seen-list writes — same code path whether the request originated from L7 openshell (future, when upstream lands `enforcement: interactive`) or L4 watcher (today). Watcher's previous direct-prompt path remains available via `AGENTBOX_NO_DECIDE_SERVER=1` for users who want the v0.2.0 behavior. Audit log tags every decision with `[src=watcher|openshell]` so you can tell where it originated. Response JSON now carries `kind` (`exact` vs `wildcard`) and `effective_host` (the host actually added to policy) so the watcher's audit log can be specific.
+- **Decide-server is now default-on; watcher routes L4 decisions through it (unified L4+L7 decision pipeline)** (`71a1bca`). The watcher catches openshell's CONNECT denial (L4), SIGSTOPs the agent, POSTs the request to the local decide-server (`source: watcher`), receives a JSON decision, then unfreezes + optionally retry-injects. The decide-server is the single source of truth for prompts, policy updates, and seen-list writes — same code path whether the request originated from L7 openshell (future, when upstream lands `enforcement: interactive`) or L4 watcher (today). Watcher's previous direct-prompt path remains available via `AGENTBOX_NO_DECIDE_SERVER=1` for users who want the v0.2.0 behavior. Audit log tags every decision with `[src=watcher|openshell]` so you can tell where it originated. Response JSON now carries `kind` (`exact` vs `wildcard`) and `effective_host` (the host actually added to policy).
 
-- **`Approve *.parent.host` — a third option in every approval prompt** (`6e9607b`). Wildcard derived automatically from the host (strip leftmost label): `static.rust-lang.org` → `*.rust-lang.org`; `download.crates.io` → `*.crates.io`. Wired into all backends — alerter (3rd `--actions` button), osascript modal (3rd button), zenity (`--list`), ntfy (3rd inline http action), `/dev/tty` (a/w/d keys). When clicked, calls `openshell policy update --add-endpoint *.parent:port` so one click covers the whole zone (rustup, cargo, etc.). Audit log distinguishes `ALLOW` vs `ALLOW_WILDCARD`.
+- **`Allow all *.parent.host` — a third option in every approval prompt** (`6e9607b`, label renamed in `7e6470c`). Wildcard derived automatically from the host (strip leftmost label): `static.rust-lang.org` → `*.rust-lang.org`; `download.crates.io` → `*.crates.io`. Wired into all backends — alerter (3rd `--actions` button), osascript modal (3rd button), zenity (`--list`), ntfy (3rd inline http action), `/dev/tty` (a/w/d keys). When clicked, calls `openshell policy update --add-endpoint *.parent:port` so one click covers the whole zone (rustup, cargo, etc.). Audit log distinguishes `ALLOW` vs `ALLOW_WILDCARD`.
 
 ### Behavioral changes
 
@@ -18,11 +18,19 @@ Six+ commits land on top of the v0.2.0 tag; cut a v0.2.1 to release.
 
 - **Cleaner post-approval notification** (`f5cb8f2`). Dropped the `Tell agent to retry` suffix from the macOS notification — it was visual noise when `AGENTBOX_FORCE_RETRY=1` handles retry automatically and informational otherwise. Now reads just `host:port allowed.`
 
+- **Cleaner macOS alerter banner: no more "Show"/"Options" dropdown** (`7e6470c`). macOS notifications support exactly one primary action button — passing 2+ actions to alerter rendered them as a dropdown menu. Now alerter shows a clean two-state Allow / Deny banner. The wildcard option (`Allow all *.host`) is still natively available on the osascript modal fallback (3-button dialog), zenity (Linux list), ntfy push (3 inline buttons), and the /dev/tty fallback. For wildcard prompts on macOS, prefer ntfy push (`export AGENTBOX_NTFY=1`).
+
 ### Bug fixes
 
 - **Watcher silent-exit at first launch** (`40398ea`). `pgrep -f <pattern>` returns exit code 1 when no orphan watchers match — which is the *correct* state immediately after the previous orphan-fix landed. Under the script's `set -euo pipefail`, the failing command substitution silently aborted the entire dispatch at `watcher_ensure`, so `claude` printed two credential-sync lines and exited without opening the TUI. Fix: add `|| true` to all four pgrep pipelines in `watcher_ensure` and `watcher_stop`.
 
 - **Concurrent watchers racing on `--add-endpoint`** (`cc5a4e8`). Root cause of the prior "I clicked Allow but the policy didn't update" complaint. Multiple watcher processes were accumulating (each `claude` launch spawned a new one and the pid file only tracked the latest), and each Allow's `openshell policy update --add-endpoint` read policy version N, pushed N+1 with their addition, and the last write won — overwriting the others' updates. Fix: both `watcher_ensure` and `watcher_stop` now use `pgrep -f "agentbox.sh __watch $sandbox"` to find ALL watchers for the sandbox (not just the tracked one). `watcher_ensure` kills orphans defensively at start; `watcher_stop` SIGTERMs then SIGKILLs all matches. Watcher count is now strictly 0 or 1 per sandbox.
+
+### Documentation
+
+- **CHANGELOG now exists** (`14028d1`, `809ed58`) — v0.2.0 entry retroactive, v0.3.0 entry curated.
+- **RESUME.md rewritten for post-v0.3.0 state** (`6eb9970`) — documents the L4/L7 architecture, the L7 trigger gap (awaiting upstream openshell), and a CONTINGENCY plan: build a custom CONNECT-proxy interceptor inside agentbox if upstream Interactive enforcement stalls 3+ months. Decision criteria + implementation hints included so future-us can pick this up cleanly.
+- **Known issue resolved**: `openshell policy update --add-endpoint --wait` silent no-op (RESUME.md). Clean repro with single watcher confirmed it works correctly; the orphan-watcher race fix (cc5a4e8) was the entire bug.
 
 ## [v0.2.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.2.0) — 2026-05-26
 
