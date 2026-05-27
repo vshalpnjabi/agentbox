@@ -551,9 +551,13 @@ apply_agentbox_tmux_settings() {
     agb_tmux set-option -g status off >/dev/null 2>&1 || true
   else
     agb_tmux set-option -g status on >/dev/null 2>&1 || true
-    agb_tmux set-option -g status-left \
-      "${AGENTBOX_TMUX_STATUS_LEFT:- #[fg=cyan,bold]agentbox#[fg=default,nobold]:#[fg=green]#{s/^agentbox-//:session_name}#[default] #[fg=cyan]| }" \
-      >/dev/null 2>&1 || true
+    # The default value can't be inlined as `${VAR:-default}` because
+    # bash's parameter-expansion default-value parser eats the closing
+    # `}` of #{s/.../.../:session_name} thinking it's the closing brace
+    # of ${...}. Build the default in a separate variable instead.
+    local status_left_default=' #[fg=cyan,bold]agentbox#[fg=default,nobold]:#[fg=green]#{s/^agentbox-//:session_name}#[default] #[fg=cyan]| '
+    local status_left="${AGENTBOX_TMUX_STATUS_LEFT:-$status_left_default}"
+    agb_tmux set-option -g status-left "$status_left" >/dev/null 2>&1 || true
     agb_tmux set-option -g status-left-length \
       "${AGENTBOX_TMUX_STATUS_LEFT_LENGTH:-80}" >/dev/null 2>&1 || true
   fi
