@@ -986,6 +986,7 @@ load_config() {
   AGB_MEMORY="$DEFAULT_MEMORY"
   AGB_POLICY=""
   AGB_UPLOAD_CREDS="false"
+  AGB_SUDO="false"
   [ ! -f .agentbox.toml ] && return 0
   while IFS='=' read -r key val; do
     key=$(printf '%s' "$key" | tr -d ' ')
@@ -996,8 +997,53 @@ load_config() {
       memory) AGB_MEMORY="$val" ;;
       policy) AGB_POLICY="$val" ;;
       upload_credentials) AGB_UPLOAD_CREDS="$val" ;;
+      sudo) AGB_SUDO="$val" ;;
     esac
   done < .agentbox.toml
+}
+
+# Grant the sandbox user NOPASSWD sudo so the agent can run privileged
+# operations (apt install, systemctl, edit /etc/*) inside its own sandbox.
+# Stays fully contained — sudo here cannot reach the host. Opt-in via
+# AGENTBOX_SUDO=1 env or `sudo = true` in .agentbox.toml. Default off.
+setup_sandbox_sudo() {
+  local sandbox="$1"
+
+  # Idempotent: short-circuit if NOPASSWD sudo already works for the default
+  # sandbox user.
+  if openshell sandbox exec --name "$sandbox" --no-tty -- sudo -n true \
+       </dev/null >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "configuring NOPASSWD sudo inside $sandbox (opt-in via AGENTBOX_SUDO)"
+
+  # The setup runs as root inside the sandbox. The base openshell image
+  # ships sudo; if not, we error with a hint.
+  local setup_script
+  setup_script='set -e
+if ! command -v sudo >/dev/null 2>&1; then
+  echo "agentbox: sudo binary not present in sandbox image. Either" >&2
+  echo "  (a) bake sudo into a custom base image, or" >&2
+  echo "  (b) temporarily allow apt repos in policy and apt-get install sudo." >&2
+  exit 1
+fi
+USER_NAME=$(stat -c "%U" /sandbox 2>/dev/null || stat -f "%Su" /sandbox 2>/dev/null || echo sandbox)
+mkdir -p /etc/sudoers.d
+printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$USER_NAME" > /etc/sudoers.d/agentbox
+chmod 0440 /etc/sudoers.d/agentbox
+echo "agentbox-sudo: NOPASSWD configured for user $USER_NAME"'
+
+  if openshell sandbox exec --name "$sandbox" --user root --no-tty \
+       -- /bin/sh -c "$setup_script" </dev/null; then
+    audit_emit "$sandbox" "sudo" "NOPASSWD sudo enabled (in-sandbox only)"
+    log "  ✓ sudo ready inside $sandbox (sudo apt install foo / sudo systemctl ... / etc.)"
+    return 0
+  fi
+
+  warn "could not configure sudo (openshell --user root not supported, or sudo missing in image)"
+  warn "manual workaround: 'agentbox shell' then 'echo \"\$USER ALL=(ALL) NOPASSWD: ALL\" | sudo tee /etc/sudoers.d/agentbox'"
+  return 1
 }
 
 write_default_policy() {
@@ -2015,6 +2061,17 @@ cmd_doctor() {
     _row info "python3" "optional (only needed for AGENTBOX_DECIDE_SERVER)"
   fi
 
+  # In-sandbox sudo (only meaningful if AGENTBOX_SUDO is set for current workspace).
+  # We can't easily check inside-sandbox state from here without naming a specific
+  # sandbox, but we can report the env-var/toml settings.
+  if [ -f .agentbox.toml ] && grep -qE '^[[:space:]]*sudo[[:space:]]*=[[:space:]]*"?(true|1|yes|on)"?' .agentbox.toml 2>/dev/null; then
+    _row ok "sandbox sudo" "enabled via .agentbox.toml in $PWD"
+  elif is_truthy "${AGENTBOX_SUDO:-}"; then
+    _row ok "sandbox sudo" "enabled via AGENTBOX_SUDO env"
+  else
+    _row info "sandbox sudo" "disabled (AGENTBOX_SUDO=1 or .agentbox.toml sudo=true to enable)"
+  fi
+
   # xdotool — only relevant for Linux force-retry keystroke injection.
   if [ "$(uname)" = "Linux" ]; then
     if command -v xdotool >/dev/null 2>&1; then
@@ -2679,6 +2736,19 @@ Per-workspace overrides (.agentbox.toml in workspace root):
   memory = "1Gi"
   policy = "./custom.yaml"     override the auto-generated policy
   upload_credentials = false   if true, copies ~/.claude into sandbox
+  sudo = true                  NOPASSWD sudo for the sandbox user (stays
+                               inside the sandbox; opt-in, default false)
+
+In-sandbox sudo (let the agent run 'sudo apt install foo', edit /etc/*, etc.
+inside its OWN sandbox — no host escape):
+  export AGENTBOX_SUDO=1                    enable for this shell
+  # or, persistent per-workspace:
+  echo 'sudo = true' >> .agentbox.toml
+
+  Writes /etc/sudoers.d/agentbox with NOPASSWD for the sandbox user via a
+  one-time `openshell sandbox exec --user root`. Idempotent — safe to leave
+  on; subsequent launches detect and skip. If the base image lacks the sudo
+  binary, falls back to a clear error with manual workaround.
 EOF
 }
 
@@ -2794,6 +2864,11 @@ mutagen_ensure "$sandbox" "$PWD"
 mutagen_state_ensure "$sandbox"
 watcher_ensure "$sandbox"
 decide_server_ensure "$sandbox"
+# In-sandbox sudo: opt-in via AGENTBOX_SUDO=1 env or .agentbox.toml `sudo = true`.
+# Idempotent — checks state first; no-op if already configured.
+if is_truthy "${AGENTBOX_SUDO:-${AGB_SUDO:-false}}"; then
+  setup_sandbox_sudo "$sandbox" || true
+fi
 agent_ensure_installed "$sandbox" "$agent"
 
 # TTY: override > detect (stdout is a tty)
