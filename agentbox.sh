@@ -410,7 +410,7 @@ ntfy_get_topic() {
   [ -n "$t" ] && printf '%s\n' "$t"
 }
 
-# Derive a wildcard parent zone from a hostname for the "Approve *.parent" UX:
+# Derive a wildcard parent zone from a hostname for the "Allow all *.parent" UX:
 #   static.rust-lang.org → *.rust-lang.org    (strip leftmost label)
 #   crates.io            → *.crates.io        (2-label apex stays prefixed)
 #   download.crates.io   → *.crates.io        (strip leftmost label)
@@ -441,13 +441,13 @@ ntfy_prompt() {
   local since; since=$(date +%s)
   local url="$AGB_NTFY_BASE/$topic"
 
-  # POST the notification with THREE actions: Allow, Approve <wildcard>, Deny.
+  # POST the notification with THREE actions: Allow, Allow all <wildcard>, Deny.
   # ntfy allows up to 3 action buttons per notification.
   curl -fsS -X POST \
     -H "Title: agentbox: approve network access?" \
     -H "Priority: high" \
     -H "Tags: warning,lock" \
-    -H "Actions: http, Allow, $url, method=POST, body=ALLOW $req_id; http, Approve $wild, $url, method=POST, body=WILDCARD $req_id; http, Deny, $url, method=POST, body=DENY $req_id" \
+    -H "Actions: http, Allow, $url, method=POST, body=ALLOW $req_id; http, Allow all $wild, $url, method=POST, body=WILDCARD $req_id; http, Deny, $url, method=POST, body=DENY $req_id" \
     -d "$bname -> $host:$port (sandbox: $sandbox)" \
     "$url" >/dev/null 2>&1 || { echo ""; return; }
 
@@ -510,7 +510,7 @@ prompt_approval() {
   local subtitle="${bname} -> ${host}:${port}"
   local wild; wild=$(wildcard_for_host "$host")
   local message="(sandbox: ${sandbox})"
-  local wild_label="Approve $wild"
+  local wild_label="Allow all $wild"
 
   # ntfy.sh backend (cross-device push, three-button inline). STRICTLY opt-in:
   # both AGENTBOX_NTFY=1 must be exported AND a topic must be configured via
@@ -533,24 +533,31 @@ prompt_approval() {
     fi
   fi
 
-  # macOS: alerter is the preferred local prompt. Three-state result: Allow
-  # button, "Approve *.parent" action button, close = Deny.
+  # macOS: alerter is the preferred local prompt. Two-state result: Allow
+  # button + close=Deny. The wildcard option is intentionally NOT offered
+  # here — macOS notification banners (NSUserNotification API) support
+  # exactly one primary action button. Passing multiple via --actions
+  # makes alerter render them as a dropdown labeled "Options"/"Show",
+  # which clutters the UX. For users who want the wildcard option on
+  # macOS, use ntfy push notifications (3 inline buttons natively
+  # supported by ntfy clients): export AGENTBOX_NTFY=1 + agentbox notify setup.
+  # The osascript modal fallback below also offers 3 buttons but only
+  # fires when alerter isn't installed.
   if [ "$(uname)" = "Darwin" ] && command -v alerter >/dev/null 2>&1; then
     local response
     response=$(alerter \
       --title "$title" \
       --subtitle "$subtitle" \
       --message "$message" \
-      --actions "Allow,$wild_label" \
+      --actions "Allow" \
       --close-label "Deny" \
       --timeout 300 \
       --sound default \
       2>/dev/null)
     case "$response" in
-      Allow)         echo "Allow" ;;
-      "$wild_label") echo "AllowWildcard:$wild" ;;
-      @CLOSED)       echo "Deny" ;;
-      *)             echo "" ;;
+      Allow)   echo "Allow" ;;
+      @CLOSED) echo "Deny" ;;
+      *)       echo "" ;;
     esac
     return 0
   fi
@@ -562,16 +569,18 @@ prompt_approval() {
 display alert "${title}" message "${subtitle}\n${message}" as informational buttons {"Deny", "${wild_label}", "Allow"} default button "Allow"
 APPLESCRIPT
 )
+    # Order matters: "Allow all *.x" contains "Allow" so the wildcard
+    # match must come before the bare-Allow match.
     case "$response" in
-      *Allow*)   echo "Allow" ;;
-      *Approve*) echo "AllowWildcard:$wild" ;;
-      *Deny*)    echo "Deny" ;;
-      *)         echo "" ;;
+      *"Allow all "*) echo "AllowWildcard:$wild" ;;
+      *Allow*)        echo "Allow" ;;
+      *Deny*)         echo "Deny" ;;
+      *)              echo "" ;;
     esac
     return 0
   fi
 
-  # Linux: zenity --list with three rows (Allow / Approve wildcard / Deny).
+  # Linux: zenity --list with three rows (Allow / Allow all <wildcard> / Deny).
   # The default --question is binary; --list lets us offer the 3rd option.
   if command -v zenity >/dev/null 2>&1; then
     local choice
@@ -1213,7 +1222,7 @@ cmd_decide_handler_internal() {
       _decide_reply "allow" "user approved" "exact" "$host"
       ;;
     AllowWildcard:*)
-      # User picked "Approve *.parent.host". Hot-reload the openshell policy
+      # User picked "Allow all *.parent.host". Hot-reload the openshell policy
       # to add the wildcard endpoint so future requests under that zone
       # pass without prompting. Then return allow for the current request.
       local wild="${response#AllowWildcard:}"
