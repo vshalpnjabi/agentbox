@@ -713,11 +713,16 @@ APPLESCRIPT
 
   # Last-resort fallback: read from /dev/tty (works on any platform when interactive).
   # Three keys: a=Allow, w=Wildcard, d=Deny.
-  if [ -r /dev/tty ]; then
+  #
+  # `[ -r /dev/tty ]` passes whenever the device node is readable, but in a
+  # daemonised handler subprocess (e.g. spawned by the decide-server) there's
+  # no controlling terminal, so the subsequent open() returns ENXIO. Use a
+  # subshell with redirection to actually probe open()-ability before reading.
+  if { : < /dev/tty; } 2>/dev/null; then
     printf '\n[agentbox] %s\n  %s\n  %s\n  [a]llow / [w]ildcard (%s) / [d]eny: ' \
       "$title" "$subtitle" "$message" "$wild" > /dev/tty
-    local ans
-    read -r ans < /dev/tty
+    local ans=""
+    read -r ans < /dev/tty || ans=""
     case "$ans" in
       a|A|allow|Allow|y|Y|yes|Yes) echo "Allow" ;;
       w|W|wildcard|Wildcard)       echo "AllowWildcard:$wild" ;;
@@ -726,7 +731,12 @@ APPLESCRIPT
     return 0
   fi
 
-  # No prompt mechanism available: fail-closed (deny)
+  # No prompt mechanism available: fail-closed (deny). Surface WHY to stderr so
+  # operators can fix the gap (most common: AGENTBOX_NTFY=1 not in the env of
+  # the process that started the decide-server, so ntfy never fires in handler
+  # subprocesses; or running on Linux without ntfy + without a TTY).
+  echo "[prompt_approval] no prompt path available — fail-closed Deny" >&2
+  echo "[prompt_approval]   uname=$(uname) AGENTBOX_NTFY=${AGENTBOX_NTFY:-unset} topic_file_exists=$([ -f "$AGB_NTFY_TOPIC_FILE" ] && echo yes || echo no) alerter=$(command -v alerter >/dev/null && echo yes || echo no) osascript=$(command -v osascript >/dev/null && echo yes || echo no) zenity=$(command -v zenity >/dev/null && echo yes || echo no) tty_openable=no" >&2
   echo "Deny"
 }
 
