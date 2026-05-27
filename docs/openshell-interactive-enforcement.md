@@ -186,39 +186,129 @@ in-flight decisions by `request_id`.
 
 ### Step 5 — Policy template
 
-Add (or update) the default `.agentbox.policy.yaml` template so new sandboxes
-get interactive enforcement by default on unconfigured hosts:
+#### Why the naive approach doesn't work
+
+Before giving the template, it's worth understanding why three seemingly
+reasonable attempts all silently fail:
+
+| Attempt | What goes wrong |
+|---------|-----------------|
+| `enforcement: {mode: interactive}` with **no `protocol:`** | Interactive never fires. Without `protocol:`, the L7 engine never runs. The proxy allows/denies at L4 (host+port only) and the enforcement field is ignored. |
+| `protocol: rest` with **no `access:` or `rules:`** | The L7 validator rejects the policy with `"protocol requires rules or access to define allowed traffic"`. |
+| `protocol: rest` + **`access: full`** (no `deny_rules`) | Interactive never fires. `access: full` expands to an allow-all rule (`method: *, path: **`), so `allowed = true` for every request. The proxy only consults interactive enforcement when `allowed = false`. |
+| **`host: "*"`** to catch all internet traffic | No matches. OPA's glob uses `.` as a segment delimiter, so `*` matches a single DNS label and never crosses dots. `glob.match("*", ["."], "api.example.com")` is false. |
+
+#### The correct pattern
+
+To make interactive fire for **every request to a given host**, you need three
+ingredients together:
+
+1. **`protocol: rest`** — enables L7 inspection (the path that consults enforcement mode)
+2. **`access: full`** — satisfies the validator's `rules or access` requirement; establishes the base allow set
+3. **`deny_rules: [{method: "*", path: "**"}]`** — overrides the base allow, making every request `allowed = false`; the proxy then calls your decision endpoint instead of forwarding
+
+The Rego rule is `allow_request if { ... _policy_allows_l7 ... not deny_request }`.
+With `deny_request = true`, `allow_request = false` → enforcement mode is checked →
+interactive fires.
+
+#### Minimal single-host example
 
 ```yaml
+version: 1
 network_policies:
-  # Hosts in this list are always allowed without a prompt.
-  claude_api:
-    name: claude-api
+  my-gated-api:
     endpoints:
-      - host: "api.anthropic.com"
+      - host: api.example.com   # exact hostname; see wildcard note below
+        port: 443
+        protocol: rest          # required: enables L7 + enforcement
+        enforcement:
+          mode: interactive
+          endpoint: http://127.0.0.1:9999/decide
+          timeout_seconds: 30
+          fallback: deny        # agent gets 403 on timeout / server error
+        access: full            # base allow (satisfies validator)
+        deny_rules:
+          - name: gate-all      # overrides base → forces allowed=false
+            method: "*"         # all HTTP methods
+            path: "**"          # all paths ("**" is the always-match sentinel)
+    binaries:
+      - path: "**"              # any binary spawned by the agent
+```
+
+When the agent sends `POST /v1/messages` to `api.example.com:443`:
+1. L4 match: `api.example.com:443` found → TCP connection opened
+2. L7 base: `access: full` → rule `{method: *, path: **}` would allow
+3. L7 deny: `deny_rules` → `method: *` + `path: **` matches → `deny_request = true`
+4. `allow_request = false` (Rego: `allow_request` requires `not deny_request`)
+5. Proxy matches `Interactive` arm → holds the connection → POSTs to `/decide`
+6. Your server replies `{"decision":"allow"}` → proxy forwards; `"deny"` → 403
+
+#### Two-tier allow-list + interactive template
+
+```yaml
+version: 1
+
+network_policies:
+  # Tier 1: Claude API — always allowed, no prompts.
+  claude-api:
+    endpoints:
+      - host: api.anthropic.com
         port: 443
         protocol: rest
         enforcement: enforce
+        access: full
     binaries:
-      - path: /usr/local/bin/claude
+      - path: "**"
 
-  # Everything else requires user approval.
-  interactive_gate:
-    name: interactive-gate
+  # Tier 2: GitHub — held for user approval.
+  #
+  # Wildcard note: "*.github.com" matches api.github.com, raw.githubusercontent.com
+  # (if listed separately), etc. Use one endpoint per base domain;
+  # bare "*" only matches single-label names (no dots) so it is useless here.
+  github-interactive:
     endpoints:
-      - host: "*"
+      - host: "*.github.com"
         port: 443
+        protocol: rest
         enforcement:
           mode: interactive
           endpoint: http://host.openshell.internal:53789/decide
           timeout_seconds: 120
           fallback: deny
+        access: full
+        deny_rules:
+          - name: gate-all
+            method: "*"
+            path: "**"
     binaries:
-      - path: /usr/local/bin/claude
+      - path: "**"
+
+  # github.com itself (subdomains use *.github.com above)
+  github-root-interactive:
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement:
+          mode: interactive
+          endpoint: http://host.openshell.internal:53789/decide
+          timeout_seconds: 120
+          fallback: deny
+        access: full
+        deny_rules:
+          - name: gate-all
+            method: "*"
+            path: "**"
+    binaries:
+      - path: "**"
 ```
 
-> Policy rules are evaluated in order; the first matching rule wins. Put
-> explicit allow-list entries **before** the `"*"` interactive rule.
+> **Evaluation order note:** OpenShell evaluates all policies and picks the
+> lexicographically smallest matching policy name. It does **not** short-circuit
+> on the first match. To prevent a later interactive policy from overriding an
+> explicit enforce entry, give allow-list policy names that sort before interactive
+> ones (e.g. `aaa-claude-api` before `zzz-interactive-gate`), or keep them in
+> separate, non-overlapping host sets.
 
 ---
 
