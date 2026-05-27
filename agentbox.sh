@@ -1019,20 +1019,12 @@ setup_sandbox_sudo() {
   log "configuring NOPASSWD sudo inside $sandbox (opt-in via AGENTBOX_SUDO)"
 
   # The setup runs as root inside the sandbox. The base openshell image
-  # ships sudo; if not, we error with a hint.
+  # ships sudo; if not, we error with a hint. The script MUST be a single
+  # line — openshell's gRPC exec API rejects command arguments containing
+  # newlines ("command argument N contains newline or carriage return
+  # characters"). Use `;` as statement separators.
   local setup_script
-  setup_script='set -e
-if ! command -v sudo >/dev/null 2>&1; then
-  echo "agentbox: sudo binary not present in sandbox image. Either" >&2
-  echo "  (a) bake sudo into a custom base image, or" >&2
-  echo "  (b) temporarily allow apt repos in policy and apt-get install sudo." >&2
-  exit 1
-fi
-USER_NAME=$(stat -c "%U" /sandbox 2>/dev/null || stat -f "%Su" /sandbox 2>/dev/null || echo sandbox)
-mkdir -p /etc/sudoers.d
-printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$USER_NAME" > /etc/sudoers.d/agentbox
-chmod 0440 /etc/sudoers.d/agentbox
-echo "agentbox-sudo: NOPASSWD configured for user $USER_NAME"'
+  setup_script='set -e; if ! command -v sudo >/dev/null 2>&1; then echo "agentbox: sudo binary not present in sandbox image. Either (a) bake sudo into a custom base image, or (b) temporarily allow apt repos in policy and apt-get install sudo." >&2; exit 1; fi; USER_NAME=$(stat -c "%U" /sandbox 2>/dev/null || stat -f "%Su" /sandbox 2>/dev/null || echo sandbox); mkdir -p /etc/sudoers.d; printf "%s ALL=(ALL) NOPASSWD: ALL\n" "$USER_NAME" > /etc/sudoers.d/agentbox; chmod 0440 /etc/sudoers.d/agentbox; echo "agentbox-sudo: NOPASSWD configured for user $USER_NAME"'
 
   if openshell sandbox exec --name "$sandbox" --user root --no-tty \
        -- /bin/sh -c "$setup_script" </dev/null; then
