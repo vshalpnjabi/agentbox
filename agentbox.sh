@@ -732,11 +732,21 @@ cmd_watch_internal() {
         local port="${BASH_REMATCH[4]}"
         local key="${binary}|${host}|${port}"
 
+        # Seen-list: by default we re-prompt for every deny, even ones
+        # you've decided on before. (This catches the case where an
+        # earlier Allow's policy hot-reload didn't actually stick.)
+        # AGENTBOX_SUPPRESS_REPEATS=1 enables the older "decide once,
+        # remember forever" mode for users who don't want a flood of
+        # repeated dialogs.
         if grep -Fxq "$key" "$seen_file"; then
-          echo "[watcher] suppressed (already in seen-list): $key" >&2
-          continue
+          if is_truthy "${AGENTBOX_SUPPRESS_REPEATS:-}"; then
+            echo "[watcher] suppressed (in seen-list, AGENTBOX_SUPPRESS_REPEATS=1): $key" >&2
+            continue
+          fi
+          echo "[watcher] re-prompting (was in seen-list; default is always-prompt): $key" >&2
+        else
+          echo "$key" >> "$seen_file"
         fi
-        echo "$key" >> "$seen_file"
 
         echo "[watcher] denied: $binary($pid) -> $host:$port — freezing + prompting" >&2
 
@@ -940,7 +950,10 @@ cmd_decide_handler_internal() {
 
   local key="${binary}|${host}|${port}"
   local cached=""
-  if [ -s "$seen_file" ]; then
+  # Decision cache: by default we re-prompt every time (parallel to the
+  # watcher path). AGENTBOX_SUPPRESS_REPEATS=1 opts in to the older
+  # "honor cached allow/deny without re-prompting" mode.
+  if [ -s "$seen_file" ] && is_truthy "${AGENTBOX_SUPPRESS_REPEATS:-}"; then
     cached=$(awk -F '|' -v k="$key" '$1"|"$2"|"$3 == k {d=$4} END{print d}' "$seen_file" || true)
   fi
   case "$cached" in
@@ -2706,11 +2719,19 @@ persisted to host so they survive gateway restarts):
   agentbox audit path [NAME]               Print log file path (~/.local/share/agentbox/state/<sandbox>/audit.log)
   agentbox audit clear [NAME]              Truncate the audit log
 
-Approval seen-list (the set of (binary, host:port) tuples the watcher
-won't re-prompt for):
-  agentbox approve list [N]              Show seen-list for this workspace
-  agentbox approve forget <pattern> [N]  Remove matching entries (re-prompts next time)
+Approval prompts (DEFAULT: every deny re-prompts, even tuples you've
+decided on before. Catches the case where a previous Allow's policy
+hot-reload didn't actually take effect.):
+  agentbox approve list [N]              Show seen-list (audit only;
+                                         doesn't affect prompting by default)
+  agentbox approve forget <pattern> [N]  Remove entries (no-op unless
+                                         AGENTBOX_SUPPRESS_REPEATS=1)
   agentbox approve reset [N]             Clear the entire seen-list
+  export AGENTBOX_SUPPRESS_REPEATS=1     Opt INTO the old "decide once,
+                                         never re-prompt" mode. Use if
+                                         the default re-prompting is too
+                                         chatty for your workflow.
+                                         (Restart watcher: agentbox stop && claude)
 
 Decide-server (host-side HTTP endpoint for openshell Interactive enforcement;
 forthcoming upstream, OPT-IN via AGENTBOX_DECIDE_SERVER=1):
