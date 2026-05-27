@@ -1673,8 +1673,7 @@ YAML
           fallback: deny
         access: full
         deny_rules:
-          - name: gate-all
-            method: "*"
+          - method: "*"
             path: "**"
     binaries:
       - { path: "**" }
