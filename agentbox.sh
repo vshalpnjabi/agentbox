@@ -516,39 +516,49 @@ tmux_kill_session() {
 # run on a private socket, they don't pollute the user's normal tmux.
 # Idempotent — safe to call on every attach.
 apply_agentbox_tmux_settings() {
-  local session="$1"
+  # All settings here are applied SERVER-GLOBAL (`-g`) on agentbox's private
+  # tmux socket — not session-scoped. This means:
+  #   1. New sessions inherit them automatically.
+  #   2. Reattaches via plain `tmux -L agentbox attach` (bypassing cmd_attach)
+  #      still see the right config — no stale session-level overrides.
+  #   3. We can also un-set any session-level overrides that may have been
+  #      written by older agentbox versions (-u -t session).
+  # First-arg session is kept only to clear potential session-level overrides
+  # from older installs; the actual settings are server-global.
+  local session="${1:-}"
   tmux_available || return 0
+
+  # Clear any session-level overrides from older agentbox versions so the
+  # global -g settings below take effect uncontested.
+  if [ -n "$session" ]; then
+    agb_tmux set-option -u -t "$session" mouse              >/dev/null 2>&1 || true
+    agb_tmux set-option -u -t "$session" history-limit      >/dev/null 2>&1 || true
+    agb_tmux set-option -u -t "$session" status             >/dev/null 2>&1 || true
+    agb_tmux set-option -u -t "$session" status-left        >/dev/null 2>&1 || true
+    agb_tmux set-option -u -t "$session" status-left-length >/dev/null 2>&1 || true
+  fi
+
   # Mouse on: scroll wheel scrolls history; click selects pane; etc.
-  agb_tmux set-option -t "$session" mouse "${AGENTBOX_TMUX_MOUSE:-on}" >/dev/null 2>&1 || true
+  agb_tmux set-option -g mouse "${AGENTBOX_TMUX_MOUSE:-on}" >/dev/null 2>&1 || true
   # Bigger scrollback than tmux's default of 2000 lines.
-  agb_tmux set-option -t "$session" history-limit "${AGENTBOX_TMUX_HISTORY:-10000}" >/dev/null 2>&1 || true
-  # Status-left: show the full sandbox name. Default tmux truncates to 10
-  # chars (so a long agentbox-<basename>-<hash> name gets cut to just
-  # "agentbox-0:ssh"). Override with AGENTBOX_TMUX_STATUS_LEFT for a custom
-  # format string; AGENTBOX_TMUX_STATUS_OFF=1 turns the whole bar off.
+  agb_tmux set-option -g history-limit "${AGENTBOX_TMUX_HISTORY:-10000}" >/dev/null 2>&1 || true
+  # Status-left: agentbox-branded label + workspace name (with the redundant
+  # leading "agentbox-" prefix stripped via tmux #{s/.../.../:var} format
+  # substitution). The `^` anchor is load-bearing — tmux's substitution is
+  # global by default, so without `^` the middle "agentbox-" would also get
+  # stripped in agentbox-on-agentbox workspaces, leaving just the bare hash.
   if is_truthy "${AGENTBOX_TMUX_STATUS_OFF:-}"; then
-    agb_tmux set-option -t "$session" status off >/dev/null 2>&1 || true
+    agb_tmux set-option -g status off >/dev/null 2>&1 || true
   else
-    agb_tmux set-option -t "$session" status on >/dev/null 2>&1 || true
-    # Strip the LEADING "agentbox-" prefix from the displayed session name
-    # — the label already says "agentbox", so the full name "agentbox-foo-..."
-    # is redundant. The `^` anchor is load-bearing: tmux's #{s/.../.../:var}
-    # is global by default (no `g` flag needed), and without `^` it would
-    # also strip the middle "agentbox-" when the workspace folder itself
-    # is named "agentbox" (sandbox name = "agentbox-agentbox-<hash>") —
-    # leaving just the bare hash.
-    agb_tmux set-option -t "$session" status-left \
+    agb_tmux set-option -g status on >/dev/null 2>&1 || true
+    agb_tmux set-option -g status-left \
       "${AGENTBOX_TMUX_STATUS_LEFT:- #[fg=cyan,bold]agentbox#[fg=default,nobold]:#[fg=green]#{s/^agentbox-//:session_name}#[default] #[fg=cyan]| }" \
       >/dev/null 2>&1 || true
-    agb_tmux set-option -t "$session" status-left-length \
+    agb_tmux set-option -g status-left-length \
       "${AGENTBOX_TMUX_STATUS_LEFT_LENGTH:-80}" >/dev/null 2>&1 || true
   fi
   # Make copy-mode less sticky: any mouse click (no drag) immediately
-  # cancels and returns to live input. Default tmux behavior keeps you
-  # in copy-mode after scroll-wheel triggers it, which surprises users
-  # who expect a click to "get me back to typing". `cancel` exits the
-  # mode entirely. Drag-to-select still works (drag is a different event
-  # MouseDrag1Pane), only standalone clicks are short-circuited.
+  # cancels and returns to live input.
   agb_tmux bind-key -T copy-mode    MouseDown1Pane send-keys -X cancel >/dev/null 2>&1 || true
   agb_tmux bind-key -T copy-mode-vi MouseDown1Pane send-keys -X cancel >/dev/null 2>&1 || true
 }
