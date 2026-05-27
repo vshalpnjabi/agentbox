@@ -2158,8 +2158,21 @@ cmd_decide_test() {
   local sandbox
   sandbox=$(workspace_sandbox_name)
 
+  # Auto-ensure the server. `decide test` only makes sense when the user wants
+  # to talk to the endpoint — so silently starting it on demand is the right
+  # default. Idempotent: no-op if already running.
   if ! decide_server_running "$sandbox"; then
-    err "decide-server not running for $sandbox — run 'agentbox decide start' or launch an agent (default-on; AGENTBOX_NO_DECIDE_SERVER=1 to disable)"
+    decide_server_ensure "$sandbox"
+    # Python forks and writes pid+port; poll briefly so the test doesn't race
+    # the bind. ~1s is plenty in practice; cap at 3s to fail fast on bugs.
+    local i
+    for i in 1 2 3 4 5 6; do
+      decide_server_running "$sandbox" && break
+      sleep 0.5
+    done
+    if ! decide_server_running "$sandbox"; then
+      err "decide-server failed to start for $sandbox — check 'agentbox decide logs'"
+    fi
   fi
   if ! command -v jq >/dev/null 2>&1; then
     err "jq required for 'agentbox decide test' (brew install jq)"
