@@ -1,5 +1,7 @@
 # agentbox
 
+[![release](https://img.shields.io/github/v/release/vshalpnjabi/agentbox?sort=semver)](https://github.com/vshalpnjabi/agentbox/releases/latest)
+
 Per-workspace [openshell](https://docs.nvidia.com/openshell/) sandboxes for AI coding agents.
 
 `claude`, `codex`, `opencode` get transparently routed through an isolated [openshell](https://github.com/NVIDIA/OpenShell) sandbox per workspace folder, with live two-way file sync to the host, persistent session history that survives sandbox loss, auto-authenticated agents (one-time host setup), and an interactive approval workflow (macOS notifications or cross-device push via [ntfy.sh](https://ntfy.sh)) for any network access that isn't pre-allowed.
@@ -26,8 +28,10 @@ End-to-end: type `claude` in any folder, get a fully-authenticated, sandboxed ag
 - macOS (primary target) or Linux
 - [openshell](https://docs.nvidia.com/openshell/get-started/quickstart) — `brew install nvidia/openshell/openshell`
 - [mutagen](https://mutagen.io) — `brew tap mutagen-io/mutagen && brew install mutagen`
+- [tmux](https://github.com/tmux/tmux) — `brew install tmux` (default-on wrap around the agent's TTY, since v0.2.0)
 - [alerter](https://github.com/vjeantet/alerter) — `brew install vjeantet/tap/alerter` (for approval dialogs)
 - [qrencode](https://fukuchi.org/works/qrencode/) — `brew install qrencode` (optional, for ntfy QR setup)
+- python3 (optional, only if `AGENTBOX_DECIDE_SERVER=1` — comes with macOS)
 - Docker (or Podman / k8s / openshell VM driver) running — sandbox compute backend
 - At least one supported agent on `$PATH`: `claude`, `codex`, or `opencode`
 
@@ -150,11 +154,33 @@ AGENTBOX_BYPASS=1 claude
 # Management
 agentbox status                      # list sandboxes + sync sessions + state usage
 agentbox name                        # print sandbox name for current workspace
-agentbox shell                       # interactive shell inside the sandbox
-agentbox stop                        # pause sync (sandbox preserved)
+agentbox shell                       # interactive shell inside the sandbox (openshell exec)
+agentbox ssh [-- cmd args...]        # ssh -t into sandbox; supports one-shot commands
+                                     # e.g.  agentbox ssh -- cat /etc/os-release
+agentbox attach                      # reattach to this workspace's tmux session
+agentbox stop                        # pause sync + kill watcher (sandbox preserved)
 agentbox pull                        # force-flush sync (sandbox -> host)
 agentbox destroy                     # delete sandbox + ssh block (host state preserved)
 agentbox destroy --purge             # also wipe ~/.local/share/agentbox/state/<sandbox>/
+
+# Sandbox resources (cpu / memory) — writes .agentbox.toml + optionally recreates
+agentbox resize                      # show effective config
+agentbox resize cpu 4 memory 4Gi     # set values for next launch
+agentbox resize cpu 4 --apply        # set + destroy + auto-recreate (state preserved)
+
+# In-sandbox NOPASSWD sudo for the agent (opt-in; stays fully contained)
+agentbox sudo                        # show status (toml + env + live in-sandbox state)
+agentbox sudo enable                 # write sudo=true to .agentbox.toml AND apply
+agentbox sudo disable                # remove /etc/sudoers.d/agentbox + drop from toml
+
+# Decide-server (host-side HTTP endpoint for openshell's forthcoming Interactive
+# enforcement mode; opt-in via AGENTBOX_DECIDE_SERVER=1)
+agentbox decide status               # running pid/port + endpoint URL
+agentbox decide start                # manually start
+agentbox decide stop                 # stop
+agentbox decide test [host [port]]   # send a synthetic /decide POST (exercises prompt UI)
+agentbox decide logs                 # tail server log
+agentbox decide seen                 # show cached allow/deny decisions
 
 # Policy management (per workspace)
 agentbox policy show                 # print active policy on the running sandbox
@@ -207,21 +233,43 @@ cpu = "1"
 memory = "1Gi"
 policy = "./custom.yaml"      # override the auto-generated policy file
 upload_credentials = false    # unused since agentbox auto-syncs credentials
+sudo = true                   # grant NOPASSWD sudo to the sandbox user (since v0.2.0)
 ```
+
+The same file is what `agentbox resize` and `agentbox sudo enable` write to, so prefer those commands over hand-editing.
 
 ## Approval workflow
 
 When the agent inside the sandbox attempts a network call to a host not in policy:
 
-1. openshell proxy denies the connection (CONNECT 403).
+1. openshell proxy denies the connection (CONNECT 403 at L4).
 2. agentbox watcher detects the deny in `openshell logs --tail`.
 3. Watcher SIGSTOPs the agent process(es) inside the sandbox so the TUI visibly freezes.
 4. A notification is shown — alerter on macOS (default), or ntfy.sh push (opt-in) to all your subscribed devices.
 5. You click **Allow** or **Deny**.
-   - **Allow** → watcher pushes a policy update via `openshell policy update` (hot-reload, <1s); future requests to that endpoint pass silently. SIGCONT resumes the agent. Note: the original 403 already reached the agent; tell it to retry.
-   - **Deny** → watcher records the (binary, host:port) tuple in `watcher-seen.txt` so you're not asked again; SIGCONT resumes. Agent reports the failure.
+   - **Allow** → watcher pushes a policy update via `openshell policy update`; future requests to that endpoint should pass. SIGCONT resumes the agent. Optionally, if `AGENTBOX_FORCE_RETRY=1` is set, agentbox also types `retry` into the agent's tmux session and submits — so you don't have to tell the agent to retry yourself.
+   - **Deny** → SIGCONT resumes; the agent reports the failure.
+
+Decisions are persisted in `watcher-seen.txt` (per-sandbox) for audit, but **by default v0.2.0 re-prompts on every deny** even for tuples you've decided on before (catches cases where the openshell policy hot-reload reports success but doesn't actually apply). Set `AGENTBOX_SUPPRESS_REPEATS=1` to opt back into the older "decide once, never re-prompt" mode.
 
 The seen-list is per-sandbox and editable via `agentbox approve {list|forget|reset}`.
+
+### Force-retry auto-inject (since v0.2.0)
+
+`AGENTBOX_FORCE_RETRY=1` makes agentbox type a `retry` message into the agent's tmux pane after you click Allow. Char-by-char with a small per-char delay to defeat Claude Code's paste-detect / multi-line input mode. Works regardless of which terminal window has focus — `tmux send-keys` delivers to the pane directly. Overridable:
+
+```bash
+export AGENTBOX_FORCE_RETRY=1
+export AGENTBOX_RETRY_PROMPT="..."           # default: "retry"
+export AGENTBOX_RETRY_TYPING_DELAY=0.02      # seconds between chars
+export AGENTBOX_RETRY_SUBMIT_KEY="Enter"     # try "Escape Enter" / "C-Enter" if Enter doesn't submit
+```
+
+### Decide-server (host-side HTTP endpoint for openshell's Interactive mode, opt-in)
+
+`AGENTBOX_DECIDE_SERVER=1` spins up `bin/agentbox-decide.py` (Python 3 stdlib, 127.0.0.1) per sandbox. Implements the wire protocol from openshell's forthcoming `interactive` enforcement mode — when openshell encounters an out-of-policy request, it POSTs the request details, our server drives the prompt UI, and returns `{"decision":"allow"|"deny"}`. Holds the connection open until you decide — agent sees a clean 200, no retry semantics needed.
+
+**Note: requires upstream openshell support that doesn't exist yet.** Tracked at [vshalpnjabi/OpenShell `interactive-enforcement`](https://github.com/vshalpnjabi/OpenShell/tree/interactive-enforcement). Until then the watcher path stays the always-on approval mechanism.
 
 ## Resilience
 
@@ -246,6 +294,21 @@ All boolean knobs accept `1` / `true` / `yes` / `on` (case-insensitive):
 | `AGB_DEFAULT_IMAGE` | Default community image. Default: `base`. |
 | `AGB_DEFAULT_CPU` | Default CPU. Default: `1`. |
 | `AGB_DEFAULT_MEMORY` | Default memory. Default: `1Gi`. |
+| `AGENTBOX_NO_TMUX` | Disable the default-on tmux wrap around agent launches (since v0.2.0). |
+| `AGENTBOX_TMUX_SOCKET` | tmux socket name for agentbox sessions. Default `agentbox`. |
+| `AGENTBOX_TMUX_MOUSE` | `on` (default) / `off` — scroll-wheel scrollback in the tmux pane. |
+| `AGENTBOX_TMUX_HISTORY` | Tmux history-limit. Default `10000`. |
+| `AGENTBOX_TMUX_STATUS_LEFT` | Custom tmux `status-left` format string. |
+| `AGENTBOX_TMUX_STATUS_OFF` | Hide the tmux status bar. |
+| `AGENTBOX_FORCE_RETRY` | Auto-inject a `retry` prompt into the agent after Allow (since v0.2.0). |
+| `AGENTBOX_RETRY_PROMPT` | Text to inject. Default `retry`. |
+| `AGENTBOX_RETRY_DELAY` | Pre-inject focus-settle (keystroke fallback only; tmux path skips). |
+| `AGENTBOX_RETRY_TYPING_DELAY` | Per-char delay during typing. Default `0.02`. |
+| `AGENTBOX_RETRY_SUBMIT_DELAY` | Pause after typing before sending submit key. Default `0.15`. |
+| `AGENTBOX_RETRY_SUBMIT_KEY` | Submit key sequence. Default `Enter`. Try `"Escape Enter"` / `"C-Enter"` / `"none"` if Enter doesn't submit. |
+| `AGENTBOX_SUDO` | Configure NOPASSWD sudo inside the sandbox on next launch (since v0.2.0). |
+| `AGENTBOX_DECIDE_SERVER` | Start the host-side HTTP `/decide` endpoint for openshell's Interactive mode (since v0.2.0; opt-in, awaiting upstream). |
+| `AGENTBOX_SUPPRESS_REPEATS` | Re-enable the older "decide once, never re-prompt" suppression (v0.2.0 default is always re-prompt). |
 
 ## How it works (architecture sketch)
 
