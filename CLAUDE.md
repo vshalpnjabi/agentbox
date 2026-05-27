@@ -150,23 +150,43 @@ Every `AGENTBOX_*` boolean env var accepts `1`, `true`, `yes`, `on`, `y`, `t` (c
 via the `is_truthy` helper. When adding new boolean knobs, use `is_truthy "${VAR:-}"`, never
 `[ "$VAR" = "1" ]`.
 
-### 10. Decide-server is purely additive; never wire it on by default
+### 10. Decide-server: default-on host; opt-in interactive policy
 
 The decide-server (`bin/agentbox-decide.py` + `__decide` handler + `decide_server_*` lifecycle
-in agentbox.sh) is the host side of openshell's *forthcoming* Interactive enforcement mode.
-Upstream does not yet send any traffic to it. Until openshell ships:
+in agentbox.sh) implements the openshell interactive-enforcement wire protocol
+(`docs/openshell-interactive-enforcement.md`). It serves BOTH paths today:
 
-- Keep it gated on `AGENTBOX_DECIDE_SERVER=1` (default off). Don't promote to default-on.
-- The classic watcher (POST-deny log tail) stays the always-on path. Don't remove it
-  thinking "the decide-server replaces this" — it doesn't, until upstream lands.
-- Bind to 127.0.0.1 ONLY. Cross-binding (0.0.0.0 or the docker bridge IP) requires the
-  HMAC auth story to be settled first (open question 2 in the upstream DESIGN.md).
-- The handler returns its decision as a single JSON object on stdout. Don't add stray
-  prints elsewhere in the handler path — `prompt_approval`'s `Allow`/`Deny`/`""` echo
-  must be captured into a variable, never let it stream through to the response.
-- Decide-server cache (`decide-seen.txt`) is intentionally separate from the watcher's
-  `watcher-seen.txt` because the decide path must remember the *direction* (allow vs
-  deny) while the watcher only needs the *fact* of a prior decision.
+- L4 watcher → POSTs to `/decide` after seeing a NET:OPEN DENIED line (default).
+- L7 openshell proxy → POSTs to `/decide` directly when the policy rule has
+  `enforcement.mode: interactive` (requires openshell built from the
+  `interactive-enforcement` branch).
+
+Rules:
+- Server runs default-on; opt out with `AGENTBOX_NO_DECIDE_SERVER=1`.
+- L4 watcher stays running alongside the server — it is the only path that
+  works against stock openshell (no interactive mode upstream yet). Don't
+  remove it thinking the decide-server replaces it.
+- Bind defaults to **127.0.0.1** (no HMAC auth exists yet). Override with
+  `AGENTBOX_DECIDE_BIND=0.0.0.0` only when openshell runs in a container and
+  reaches agentbox via `host.openshell.internal`. Document the threat model
+  before broadening this default.
+- The handler returns its decision as a single JSON object on stdout. Don't
+  add stray prints elsewhere in the handler path — `prompt_approval`'s
+  `Allow`/`Deny`/`""` echo must be captured into a variable, never let it
+  stream through to the response.
+- Wire-protocol fields (parsed in `cmd_decide_handler_internal`): `host`,
+  `port`, `binary`, `request_id`, `schema_version`, `sandbox_name`, `pid`,
+  `method`, `path`, `protocol`, `policy_name`, `source`. Validation:
+  schema_version must be 1 (empty allowed for legacy watcher callers),
+  sandbox_name must match the server's sandbox when present.
+- The opt-in `AGENTBOX_INTERACTIVE_POLICY=1` makes `write_default_policy`
+  append a wildcard `interactive_gate` rule pointing at the local
+  decide-server URL. Only useful when openshell upstream interactive mode
+  is installed — without it openshell silently falls back to enforce.
+- Decide-server cache (`decide-seen.txt`) is intentionally separate from the
+  watcher's `watcher-seen.txt` because the decide path must remember the
+  *direction* (allow vs deny) while the watcher only needs the *fact* of a
+  prior decision.
 
 ### 12. Tmux wrap is default-on; retry-inject prefers `send-keys`
 

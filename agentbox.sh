@@ -1218,10 +1218,18 @@ decide_server_ensure() {
   local handler
   handler=$(printf '%q __decide %q' "$self_path" "$sandbox")
 
-  log "starting decide-server for $sandbox on 127.0.0.1:$port"
+  # Bind address. Default 127.0.0.1 (CLAUDE.md rule 10 — safe; no HMAC auth
+  # exists yet). Override with AGENTBOX_DECIDE_BIND when the openshell proxy
+  # runs inside a container and reaches agentbox via host.openshell.internal,
+  # which resolves to the docker-bridge IP (typically 10.x or 192.168.x).
+  # Setting 0.0.0.0 makes the endpoint visible to any process on the host —
+  # only do this on trusted networks until the auth story is settled.
+  local bind="${AGENTBOX_DECIDE_BIND:-127.0.0.1}"
+
+  log "starting decide-server for $sandbox on ${bind}:${port}"
   nohup python3 "$py" \
     --port "$port" \
-    --bind 127.0.0.1 \
+    --bind "$bind" \
     --sandbox "$sandbox" \
     --handler "$handler" \
     --pid-file "$pf" \
@@ -1263,17 +1271,47 @@ cmd_decide_handler_internal() {
 
   local body
   body=$(cat)
-  local host port binary req_id source
-  host=$(printf '%s' "$body"   | jq -r '.host // empty' 2>/dev/null || echo "")
-  port=$(printf '%s' "$body"   | jq -r '.port // empty' 2>/dev/null || echo "")
-  binary=$(printf '%s' "$body" | jq -r '.binary // empty' 2>/dev/null || echo "")
-  req_id=$(printf '%s' "$body" | jq -r '.request_id // empty' 2>/dev/null || echo "")
+  # Parse the full openshell interactive-enforcement wire protocol
+  # (docs/openshell-interactive-enforcement.md). Fields the openshell proxy
+  # sends today: host, port, binary, request_id, schema_version, sandbox_name,
+  # pid, method, path, protocol, policy_name. Earlier watcher-internal calls
+  # only set host/port/binary/request_id/source — those keep working since the
+  # extra fields default to empty.
+  local host port binary req_id source schema_version body_sandbox pid method req_path protocol policy_name
+  host=$(printf '%s' "$body"           | jq -r '.host // empty'           2>/dev/null || echo "")
+  port=$(printf '%s' "$body"           | jq -r '.port // empty'           2>/dev/null || echo "")
+  binary=$(printf '%s' "$body"         | jq -r '.binary // empty'         2>/dev/null || echo "")
+  req_id=$(printf '%s' "$body"         | jq -r '.request_id // empty'     2>/dev/null || echo "")
+  schema_version=$(printf '%s' "$body" | jq -r '.schema_version // empty' 2>/dev/null || echo "")
+  body_sandbox=$(printf '%s' "$body"   | jq -r '.sandbox_name // empty'   2>/dev/null || echo "")
+  pid=$(printf '%s' "$body"            | jq -r '.pid // empty'            2>/dev/null || echo "")
+  method=$(printf '%s' "$body"         | jq -r '.method // empty'         2>/dev/null || echo "")
+  req_path=$(printf '%s' "$body"       | jq -r '.path // empty'           2>/dev/null || echo "")
+  protocol=$(printf '%s' "$body"       | jq -r '.protocol // empty'       2>/dev/null || echo "")
+  policy_name=$(printf '%s' "$body"    | jq -r '.policy_name // empty'    2>/dev/null || echo "")
   # `source` distinguishes who called us:
   #   openshell  (default) — L7 Interactive enforcement (when upstream lands)
   #   watcher              — L4 deny caught by agentbox's log-tail watcher
   # Used for audit log clarity. Behavior is the same either way.
   source=$(printf '%s' "$body" | jq -r '.source // empty' 2>/dev/null || echo "")
   [ -z "$source" ] && source="openshell"
+
+  # Reject schema versions we don't understand — but accept missing/empty
+  # (legacy watcher callers don't set it).
+  if [ -n "$schema_version" ] && [ "$schema_version" != "1" ]; then
+    audit_emit "$sandbox" "decide" "BAD_SCHEMA [src=$source] ${req_id:-?}: schema_version=$schema_version (expected 1)"
+    printf '{"decision":"deny","reason":"unsupported schema_version %s"}\n' "$schema_version"
+    return 0
+  fi
+
+  # If the request body names a sandbox, it MUST match the one this server
+  # was bound to at startup. This guards against the openshell proxy
+  # accidentally routing a decision request to the wrong agentbox instance.
+  if [ -n "$body_sandbox" ] && [ "$body_sandbox" != "$sandbox" ]; then
+    audit_emit "$sandbox" "decide" "WRONG_SANDBOX [src=$source] ${req_id:-?}: body=$body_sandbox server=$sandbox"
+    printf '{"decision":"deny","reason":"sandbox_name mismatch (body=%s server=%s)"}\n' "$body_sandbox" "$sandbox"
+    return 0
+  fi
 
   if [ -z "$host" ] || [ -z "$port" ] || [ -z "$binary" ]; then
     audit_emit "$sandbox" "decide" "BAD_REQUEST [src=$source] ${req_id:-?}: host='$host' port='$port' binary='$binary'"
@@ -1306,7 +1344,16 @@ cmd_decide_handler_internal() {
       ;;
   esac
 
-  audit_emit "$sandbox" "decide" "PROMPT [src=$source] ${req_id:-?}: $binary -> $host:$port"
+  # Build a context suffix from any new spec fields the proxy supplied so the
+  # audit log shows what the agent was actually trying to do (helps when
+  # reviewing past decisions).
+  local ctx=""
+  [ -n "$method" ]      && ctx="${ctx} ${method}"
+  [ -n "$req_path" ]    && ctx="${ctx} ${req_path}"
+  [ -n "$protocol" ] && [ "$protocol" != "unknown" ] && ctx="${ctx} (proto=$protocol)"
+  [ -n "$policy_name" ] && ctx="${ctx} (policy=$policy_name)"
+  [ -n "$pid" ]         && ctx="${ctx} (pid=$pid)"
+  audit_emit "$sandbox" "decide" "PROMPT [src=$source] ${req_id:-?}: $binary ->${ctx} $host:$port"
   local response
   response=$(prompt_approval "$sandbox" "$host" "$port" "$binary")
 
@@ -1573,6 +1620,52 @@ network_policies:
       - { path: /usr/bin/wget }
       - { path: /usr/bin/ssh }
 YAML
+
+  # Opt-in interactive-enforcement block. Appended only when both
+  # AGENTBOX_INTERACTIVE_POLICY=1 is set AND we can determine the sandbox's
+  # decide-server port. When the openshell `interactive-enforcement` branch
+  # is upstream and shipped in the user's openshell install, this rule lets
+  # ANY denied host be approved on the fly via the alerter/ntfy prompt —
+  # without an L4 reject + retry roundtrip. See:
+  # docs/openshell-interactive-enforcement.md
+  if is_truthy "${AGENTBOX_INTERACTIVE_POLICY:-}"; then
+    local sb port
+    sb=$(workspace_sandbox_name)
+    port=$(decide_server_port_for_sandbox "$sb")
+    cat >> "$target" <<YAML
+
+  # ---- interactive enforcement (opt-in via AGENTBOX_INTERACTIVE_POLICY=1) ----
+  # Wildcard "*" host with mode: interactive holds every NOT-already-allowed
+  # outbound TCP connection open at the proxy while agentbox prompts the
+  # user. Allow → 200 from /decide → tunnel proceeds. Deny / timeout →
+  # \`fallback\` (deny by default) → agent sees 403.
+  #
+  # Requires openshell built from the interactive-enforcement branch:
+  #   https://github.com/vshalpnjabi/OpenShell/tree/interactive-enforcement
+  # Without that build, openshell falls back to plain \`enforce\` semantics
+  # and this block is effectively ignored (the L4 watcher path still works).
+  interactive_gate:
+    name: interactive-gate
+    endpoints:
+      - host: "*"
+        port: 443
+        enforcement:
+          mode: interactive
+          endpoint: http://host.openshell.internal:${port}/decide
+          timeout_seconds: 120
+          fallback: deny
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/codex }
+      - { path: /usr/bin/opencode }
+      - { path: /usr/bin/git }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+      - { path: /usr/bin/gh }
+      - { path: /sandbox/.cargo/bin/cargo }
+      - { path: /sandbox/.cargo/bin/rustup }
+YAML
+  fi
 }
 
 ensure_workspace_policy() {
@@ -1982,6 +2075,7 @@ cmd_decide_status() {
   else
     printf 'decide-server: enabled (default; AGENTBOX_NO_DECIDE_SERVER=1 to opt out)\n'
   fi
+  local bind="${AGENTBOX_DECIDE_BIND:-127.0.0.1}"
   if decide_server_running "$sandbox"; then
     local pid port
     pid=$(cat "$(decide_server_pid_file "$sandbox")" 2>/dev/null)
@@ -1989,13 +2083,18 @@ cmd_decide_status() {
     printf 'status: running\n'
     printf 'pid: %s\n' "$pid"
     printf 'port: %s\n' "$port"
-    printf 'endpoint (from host): http://127.0.0.1:%s/decide\n' "$port"
+    printf 'bind: %s\n' "$bind"
+    printf 'endpoint (from host):    http://127.0.0.1:%s/decide\n' "$port"
+    if [ "$bind" != "127.0.0.1" ]; then
+      printf 'endpoint (from sandbox): http://host.openshell.internal:%s/decide\n' "$port"
+    fi
     printf 'log: %s\n' "$(decide_server_log_file "$sandbox")"
   else
     printf 'status: not running\n'
     local port
     port=$(decide_server_port_for_sandbox "$sandbox")
     printf 'would-use-port: %s (deterministic from sandbox hash)\n' "$port"
+    printf 'would-use-bind: %s (AGENTBOX_DECIDE_BIND to override; 0.0.0.0 for in-container proxy)\n' "$bind"
   fi
 }
 
