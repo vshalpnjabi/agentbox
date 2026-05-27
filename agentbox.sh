@@ -2101,6 +2101,14 @@ cmd_ssh() {
   fi
   ssh_config_sync "$name"
 
+  # Bring up the approval prompt infrastructure so commands run inside this
+  # SSH session (e.g. `gh auth login`, `pip install …`) get an interactive
+  # prompt on L4 deny — same as commands run by an agent. Both ensures are
+  # idempotent: no-op if already alive. Without these, a user SSHing in and
+  # running a network command on a denied host just sees 403 with no prompt.
+  watcher_ensure "$name"
+  decide_server_ensure "$name"
+
   local ssh_host="openshell-$name"
   if [ "$#" -eq 0 ]; then
     log "ssh into $name (workdir=/sandbox/work) — exit to return"
