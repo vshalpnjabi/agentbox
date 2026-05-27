@@ -31,7 +31,7 @@ End-to-end: type `claude` in any folder, get a fully-authenticated, sandboxed ag
 - [tmux](https://github.com/tmux/tmux) — `brew install tmux` (default-on wrap around the agent's TTY, since v0.2.0)
 - [alerter](https://github.com/vjeantet/alerter) — `brew install vjeantet/tap/alerter` (for approval dialogs)
 - [qrencode](https://fukuchi.org/works/qrencode/) — `brew install qrencode` (optional, for ntfy QR setup)
-- python3 (optional, only if `AGENTBOX_DECIDE_SERVER=1` — comes with macOS)
+- python3 (default-on decide-server uses it; comes with macOS. Set `AGENTBOX_NO_DECIDE_SERVER=1` to skip it.)
 - Docker (or Podman / k8s / openshell VM driver) running — sandbox compute backend
 - At least one supported agent on `$PATH`: `claude`, `codex`, or `opencode`
 
@@ -267,9 +267,14 @@ export AGENTBOX_RETRY_SUBMIT_KEY="Enter"     # try "Escape Enter" / "C-Enter" if
 
 ### Decide-server (host-side HTTP endpoint for openshell's Interactive mode, opt-in)
 
-`AGENTBOX_DECIDE_SERVER=1` spins up `bin/agentbox-decide.py` (Python 3 stdlib, 127.0.0.1) per sandbox. Implements the wire protocol from openshell's forthcoming `interactive` enforcement mode — when openshell encounters an out-of-policy request, it POSTs the request details, our server drives the prompt UI, and returns `{"decision":"allow"|"deny"}`. Holds the connection open until you decide — agent sees a clean 200, no retry semantics needed.
+`bin/agentbox-decide.py` (Python 3 stdlib, 127.0.0.1) runs per sandbox **by default**. It implements the wire protocol from openshell's forthcoming `interactive` enforcement mode AND serves as the unified decision pipeline for the L4 watcher path today:
 
-**Note: requires upstream openshell support that doesn't exist yet.** Tracked at [vshalpnjabi/OpenShell `interactive-enforcement`](https://github.com/vshalpnjabi/OpenShell/tree/interactive-enforcement). Until then the watcher path stays the always-on approval mechanism.
+- **L7 (openshell Interactive — future):** when upstream lands `enforcement: interactive`, openshell will POST request details, our server drives the prompt UI, and returns `{"decision":"allow"|"deny"}`. The connection is held open until you decide — agent sees a clean 200, no retry semantics needed.
+- **L4 (watcher path — today):** the watcher detects openshell's CONNECT 403, SIGSTOPs the agent, POSTs the request to the decide-server with `source: watcher`. The decide-server prompts, updates the policy, and returns the decision. Watcher applies SIGCONT and (with `AGENTBOX_FORCE_RETRY=1`) types `retry` into the agent's TUI.
+
+Result: **single decision pipeline** for both paths. Same prompt UI, same audit format, same seen-list. When upstream lands L7 Interactive, only the openshell config changes; the decide-server is already in production exercise.
+
+To opt out and use the legacy v0.2.0 direct-prompt watcher path: `export AGENTBOX_NO_DECIDE_SERVER=1`.
 
 ## Resilience
 
@@ -307,7 +312,7 @@ All boolean knobs accept `1` / `true` / `yes` / `on` (case-insensitive):
 | `AGENTBOX_RETRY_SUBMIT_DELAY` | Pause after typing before sending submit key. Default `0.15`. |
 | `AGENTBOX_RETRY_SUBMIT_KEY` | Submit key sequence. Default `Enter`. Try `"Escape Enter"` / `"C-Enter"` / `"none"` if Enter doesn't submit. |
 | `AGENTBOX_SUDO` | Configure NOPASSWD sudo inside the sandbox on next launch (since v0.2.0). |
-| `AGENTBOX_DECIDE_SERVER` | Start the host-side HTTP `/decide` endpoint for openshell's Interactive mode (since v0.2.0; opt-in, awaiting upstream). |
+| `AGENTBOX_NO_DECIDE_SERVER` | **Opt OUT** of the default-on decide-server. With this set, the watcher uses its legacy direct-prompt path (v0.2.0 behavior). Without this, the watcher routes its L4-deny decisions through the local decide-server so the same code handles both L4 (today) and L7 (future openshell Interactive). |
 | `AGENTBOX_SUPPRESS_REPEATS` | Re-enable the older "decide once, never re-prompt" suppression (v0.2.0 default is always re-prompt). |
 
 ## How it works (architecture sketch)

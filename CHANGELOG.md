@@ -4,9 +4,11 @@ All notable changes to agentbox.
 
 ## Unreleased (post-v0.2.0 on `main`)
 
-Five commits land on top of the v0.2.0 tag; cut a v0.2.1 to release.
+Six+ commits land on top of the v0.2.0 tag; cut a v0.2.1 to release.
 
 ### New features
+
+- **Decide-server is now default-on; watcher routes L4 decisions through it (L7-style decision pipeline)**. The watcher catches openshell's CONNECT denial (L4), SIGSTOPs the agent, POSTs the request to the local decide-server (`source: watcher`), receives a JSON decision, then unfreezes + optionally retry-injects. The decide-server is the single source of truth for prompts, policy updates, and seen-list writes — same code path whether the request originated from L7 openshell (future, when upstream lands `enforcement: interactive`) or L4 watcher (today). Watcher's previous direct-prompt path remains available via `AGENTBOX_NO_DECIDE_SERVER=1` for users who want the v0.2.0 behavior. Audit log tags every decision with `[src=watcher|openshell]` so you can tell where it originated. Response JSON now carries `kind` (`exact` vs `wildcard`) and `effective_host` (the host actually added to policy) so the watcher's audit log can be specific.
 
 - **`Approve *.parent.host` — a third option in every approval prompt** (`6e9607b`). Wildcard derived automatically from the host (strip leftmost label): `static.rust-lang.org` → `*.rust-lang.org`; `download.crates.io` → `*.crates.io`. Wired into all backends — alerter (3rd `--actions` button), osascript modal (3rd button), zenity (`--list`), ntfy (3rd inline http action), `/dev/tty` (a/w/d keys). When clicked, calls `openshell policy update --add-endpoint *.parent:port` so one click covers the whole zone (rustup, cargo, etc.). Audit log distinguishes `ALLOW` vs `ALLOW_WILDCARD`.
 

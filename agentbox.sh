@@ -202,6 +202,70 @@ watcher_log_file()  { echo "$(watcher_state_dir "$1")/watcher.log"; }
 watcher_seen_file() { echo "$(watcher_state_dir "$1")/watcher-seen.txt"; }
 audit_log_file()    { echo "$(watcher_state_dir "$1")/audit.log"; }
 
+# Watcher → decide-server bridge: POST a watcher-origin decision request
+# to the local decide-server (running on 127.0.0.1, deterministic port).
+# Echoes the response JSON on stdout, or empty on failure. Exits non-zero
+# on failure. Used in default mode (decide-server running, AGENTBOX_NO_DECIDE_SERVER unset).
+watcher_call_decide_server() {
+  local sandbox="$1" host="$2" port="$3" binary="$4" pid="$5"
+  local port_file
+  port_file="$AGB_STATE_ROOT/$sandbox/decide-server.port"
+  [ -f "$port_file" ] || return 1
+  local srv_port
+  srv_port=$(cat "$port_file" 2>/dev/null) || return 1
+  [ -z "$srv_port" ] && return 1
+
+  command -v jq >/dev/null 2>&1 || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  local body
+  body=$(jq -nc \
+    --arg sb "$sandbox" \
+    --arg host "$host" \
+    --argjson port "$port" \
+    --arg bin "$binary" \
+    --argjson pid "$pid" \
+    --arg src "watcher" \
+    --arg rid "watcher-$(date +%s%N 2>/dev/null || date +%s)" \
+    '{schema_version:1, request_id:$rid, sandbox_name:$sb, host:$host, port:$port, binary:$bin, pid:$pid, source:$src}') || return 1
+
+  # Timeout slightly longer than prompt_approval's internal 300s. If the
+  # call fails (server died, network blocked), curl exits non-zero, we
+  # return non-zero. Watcher's caller treats failure as a terminal Deny
+  # (agent unfrozen, gets the original 403 from openshell — same as if
+  # the user had clicked Deny manually).
+  curl -fsS --max-time 360 -X POST \
+    -H "Content-Type: application/json" \
+    --data "$body" \
+    "http://127.0.0.1:$srv_port/decide" 2>/dev/null
+}
+
+# Look up the LAST decision for a (binary, host, port) tuple across both
+# seen-list files. Decide-seen.txt is canonical (where new writes go in
+# decide-server mode); watcher-seen.txt is legacy (writes go there in
+# AGENTBOX_NO_DECIDE_SERVER=1 mode). Reading both preserves entries
+# across mode switches and across the v0.2.0 → v0.2.1+ format upgrade.
+# Echoes "" if not seen, else "allow" / "allow_wildcard" / "deny" / "legacy".
+get_seen_decision_for_key() {
+  local sandbox="$1" key="$2"
+  local d=""
+  local f
+  for f in "$AGB_STATE_ROOT/$sandbox/decide-seen.txt" \
+           "$AGB_STATE_ROOT/$sandbox/watcher-seen.txt"; do
+    [ -s "$f" ] || continue
+    local hit
+    hit=$(awk -F '|' -v k="$key" '
+      $1"|"$2"|"$3 == k { d = (NF >= 4 ? $4 : "legacy") }
+      END { print d }
+    ' "$f" 2>/dev/null) || hit=""
+    if [ -n "$hit" ]; then
+      d="$hit"
+      break  # decide-seen.txt wins over watcher-seen.txt
+    fi
+  done
+  echo "$d"
+}
+
 # Append a structured audit entry. Format: ISO-8601 timestamp + tag + message.
 audit_emit() {
   local sandbox="$1" tag="$2" msg="$3"
@@ -818,7 +882,9 @@ cmd_watch_internal() {
         local port="${BASH_REMATCH[4]}"
         local key="${binary}|${host}|${port}"
 
-        # Seen-list gates re-prompting by the LAST decision for this tuple:
+        # Seen-list gates re-prompting by the LAST decision for this tuple
+        # across BOTH seen-list files (decide-seen.txt + watcher-seen.txt).
+        # See get_seen_decision_for_key for rules.
         #   allow / allow_wildcard → suppress (you've already said yes)
         #   deny                   → re-prompt (lets you change your mind,
         #                             catches openshell hot-reload misses)
@@ -826,13 +892,8 @@ cmd_watch_internal() {
         #                             be stored with the format suffix
         #   not in list            → prompt fresh
         # AGENTBOX_SUPPRESS_REPEATS=1 suppresses everything (v0.1.0 behavior).
-        local seen_decision=""
-        if [ -s "$seen_file" ]; then
-          seen_decision=$(awk -F '|' -v k="$key" '
-            $1"|"$2"|"$3 == k { d = (NF >= 4 ? $4 : "legacy") }
-            END { print d }
-          ' "$seen_file" 2>/dev/null || echo "")
-        fi
+        local seen_decision
+        seen_decision=$(get_seen_decision_for_key "$sandbox" "$key")
         case "$seen_decision" in
           allow|allow_wildcard)
             echo "[watcher] suppressed (previously $seen_decision): $key" >&2
@@ -847,68 +908,96 @@ cmd_watch_internal() {
             ;;
         esac
 
-        echo "[watcher] denied: $binary($pid) -> $host:$port — freezing + prompting" >&2
-
-        # Freeze the offender PID and all top-level agent processes inside the
-        # sandbox so the TUI visibly pauses until the user decides.
+        echo "[watcher] denied: $binary($pid) -> $host:$port — freezing" >&2
         freeze_sandbox_agents "$sandbox" "$pid"
 
-        local response
-        response=$(prompt_approval "$sandbox" "$host" "$port" "$binary")
-        echo "[watcher] user response: [$response]" >&2
+        # Two modes from here:
+        # (a) Default — decide-server is running. Route the decision
+        #     through it (single source of truth for prompts + policy
+        #     updates + seen-list writes). Watcher just handles SIGSTOP/
+        #     SIGCONT and the optional retry-inject. If the decide-server
+        #     call itself fails, the watcher treats it as a terminal
+        #     Deny — agent is unfrozen and gets the original 403.
+        # (b) AGENTBOX_NO_DECIDE_SERVER=1 — legacy v0.2.0+ direct-prompt
+        #     path. Watcher calls prompt_approval, applies policy update,
+        #     writes watcher-seen.txt.
+        local decision="deny"
+        local effective_host="$host"
+        local kind=""
 
-        # Three possible decisions from prompt_approval:
-        #   AllowWildcard:*.parent.host  → add *.parent as endpoint
-        #   Allow                        → add specific host as endpoint
-        #   Deny / "" (timeout)          → no policy change
-        local rule_host="$host"
-        local decision_tag="DENY"
-        local should_add=0
-        local approval_kind=""
-        local seen_decision_value="deny"
-        if [[ "$response" == AllowWildcard:* ]]; then
-          rule_host="${response#AllowWildcard:}"
-          decision_tag="ALLOW_WILDCARD"
-          approval_kind="wildcard"
-          should_add=1
-          seen_decision_value="allow_wildcard"
-        elif [[ "$response" == *"Allow"* ]]; then
-          decision_tag="ALLOW"
-          approval_kind="exact"
-          should_add=1
-          seen_decision_value="allow"
-        fi
+        if ! is_truthy "${AGENTBOX_NO_DECIDE_SERVER:-}" && decide_server_running "$sandbox"; then
+          # ----- (a) L7 path -----
+          echo "[watcher] routing decision through decide-server (source=watcher)" >&2
+          local resp_json
+          resp_json=$(watcher_call_decide_server "$sandbox" "$host" "$port" "$binary" "$pid" 2>/dev/null) || resp_json=""
+          if [ -n "$resp_json" ]; then
+            decision=$(printf '%s' "$resp_json" | jq -r '.decision // "deny"' 2>/dev/null) || decision="deny"
+            kind=$(printf '%s' "$resp_json" | jq -r '.kind // ""' 2>/dev/null) || kind=""
+            local eh
+            eh=$(printf '%s' "$resp_json" | jq -r '.effective_host // ""' 2>/dev/null) || eh=""
+            [ -n "$eh" ] && effective_host="$eh"
+            audit_emit "$sandbox" "decision" "[via decide-server] ${decision} $binary -> ${effective_host}:$port (kind=${kind:-n/a})"
+            echo "[watcher] decide-server: $decision (effective_host=$effective_host, kind=$kind)" >&2
+          else
+            decision="deny"
+            audit_emit "$sandbox" "decision" "DECIDE_SERVER_FAIL $binary -> $host:$port (treating as Deny)"
+            echo "[watcher] decide-server call failed; treating as Deny" >&2
+          fi
+          # NOTE: decide-server already updated openshell policy + wrote
+          # decide-seen.txt. Watcher must NOT do those again.
 
-        if [ "$should_add" -eq 1 ]; then
-          if openshell policy update "$sandbox" \
-              --add-endpoint "${rule_host}:${port}" \
-              --binary "$binary" \
-              --wait >/dev/null 2>&1; then
-            audit_emit "$sandbox" "decision" "$decision_tag $binary -> $rule_host:$port (policy hot-reloaded by user)"
-            echo "[watcher] approved ($approval_kind): $rule_host:$port for $binary (policy hot-reloaded)" >&2
-            printf '%s|%s\n' "$key" "$seen_decision_value" >> "$seen_file"
-            # Unfreeze BEFORE injecting the retry. Chars typed while frozen
-            # accumulate in the pty buffer and arrive in one burst on SIGCONT
-            # — exactly the paste-detect trigger char-by-char typing exists
-            # to avoid.
-            unfreeze_sandbox_agents "$sandbox" "$pid"
-            echo "[watcher] unfroze agents in $sandbox" >&2
-            if is_truthy "${AGENTBOX_FORCE_RETRY:-}"; then
-              inject_retry_to_agent "$sandbox" "$host" "$port" "$binary"
+        else
+          # ----- (b) Legacy direct prompt path -----
+          [ "${AGENTBOX_NO_DECIDE_SERVER:-}" ] && echo "[watcher] using direct prompt path (AGENTBOX_NO_DECIDE_SERVER=1)" >&2 \
+                                              || echo "[watcher] decide-server not running; using direct prompt path" >&2
+          local response
+          response=$(prompt_approval "$sandbox" "$host" "$port" "$binary")
+          echo "[watcher] user response: [$response]" >&2
+          local seen_decision_value="deny"
+          if [[ "$response" == AllowWildcard:* ]]; then
+            effective_host="${response#AllowWildcard:}"
+            kind="wildcard"
+            decision="allow"
+            seen_decision_value="allow_wildcard"
+          elif [[ "$response" == *"Allow"* ]]; then
+            kind="exact"
+            decision="allow"
+            seen_decision_value="allow"
+          fi
+          if [ "$decision" = "allow" ]; then
+            if openshell policy update "$sandbox" \
+                --add-endpoint "${effective_host}:${port}" \
+                --binary "$binary" \
+                --wait >/dev/null 2>&1; then
+              audit_emit "$sandbox" "decision" "ALLOW $binary -> ${effective_host}:$port (kind=$kind; policy hot-reloaded by user)"
+              echo "[watcher] approved ($kind): $effective_host:$port" >&2
+              printf '%s|%s\n' "$key" "$seen_decision_value" >> "$seen_file"
             else
-              osascript -e "display notification \"$rule_host:$port allowed.\" with title \"agentbox\"" 2>/dev/null || true
+              echo "[watcher] openshell policy update returned non-zero — treating as Deny" >&2
+              audit_emit "$sandbox" "decision" "ALLOW_FAIL $binary -> ${effective_host}:$port (kind=$kind; policy update failed)"
+              decision="deny"
             fi
           else
-            echo "[watcher] approval failed: openshell policy update returned non-zero" >&2
-            unfreeze_sandbox_agents "$sandbox" "$pid"
-            echo "[watcher] unfroze agents in $sandbox" >&2
+            audit_emit "$sandbox" "decision" "DENY $binary -> $host:$port (user declined)"
+            echo "[watcher] denied by user: $host:$port" >&2
+            printf '%s|deny\n' "$key" >> "$seen_file"
           fi
-        else
-          audit_emit "$sandbox" "decision" "DENY $binary -> $host:$port (user declined)"
-          echo "[watcher] denied by user: $host:$port for $binary (will re-prompt next time)" >&2
-          printf '%s|deny\n' "$key" >> "$seen_file"
-          unfreeze_sandbox_agents "$sandbox" "$pid"
-          echo "[watcher] unfroze agents in $sandbox" >&2
+        fi
+
+        # Always unfreeze BEFORE retry-inject. Chars typed into a SIGSTOPped
+        # agent's pty buffer up and arrive in a burst on SIGCONT — the exact
+        # paste-detect trigger char-by-char typing exists to avoid.
+        unfreeze_sandbox_agents "$sandbox" "$pid"
+        echo "[watcher] unfroze agents in $sandbox" >&2
+
+        # Retry-inject only on allow + AGENTBOX_FORCE_RETRY. If neither,
+        # show a passive notification (legacy v0.2.0 behavior).
+        if [ "$decision" = "allow" ]; then
+          if is_truthy "${AGENTBOX_FORCE_RETRY:-}"; then
+            inject_retry_to_agent "$sandbox" "$host" "$port" "$binary"
+          else
+            osascript -e "display notification \"${effective_host}:${port} allowed.\" with title \"agentbox\"" 2>/dev/null || true
+          fi
         fi
       fi
     done
@@ -968,7 +1057,13 @@ decide_server_running() {
 
 decide_server_ensure() {
   local sandbox="$1"
-  is_truthy "${AGENTBOX_DECIDE_SERVER:-}" || return 0
+  # Default-on. Opt out with AGENTBOX_NO_DECIDE_SERVER=1 for users who want
+  # the v0.2.0 pure-watcher behavior (no localhost HTTP hop in the prompt
+  # path). Legacy AGENTBOX_DECIDE_SERVER=1 is still honored as a no-op
+  # signal of intent — useful for grepping configs to see who relied on it.
+  if is_truthy "${AGENTBOX_NO_DECIDE_SERVER:-}"; then
+    return 0
+  fi
 
   local py
   py=$(decide_server_python_script)
@@ -977,7 +1072,7 @@ decide_server_ensure() {
     return 0
   fi
   if ! command -v python3 >/dev/null 2>&1; then
-    warn "python3 not on PATH; decide-server skipped (install python3 or unset AGENTBOX_DECIDE_SERVER)"
+    warn "python3 not on PATH; decide-server skipped (install python3 or set AGENTBOX_NO_DECIDE_SERVER=1)"
     return 0
   fi
 
@@ -1052,14 +1147,20 @@ cmd_decide_handler_internal() {
 
   local body
   body=$(cat)
-  local host port binary req_id
+  local host port binary req_id source
   host=$(printf '%s' "$body"   | jq -r '.host // empty' 2>/dev/null || echo "")
   port=$(printf '%s' "$body"   | jq -r '.port // empty' 2>/dev/null || echo "")
   binary=$(printf '%s' "$body" | jq -r '.binary // empty' 2>/dev/null || echo "")
   req_id=$(printf '%s' "$body" | jq -r '.request_id // empty' 2>/dev/null || echo "")
+  # `source` distinguishes who called us:
+  #   openshell  (default) — L7 Interactive enforcement (when upstream lands)
+  #   watcher              — L4 deny caught by agentbox's log-tail watcher
+  # Used for audit log clarity. Behavior is the same either way.
+  source=$(printf '%s' "$body" | jq -r '.source // empty' 2>/dev/null || echo "")
+  [ -z "$source" ] && source="openshell"
 
   if [ -z "$host" ] || [ -z "$port" ] || [ -z "$binary" ]; then
-    audit_emit "$sandbox" "decide" "BAD_REQUEST ${req_id:-?}: host='$host' port='$port' binary='$binary'"
+    audit_emit "$sandbox" "decide" "BAD_REQUEST [src=$source] ${req_id:-?}: host='$host' port='$port' binary='$binary'"
     printf '{"decision":"deny","reason":"missing host/port/binary"}\n'
     return 0
   fi
@@ -1075,13 +1176,13 @@ cmd_decide_handler_internal() {
   fi
   case "$cached" in
     allow|allow_wildcard)
-      audit_emit "$sandbox" "decide" "CACHED_ALLOW ${req_id:-?}: $binary -> $host:$port"
-      printf '{"decision":"allow","reason":"cached"}\n'
+      audit_emit "$sandbox" "decide" "CACHED_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port"
+      printf '{"decision":"allow","reason":"cached","kind":"%s"}\n' "$cached"
       return 0
       ;;
     deny)
       if is_truthy "${AGENTBOX_SUPPRESS_REPEATS:-}"; then
-        audit_emit "$sandbox" "decide" "CACHED_DENY ${req_id:-?}: $binary -> $host:$port"
+        audit_emit "$sandbox" "decide" "CACHED_DENY [src=$source] ${req_id:-?}: $binary -> $host:$port"
         printf '{"decision":"deny","reason":"cached"}\n'
         return 0
       fi
@@ -1089,15 +1190,27 @@ cmd_decide_handler_internal() {
       ;;
   esac
 
-  audit_emit "$sandbox" "decide" "PROMPT ${req_id:-?}: $binary -> $host:$port"
+  audit_emit "$sandbox" "decide" "PROMPT [src=$source] ${req_id:-?}: $binary -> $host:$port"
   local response
   response=$(prompt_approval "$sandbox" "$host" "$port" "$binary")
+
+  # Helper to emit a JSON response with optional kind/effective_host fields.
+  # Uses jq for safe escaping (especially of wildcard hosts in the future).
+  _decide_reply() {
+    # _decide_reply <decision> <reason> [kind] [effective_host]
+    jq -nc \
+      --arg d "$1" --arg r "$2" \
+      --arg kind "${3:-}" --arg eh "${4:-}" \
+      '{decision:$d, reason:$r}
+       + (if $kind != "" then {kind:$kind} else {} end)
+       + (if $eh   != "" then {effective_host:$eh} else {} end)'
+  }
 
   case "$response" in
     Allow)
       printf '%s|allow\n' "$key" >> "$seen_file"
-      audit_emit "$sandbox" "decide" "USER_ALLOW ${req_id:-?}: $binary -> $host:$port"
-      printf '{"decision":"allow","reason":"user approved"}\n'
+      audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port"
+      _decide_reply "allow" "user approved" "exact" "$host"
       ;;
     AllowWildcard:*)
       # User picked "Approve *.parent.host". Hot-reload the openshell policy
@@ -1109,23 +1222,23 @@ cmd_decide_handler_internal() {
           --binary "$binary" \
           --wait >/dev/null 2>&1; then
         printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
-        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD ${req_id:-?}: $binary -> $wild:$port (policy hot-reloaded)"
-        printf '{"decision":"allow","reason":"user approved wildcard %s"}\n' "$wild"
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> $wild:$port (policy hot-reloaded)"
+        _decide_reply "allow" "user approved wildcard $wild" "wildcard" "$wild"
       else
-        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD_FAIL ${req_id:-?}: $binary -> $wild:$port (policy update returned non-zero; allowing this request only)"
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD_FAIL [src=$source] ${req_id:-?}: $binary -> $wild:$port (policy update returned non-zero)"
         printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
-        printf '{"decision":"allow","reason":"user approved wildcard (but policy update failed)"}\n'
+        _decide_reply "allow" "user approved wildcard $wild (policy update failed)" "wildcard" "$wild"
       fi
       ;;
     Deny)
       printf '%s|deny\n' "$key" >> "$seen_file"
-      audit_emit "$sandbox" "decide" "USER_DENY ${req_id:-?}: $binary -> $host:$port"
-      printf '{"decision":"deny","reason":"user denied"}\n'
+      audit_emit "$sandbox" "decide" "USER_DENY [src=$source] ${req_id:-?}: $binary -> $host:$port"
+      _decide_reply "deny" "user denied"
       ;;
     *)
       # Timeout / no UI: deny but don't cache, so the next attempt re-prompts.
-      audit_emit "$sandbox" "decide" "TIMEOUT ${req_id:-?}: $binary -> $host:$port (fail-closed)"
-      printf '{"decision":"deny","reason":"prompt timed out"}\n'
+      audit_emit "$sandbox" "decide" "TIMEOUT [src=$source] ${req_id:-?}: $binary -> $host:$port (fail-closed)"
+      _decide_reply "deny" "prompt timed out"
       ;;
   esac
   return 0
@@ -1635,10 +1748,10 @@ cmd_decide() {
 cmd_decide_status() {
   local sandbox="${1:-$(workspace_sandbox_name)}"
   printf 'sandbox: %s\n' "$sandbox"
-  if is_truthy "${AGENTBOX_DECIDE_SERVER:-}"; then
-    printf 'AGENTBOX_DECIDE_SERVER: enabled\n'
+  if is_truthy "${AGENTBOX_NO_DECIDE_SERVER:-}"; then
+    printf 'AGENTBOX_NO_DECIDE_SERVER: set → decide-server disabled (using legacy direct prompt path)\n'
   else
-    printf 'AGENTBOX_DECIDE_SERVER: disabled (export AGENTBOX_DECIDE_SERVER=1 to enable)\n'
+    printf 'decide-server: enabled (default; AGENTBOX_NO_DECIDE_SERVER=1 to opt out)\n'
   fi
   if decide_server_running "$sandbox"; then
     local pid port
@@ -1658,13 +1771,14 @@ cmd_decide_status() {
 }
 
 cmd_decide_start() {
-  # Manual start (the agent dispatch starts this automatically when
-  # AGENTBOX_DECIDE_SERVER=1, but this lets you exercise the path without
-  # launching an agent).
+  # Manual start (the agent dispatch starts this automatically; this lets
+  # you exercise the path without launching an agent). Respects
+  # AGENTBOX_NO_DECIDE_SERVER opt-out for consistency — pass --force to
+  # override that for one-off testing.
   local sandbox="${1:-$(workspace_sandbox_name)}"
-  if ! is_truthy "${AGENTBOX_DECIDE_SERVER:-}"; then
-    warn "AGENTBOX_DECIDE_SERVER is not set — starting anyway (this one-off invocation)"
-    AGENTBOX_DECIDE_SERVER=1 decide_server_ensure "$sandbox"
+  if is_truthy "${AGENTBOX_NO_DECIDE_SERVER:-}" && [ "${2:-}" != "--force" ]; then
+    warn "AGENTBOX_NO_DECIDE_SERVER=1 — pass --force to override and start anyway"
+    AGENTBOX_NO_DECIDE_SERVER=0 decide_server_ensure "$sandbox"
   else
     decide_server_ensure "$sandbox"
   fi
@@ -1717,7 +1831,7 @@ cmd_decide_test() {
   sandbox=$(workspace_sandbox_name)
 
   if ! decide_server_running "$sandbox"; then
-    err "decide-server not running for $sandbox — start with 'agentbox decide start' or AGENTBOX_DECIDE_SERVER=1 <agent>"
+    err "decide-server not running for $sandbox — run 'agentbox decide start' or launch an agent (default-on; AGENTBOX_NO_DECIDE_SERVER=1 to disable)"
   fi
   if ! command -v jq >/dev/null 2>&1; then
     err "jq required for 'agentbox decide test' (brew install jq)"
@@ -2322,13 +2436,15 @@ cmd_doctor() {
     fi
   done
 
-  # python3 — only required if AGENTBOX_DECIDE_SERVER is enabled. Warn otherwise.
+  # python3 — needed by the default-on decide-server. Without it the
+  # watcher falls back to its direct prompt path (no regression, just
+  # less unified state).
   if command -v python3 >/dev/null 2>&1; then
     _row ok "python3" "$(python3 --version 2>&1)"
-  elif is_truthy "${AGENTBOX_DECIDE_SERVER:-}"; then
-    _row bad "python3" "required by AGENTBOX_DECIDE_SERVER=1; install python3"
+  elif is_truthy "${AGENTBOX_NO_DECIDE_SERVER:-}"; then
+    _row info "python3" "not needed (AGENTBOX_NO_DECIDE_SERVER=1)"
   else
-    _row info "python3" "optional (only needed for AGENTBOX_DECIDE_SERVER)"
+    _row warn "python3" "missing — decide-server skipped; watcher uses fallback direct prompts"
   fi
 
   # In-sandbox sudo (only meaningful if AGENTBOX_SUDO is set for current workspace).
@@ -2868,7 +2984,7 @@ attempt will ask again so you can change your mind):
                                          (Restart watcher: agentbox stop && claude)
 
 Decide-server (host-side HTTP endpoint for openshell Interactive enforcement;
-forthcoming upstream, OPT-IN via AGENTBOX_DECIDE_SERVER=1):
+default-on; AGENTBOX_NO_DECIDE_SERVER=1 to disable):
   agentbox decide status                 Show running pid/port + endpoint URL
   agentbox decide start [NAME]           Manually start the server (auto-started
                                          on agent launch when env var is set)
