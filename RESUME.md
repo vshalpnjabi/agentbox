@@ -27,44 +27,84 @@ State of the project on pause. Pick this up next session.
 
 Full release notes: `CHANGELOG.md`.
 
-## Known issues observed but not yet root-caused
+## Known issues / resolved investigations
 
-- **`openshell policy update --add-endpoint --wait` reports success but doesn't always apply.** Real-world repro from this session: clicking Allow logs "policy hot-reloaded by user" but subsequent requests to the same `(binary, host, port)` continue to be denied. The new default-on re-prompt behavior masks this for users (they get re-prompted, can Allow again or edit the policy file), but the underlying openshell bug is real. Worth filing against the openshell-interactive-enforcement fork while we're in that codebase anyway.
-- **openshell sandbox exec has no `--user` flag.** Confirmed via `--help`. Agentbox now uses `docker exec -u 0 <container-id>` directly for root operations (`agentbox sudo`). Works on Docker Desktop without host sudo. If openshell ever ships a `--user` flag, we could switch back for cleaner abstraction — minor.
+- **~~`openshell policy update --add-endpoint --wait` silent no-op~~** **RESOLVED.** Reproduced cleanly with a single watcher (post-`cc5a4e8` orphan fix): policy version increments, rule visible in `policy get --full`, subsequent request succeeds with `policy:allow_<host>_<port>` matched. The original "I clicked Allow but it didn't work" was 100% caused by concurrent watchers racing on the policy update (each reading v_N, writing v_N+1, last write wins). Single-watcher invariant fixes it. No upstream openshell bug.
+
+- **openshell sandbox exec has no `--user` flag.** Confirmed via `--help`. Agentbox uses `docker exec -u 0 <container-id>` directly for root operations (`agentbox sudo`). Works on Docker Desktop without host sudo. If openshell ever ships a `--user` flag, we could switch back for cleaner abstraction — minor.
+
+- **L4 CONNECT denial preempts the decide-server.** Today, openshell denies CONNECT at L4 immediately when a host isn't in any policy. Our decide-server is wired to consume L7 Interactive enforcement (which doesn't exist upstream yet). Net: the decide-server's L7 *trigger* is dead until openshell upstream ships `enforcement: interactive`. We've worked around this by routing L4 watcher events through the decide-server (commit `71a1bca`) so the decision pipeline gets real exercise. The "agent sees a 403 and must retry" cost is mitigated by `AGENTBOX_FORCE_RETRY=1` (auto-types `retry` after Allow). See "Custom proxy interceptor" below for the contingency plan if upstream doesn't land.
 
 ## Parked next steps (in priority order)
 
-### 1. Implement openshell hold-and-ask enforcement (in the fork)
+### 1. Implement openshell hold-and-ask enforcement (in the fork) — PRIMARY PATH
 
 Lives in `~/Library/CloudStorage/Dropbox/github.com/openshell-interactive-enforcement/` on branch `interactive-enforcement` (worktree of fork `vshalpnjabi/OpenShell`). Already pushed to origin:
 
 - `docs/interactive-enforcement/DESIGN.md` — architecture for hold-and-ask
 - `docs/interactive-enforcement/CLAUDE.md` — phased implementation checklist
 
-Once that lands upstream, agentbox's decide-server can come off the `AGENTBOX_DECIDE_SERVER=1` gate and become the default approval path — and the watcher-path's "agent saw the 403, must retry" problem goes away entirely (Interactive mode holds the connection open until /decide returns).
+Once that lands upstream, the L7 trigger comes alive: openshell will POST request details to the decide-server, the connection holds until the user decides, agent never sees a 403 (no retry needed).
 
 **Outstanding agentbox-side follow-ups** (deferred until openshell upstream lands):
 - HMAC auth for the wire protocol (open question 2 in DESIGN.md).
 - Bind decide-server to docker-bridge IP (or Unix socket) instead of 127.0.0.1-only, so the sandbox can actually reach it (open question 1).
 - Update the auto-generated `.agentbox.policy.yaml` template to emit `enforcement: interactive` blocks referencing `http://host.openshell.internal:<port>/decide`.
 
-### 2. Investigate `openshell policy update --add-endpoint` non-application bug
+### 2. CONTINGENCY: Custom CONNECT-proxy interceptor inside agentbox
 
-When the watcher's user-Allow runs `openshell policy update --add-endpoint`, it returns 0 (and the audit log records "policy hot-reloaded by user"), but subsequent requests for the same `(binary, host, port)` continue to deny. Reproduced reliably in the openshell-interactive-enforcement workspace with curl + rust-lang.org endpoints. Repro recipe:
+**Only build this if option 1 stalls** (upstream Interactive enforcement isn't moving toward merge, or the fork's PR sits indefinitely). This implements interactive L4 enforcement WITHOUT upstream support, at the cost of maintaining a chunk of net code in agentbox.
 
+**Architecture sketch:**
 ```
-# In any workspace with deny-all-network policy:
-agentbox approve reset  # clear seen-list
-# inside the agent: try a denied URL, click Allow on the prompt
-# audit log shows ALLOW + policy-hot-reloaded
-# try the same URL again — still denied
+sandbox env: HTTP_PROXY=http://host.openshell.internal:NEW_PORT
+                                                       │
+                                                       ▼
+                            ┌──────────────────────────────────────┐
+                            │ agentbox-proxy (NEW, ~300 LOC)       │
+                            │  - listens on host's docker-bridge   │
+                            │  - intercepts every CONNECT          │
+                            │  - POSTs to local decide-server      │
+                            │  - on allow: TCP-forwards to         │
+                            │    openshell's proxy at :3128        │
+                            │  - on deny: returns HTTP 403         │
+                            └──────────────────────────────────────┘
+                                                       │
+                                                       ▼
+                            ┌──────────────────────────────────────┐
+                            │ openshell proxy at 10.200.0.1:3128   │
+                            │  (unchanged; policy in full-allow    │
+                            │   mode for hosts agentbox-proxy lets │
+                            │   through)                           │
+                            └──────────────────────────────────────┘
 ```
 
-Hypothesis: the rule format emitted by `--add-endpoint` doesn't match the request's normalized form (e.g., DNS-resolved IP vs hostname, or a different binary path than what triggered the deny).
+**What it gives us:**
+- Real interactive L4 enforcement TODAY, no upstream dependency.
+- Agent NEVER sees a 403 for unknown hosts (no retry needed; the connection is held open exactly like upstream Interactive would).
+- Decide-server stays the canonical decision pipeline (same as L4 watcher today; same as L7 future).
+
+**Costs:**
+- ~300 lines of Python/Go for an HTTP CONNECT proxy (TCP forwarding, TLS handshake passthrough, HTTP/1.1 + maybe HTTP/2 hooks).
+- Maintenance burden: this is a security-critical net component. Test surface large.
+- Throw-away the day openshell upstream ships Interactive — though decide-server stays. Just the proxy goes.
+- Risk of regressions in the working L4-watcher path — would want to keep both running side-by-side during transition.
+
+**Decision criteria for actually building it:**
+- Upstream openshell shows no movement on Interactive for 3+ months from the date the PR is filed against NVIDIA/OpenShell.
+- OR: user demand for "no-retry semantics" outweighs the maintenance cost.
+- OR: a security-critical workflow appears where the agent SEEING a 403 (even briefly) is unacceptable (e.g., agent uses it as a signal that something is allowed/blocked and changes behavior accordingly).
+
+**Implementation hints when the time comes:**
+- Use Python 3 stdlib `socketserver` + `ssl` (same family as our existing `bin/agentbox-decide.py`).
+- Run as a sibling process to the decide-server, gated by `AGENTBOX_PROXY_INTERCEPT=1` while in beta.
+- Port can be deterministic per-sandbox (like decide-server's port), in the IANA dynamic range.
+- Sandbox-side: inject `HTTP_PROXY` env override at agent launch (before openshell's proxy env applies).
+- Be sure to handle CONNECT tunneling (90% of agent traffic is HTTPS).
 
 ### 3. Optional: delete the `decide-endpoint-server` branch from origin
 
-Already fully merged. `git push origin --delete decide-endpoint-server` cleans it up. Not urgent.
+Already fully merged and the branch was already deleted from origin on 2026-05-27. Local worktree at `.claude/worktrees/decide-endpoint-server/` still exists; safe to remove via `git worktree remove .claude/worktrees/decide-endpoint-server`.
 
 ## Other notes worth remembering on resume
 
