@@ -879,7 +879,7 @@ cmd_watch_internal() {
             if is_truthy "${AGENTBOX_FORCE_RETRY:-}"; then
               inject_retry_to_agent "$sandbox" "$host" "$port" "$binary"
             else
-              osascript -e "display notification \"$rule_host:$port allowed. Tell agent to retry.\" with title \"agentbox\"" 2>/dev/null || true
+              osascript -e "display notification \"$rule_host:$port allowed.\" with title \"agentbox\"" 2>/dev/null || true
             fi
           else
             echo "[watcher] approval failed: openshell policy update returned non-zero" >&2
