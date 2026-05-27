@@ -1760,6 +1760,102 @@ cmd_resize() {
   fi
 }
 
+cmd_sudo() {
+  # Manage in-sandbox NOPASSWD sudo for the current workspace.
+  #   agentbox sudo          show status
+  #   agentbox sudo enable   write sudo=true to .agentbox.toml AND apply
+  #                          to the running sandbox immediately (idempotent)
+  #   agentbox sudo disable  remove /etc/sudoers.d/agentbox + drop from
+  #                          .agentbox.toml
+  local sub="${1:-status}"
+  [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    enable)  cmd_sudo_enable  "$@" ;;
+    disable) cmd_sudo_disable "$@" ;;
+    status|show|"") cmd_sudo_status "$@" ;;
+    help|-h|--help) cmd_sudo_status "$@" ;;
+    *) err "unknown 'sudo' subcommand '$sub' (try: agentbox sudo {enable|disable|status})" ;;
+  esac
+}
+
+cmd_sudo_enable() {
+  local name
+  name=$(workspace_sandbox_name)
+  agb_toml_set "sudo" "true"
+  log "wrote sudo = true to $PWD/.agentbox.toml"
+  local phase
+  phase=$(sandbox_phase "$name" 2>/dev/null || echo "")
+  if [ "$phase" = "Ready" ]; then
+    log "applying to running sandbox $name now"
+    setup_sandbox_sudo "$name" || warn "setup failed — see message above; restart sandbox with 'agentbox destroy && claude'"
+  else
+    log "no running sandbox; will apply on next agent launch."
+  fi
+  cmd_sudo_status
+}
+
+cmd_sudo_disable() {
+  local name
+  name=$(workspace_sandbox_name)
+  agb_toml_unset "sudo"
+  log "removed sudo from $PWD/.agentbox.toml"
+  local phase
+  phase=$(sandbox_phase "$name" 2>/dev/null || echo "")
+  if [ "$phase" = "Ready" ]; then
+    log "removing /etc/sudoers.d/agentbox from $name"
+    if openshell sandbox exec --name "$name" --user root --no-tty \
+         -- /bin/sh -c 'rm -f /etc/sudoers.d/agentbox' </dev/null >/dev/null 2>&1; then
+      audit_emit "$name" "sudo" "DISABLED (sudoers file removed)"
+      log "  ✓ sudo revoked inside $name"
+    else
+      warn "could not remove sudoers file (openshell --user root failed). Manual cleanup:"
+      warn "  openshell sandbox exec --name $name --user root -- rm -f /etc/sudoers.d/agentbox"
+    fi
+  fi
+  cmd_sudo_status
+}
+
+cmd_sudo_status() {
+  local name
+  name=$(workspace_sandbox_name)
+  load_config
+  printf '\n  workspace: %s\n' "$PWD"
+  printf '  sandbox:   %s\n' "$name"
+  echo
+
+  # Config-file state
+  if [ -f .agentbox.toml ] && grep -qE '^[[:space:]]*sudo[[:space:]]*=[[:space:]]*"?(true|1|yes|on)"?' .agentbox.toml 2>/dev/null; then
+    printf '  .agentbox.toml:   sudo = true  (enabled, persistent)\n'
+  else
+    printf '  .agentbox.toml:   sudo not set (or false)\n'
+  fi
+
+  # Env var state
+  if is_truthy "${AGENTBOX_SUDO:-}"; then
+    printf '  AGENTBOX_SUDO:    set (enabled for this shell)\n'
+  else
+    printf '  AGENTBOX_SUDO:    unset\n'
+  fi
+
+  # Live sandbox state — only check if running
+  local phase
+  phase=$(sandbox_phase "$name" 2>/dev/null || echo "")
+  if [ "$phase" = "Ready" ]; then
+    if openshell sandbox exec --name "$name" --no-tty -- sudo -n true \
+         </dev/null >/dev/null 2>&1; then
+      printf '  live in sandbox:  ✓ sudo -n works (NOPASSWD active)\n'
+    else
+      printf '  live in sandbox:  ✗ sudo -n does not work (not yet applied or revoked)\n'
+    fi
+  else
+    printf '  live in sandbox:  (sandbox not running)\n'
+  fi
+  echo
+  echo "  agentbox sudo enable   # write sudo=true + apply to running sandbox"
+  echo "  agentbox sudo disable  # remove sudoers + drop from .agentbox.toml"
+  echo
+}
+
 cmd_resize_show() {
   # Print the effective config for the current workspace.
   load_config
@@ -2741,9 +2837,15 @@ Per-workspace overrides (.agentbox.toml in workspace root):
 
 In-sandbox sudo (let the agent run 'sudo apt install foo', edit /etc/*, etc.
 inside its OWN sandbox — no host escape):
-  export AGENTBOX_SUDO=1                    enable for this shell
-  # or, persistent per-workspace:
-  echo 'sudo = true' >> .agentbox.toml
+  agentbox sudo                Show current sudo status (toml + env + live)
+  agentbox sudo enable         Persist sudo=true in .agentbox.toml and apply
+                               to the running sandbox immediately
+  agentbox sudo disable        Revert: remove /etc/sudoers.d/agentbox and
+                               drop sudo from .agentbox.toml
+
+  Equivalent low-level toggles:
+    export AGENTBOX_SUDO=1            enable for this shell only
+    echo 'sudo = true' >> .agentbox.toml   persistent per-workspace
 
   Writes /etc/sudoers.d/agentbox with NOPASSWD for the sandbox user via a
   one-time `openshell sandbox exec --user root`. Idempotent — safe to leave
@@ -2798,6 +2900,7 @@ if [ "$self_name" = "agentbox" ] || [ "$self_name" = "agentbox.sh" ]; then
     ssh)     cmd_ssh "$@" ;;
     attach)  cmd_attach "$@" ;;
     resize)  cmd_resize "$@" ;;
+    sudo)    cmd_sudo "$@" ;;
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
     audit)         cmd_audit "$@" ;;
