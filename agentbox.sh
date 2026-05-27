@@ -403,11 +403,54 @@ unfreeze_sandbox_agents() {
 AGB_NTFY_TOPIC_FILE="$AGB_ROOT/ntfy-topic"
 AGB_NTFY_BASE="${AGB_NTFY_BASE:-https://ntfy.sh}"
 
+# Sanitize a user-supplied ntfy topic. Strips an optional scheme + host
+# prefix (so users can paste a full URL like https://ntfy.sh/foo or
+# ntfy.sh/foo and get just "foo"), then validates against ntfy's
+# acceptable character set. Echoes the cleaned topic on success.
+ntfy_sanitize_topic() {
+  local raw="$1"
+  # Strip leading whitespace + scheme + host so URL pastes work.
+  local t="${raw#"${raw%%[![:space:]]*}"}"
+  t="${t%"${t##*[![:space:]]}"}"
+  t="${t#http://}"
+  t="${t#https://}"
+  t="${t#ntfy.sh/}"
+  case "$t" in
+    */*) t="${t##*/}" ;;
+  esac
+  # ntfy topics: 1-64 chars, alnum + _ + - (we keep the strict subset).
+  case "$t" in
+    "" )
+      return 1 ;;
+    *[!A-Za-z0-9_-]* )
+      return 1 ;;
+  esac
+  [ "${#t}" -gt 64 ] && return 1
+  printf '%s\n' "$t"
+}
+
+# Resolve the active ntfy topic. Priority:
+#   1. $AGENTBOX_NTFY_TOPIC env (per-shell override; portable across hosts)
+#   2. $AGB_NTFY_TOPIC_FILE   (persisted via `agentbox notify setup`)
 ntfy_get_topic() {
+  if [ -n "${AGENTBOX_NTFY_TOPIC:-}" ]; then
+    ntfy_sanitize_topic "$AGENTBOX_NTFY_TOPIC" && return 0
+    return 1
+  fi
   [ -f "$AGB_NTFY_TOPIC_FILE" ] || return 1
   local t
   t=$(tr -d "[:space:]" < "$AGB_NTFY_TOPIC_FILE")
   [ -n "$t" ] && printf '%s\n' "$t"
+}
+
+# Returns "env" or "file" depending on where ntfy_get_topic resolved from.
+# Echoes nothing if no topic is configured.
+ntfy_topic_source() {
+  if [ -n "${AGENTBOX_NTFY_TOPIC:-}" ] && ntfy_sanitize_topic "$AGENTBOX_NTFY_TOPIC" >/dev/null 2>&1; then
+    echo "env"
+  elif [ -f "$AGB_NTFY_TOPIC_FILE" ] && [ -s "$AGB_NTFY_TOPIC_FILE" ]; then
+    echo "file"
+  fi
 }
 
 # Derive a wildcard parent zone from a hostname for the "Allow all *.parent" UX:
@@ -2758,8 +2801,21 @@ cmd_notify() {
 
   case "$sub" in
     setup)
+      # Optional positional arg: reuse an existing topic instead of generating
+      # one. Accepts bare topic ("my-topic"), full URL ("https://ntfy.sh/foo"),
+      # or host+path ("ntfy.sh/foo") — ntfy_sanitize_topic normalizes them.
+      # This is the cross-host workflow: run the same `agentbox notify setup
+      # <topic>` on every Mac and they all push to the same feed.
+      local provided="${1:-}"
+      [ "$#" -gt 0 ] && shift
       local existing
       if existing=$(ntfy_get_topic); then
+        local src; src=$(ntfy_topic_source)
+        if [ "$src" = "env" ]; then
+          echo "ntfy topic is currently set via \$AGENTBOX_NTFY_TOPIC: $existing"
+          echo "(unset it to use a file-backed topic, or just keep the env var.)"
+          return 0
+        fi
         echo "ntfy topic already configured: $existing"
         printf 'Overwrite? [y/N] ' >&2
         local ans
@@ -2767,8 +2823,15 @@ cmd_notify() {
         [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { echo "(unchanged)"; return 0; }
       fi
       mkdir -p "$AGB_ROOT"
-      local topic="agentbox-$(uuidgen 2>/dev/null | tr "A-Z" "a-z" | tr -d "-" | head -c 24)"
-      [ "${#topic}" -lt 24 ] && topic="agentbox-$(printf '%s' "$RANDOM$RANDOM$RANDOM$$" | shasum -a 256 | cut -c1-24)"
+      local topic
+      if [ -n "$provided" ]; then
+        topic=$(ntfy_sanitize_topic "$provided") || \
+          err "invalid topic '$provided' — use 1-64 chars [A-Za-z0-9_-]"
+        log "reusing supplied ntfy topic: $topic"
+      else
+        topic="agentbox-$(uuidgen 2>/dev/null | tr "A-Z" "a-z" | tr -d "-" | head -c 24)"
+        [ "${#topic}" -lt 24 ] && topic="agentbox-$(printf '%s' "$RANDOM$RANDOM$RANDOM$$" | shasum -a 256 | cut -c1-24)"
+      fi
       printf '%s\n' "$topic" > "$AGB_NTFY_TOPIC_FILE"
       chmod 600 "$AGB_NTFY_TOPIC_FILE"
       log "saved ntfy topic to $AGB_NTFY_TOPIC_FILE"
@@ -2844,8 +2907,13 @@ cmd_notify() {
     status)
       local t
       if t=$(ntfy_get_topic); then
+        local src; src=$(ntfy_topic_source)
         echo "ntfy topic: $t"
         echo "URL:        $AGB_NTFY_BASE/$t"
+        case "$src" in
+          env)  echo "Source:     \$AGENTBOX_NTFY_TOPIC env var (per-shell override)" ;;
+          file) echo "Source:     $AGB_NTFY_TOPIC_FILE" ;;
+        esac
         if is_truthy "${AGENTBOX_NTFY:-}"; then
           echo "Enabled:    yes (AGENTBOX_NTFY=1 set in env)"
         else
@@ -2853,7 +2921,10 @@ cmd_notify() {
         fi
       else
         echo "ntfy: not configured  (run: agentbox notify setup)"
-        echo "Note: ntfy is opt-in. After setup, also export AGENTBOX_NTFY=1."
+        echo "Tips:"
+        echo "  - reuse a topic across machines: agentbox notify setup <topic>"
+        echo "  - or per-shell override:         export AGENTBOX_NTFY_TOPIC=<topic>"
+        echo "  - then activate:                 export AGENTBOX_NTFY=1"
       fi
       ;;
     test)
@@ -3148,9 +3219,12 @@ Notification appearance (macOS):
                                          approval prompts with action buttons.
 
 ntfy.sh (OPT-IN cross-device push with two-button inline actions):
-  agentbox notify setup                  Generate topic, offer to open ntfy app
-                                         or browser to subscribe, send a test.
-  agentbox notify status                 Topic + URL + enabled-or-not.
+  agentbox notify setup [TOPIC]          Generate (or reuse, if TOPIC given) a
+                                         topic, offer to open ntfy app / browser
+                                         to subscribe, and send a test push.
+                                         TOPIC can be bare ("my-topic") or a
+                                         full URL ("https://ntfy.sh/my-topic").
+  agentbox notify status                 Topic + URL + source + enabled-or-not.
   agentbox notify open                   Re-open subscribe target (app/browser).
   agentbox notify browser                Re-open in browser specifically.
   agentbox notify qr                     Re-print the subscribe QR.
@@ -3160,6 +3234,13 @@ ntfy.sh (OPT-IN cross-device push with two-button inline actions):
   Enable: export AGENTBOX_NTFY=1 in your shell. Without that env var, ntfy
   stays dormant and approval prompts go through alerter (the default).
   Subscribe UX: AGENTBOX_NTFY_SUBSCRIBE=auto|app|browser|none
+
+  Shared topic across hosts (laptop + remote Mac + phone subscribe once):
+    pick a topic name, then on EACH host run:
+      agentbox notify setup my-shared-topic
+      export AGENTBOX_NTFY=1
+    Or per-shell only (no file): export AGENTBOX_NTFY_TOPIC=my-shared-topic.
+    The env var beats the file when both are set.
 
 Per-agent host-side auth setup (so sandboxes auto-authenticate):
   agentbox auth status                          Show which agents are set up
