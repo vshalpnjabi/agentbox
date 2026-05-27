@@ -974,9 +974,10 @@ cmd_watch_internal() {
                 --add-endpoint "${effective_host}:${port}" \
                 --binary "$binary" \
                 --wait >/dev/null 2>&1; then
-              audit_emit "$sandbox" "decision" "ALLOW $binary -> ${effective_host}:$port (kind=$kind; policy hot-reloaded by user)"
+              audit_emit "$sandbox" "decision" "ALLOW $binary -> ${effective_host}:$port (kind=$kind; policy hot-reloaded + persisted)"
               echo "[watcher] approved ($kind): $effective_host:$port" >&2
               printf '%s|%s\n' "$key" "$seen_decision_value" >> "$seen_file"
+              auto_policy_append "$effective_host" "$port" "$binary"
             else
               echo "[watcher] openshell policy update returned non-zero — treating as Deny" >&2
               audit_emit "$sandbox" "decision" "ALLOW_FAIL $binary -> ${effective_host}:$port (kind=$kind; policy update failed)"
@@ -1213,9 +1214,19 @@ cmd_decide_handler_internal() {
 
   case "$response" in
     Allow)
-      printf '%s|allow\n' "$key" >> "$seen_file"
-      audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port"
-      _decide_reply "allow" "user approved" "exact" "$host"
+      if openshell policy update "$sandbox" \
+          --add-endpoint "${host}:${port}" \
+          --binary "$binary" \
+          --wait >/dev/null 2>&1; then
+        printf '%s|allow\n' "$key" >> "$seen_file"
+        auto_policy_append "$host" "$port" "$binary"
+        audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (policy hot-reloaded + persisted)"
+        _decide_reply "allow" "user approved" "exact" "$host"
+      else
+        audit_emit "$sandbox" "decide" "USER_ALLOW_FAIL [src=$source] ${req_id:-?}: $binary -> $host:$port (openshell policy update returned non-zero)"
+        printf '%s|allow\n' "$key" >> "$seen_file"
+        _decide_reply "allow" "user approved (policy update failed)" "exact" "$host"
+      fi
       ;;
     AllowWildcard:*)
       # User picked "Allow all *.parent.host". Hot-reload the openshell policy
@@ -1227,7 +1238,8 @@ cmd_decide_handler_internal() {
           --binary "$binary" \
           --wait >/dev/null 2>&1; then
         printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
-        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> $wild:$port (policy hot-reloaded)"
+        auto_policy_append "$wild" "$port" "$binary"
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> $wild:$port (policy hot-reloaded + persisted)"
         _decide_reply "allow" "user approved wildcard $wild" "wildcard" "$wild"
       else
         audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD_FAIL [src=$source] ${req_id:-?}: $binary -> $wild:$port (policy update returned non-zero)"
@@ -1454,6 +1466,98 @@ ensure_workspace_policy() {
     write_default_policy "$WORKSPACE_POLICY_FILE"
   fi
   AGB_POLICY="$WORKSPACE_POLICY_FILE"
+}
+
+# Append an auto_* network policy rule to .agentbox.policy.yaml so user
+# approvals survive `agentbox policy reload` AND sandbox destroy+recreate
+# (both reset openshell's live policy to the on-disk file). Idempotent —
+# duplicate (host, port, binary) tuples are skipped by rule-name lookup.
+# Insertion happens INSIDE the network_policies: section so the YAML stays
+# valid. Auto rules are name-prefixed `auto_` so `agentbox approve reset`
+# can find and remove them later.
+auto_policy_append() {
+  local host="$1" port="$2" binary="$3"
+  local f="$WORKSPACE_POLICY_FILE"
+  [ -f "$f" ] || return 1
+
+  # Build a deterministic, YAML-safe rule name from the tuple. Long names
+  # are truncated + suffixed with a short hash to avoid collisions.
+  local hsan bsan rule_name
+  hsan=$(printf '%s' "$host"   | tr -c 'a-zA-Z0-9' '_')
+  bsan=$(printf '%s' "$binary" | tr -c 'a-zA-Z0-9' '_')
+  rule_name="auto_${hsan}_${port}_${bsan}"
+  if [ ${#rule_name} -gt 80 ]; then
+    local digest
+    digest=$(printf '%s' "$rule_name" | shasum -a 256 | cut -c1-8)
+    rule_name="${rule_name:0:60}_${digest}"
+  fi
+
+  # Idempotent: skip if a rule with this name already exists.
+  if grep -qE "^  ${rule_name}:[[:space:]]*$" "$f" 2>/dev/null; then
+    return 0
+  fi
+
+  # The rule block to insert (one trailing newline already present).
+  local block
+  printf -v block '  # auto-added by agentbox approval prompt (safe to delete)
+  %s:
+    name: %s
+    endpoints:
+      - { host: '\''%s'\'', port: %s }
+    binaries:
+      - { path: '\''%s'\'' }
+' "$rule_name" "$rule_name" "$host" "$port" "$binary"
+
+  # Insert just before the next top-level key after `network_policies:`,
+  # or at EOF if network_policies is the last top-level section. Atomic
+  # via tempfile + mv. Pass `block` through ENVIRON because BWK awk's `-v`
+  # rejects literal newlines.
+  local tmp
+  tmp=$(mktemp -t agentbox-policy-edit.XXXXXX 2>/dev/null) || tmp="/tmp/agentbox-policy-edit-$$.yaml"
+  AGB_BLOCK="$block" awk '
+    BEGIN { block = ENVIRON["AGB_BLOCK"]; in_np = 0; inserted = 0 }
+    /^network_policies:[[:space:]]*$/ { in_np = 1; print; next }
+    in_np && /^[a-zA-Z]/ {
+      if (!inserted) { printf "%s", block; inserted = 1 }
+      in_np = 0
+    }
+    { print }
+    END { if (in_np && !inserted) printf "%s", block }
+  ' "$f" > "$tmp" 2>/dev/null
+
+  if [ -s "$tmp" ]; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# Remove every auto_* rule (and its preceding `# auto-added` comment) from
+# .agentbox.policy.yaml. Returns 0 even if nothing was removed.
+auto_policy_remove_all() {
+  local f="$WORKSPACE_POLICY_FILE"
+  [ -f "$f" ] || return 0
+  local tmp
+  tmp=$(mktemp -t agentbox-policy-edit.XXXXXX 2>/dev/null) || tmp="/tmp/agentbox-policy-edit-$$.yaml"
+  awk '
+    # state: skipping inside an auto rule
+    BEGIN { skip = 0 }
+    /^  # auto-added by agentbox/ { skip = 1; next }
+    skip && /^  auto_[a-zA-Z0-9_]+:[[:space:]]*$/ { next }
+    skip && /^    / { next }
+    skip {
+      skip = 0
+      # fall through and print this line
+    }
+    { print }
+  ' "$f" > "$tmp" 2>/dev/null
+
+  if [ -s "$tmp" ]; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
 }
 
 agent_install_cmd() {
@@ -2824,40 +2928,77 @@ EOF
 }
 
 cmd_approve() {
-  # Manage the watcher seen-list — the set of (binary, host, port) tuples the
-  # user has already responded to. Entries here suppress re-prompts. Use this
-  # to "forget" past denials/approvals so the watcher will ask again.
+  # Manage the approval seen-lists AND the auto_* rules persisted in
+  # .agentbox.policy.yaml. Two seen-list files for back-compat:
+  #   decide-seen.txt   (canonical since v0.3.0)
+  #   watcher-seen.txt  (legacy direct-mode + pre-v0.3.0)
+  # reset wipes both seen-lists AND the auto_* rules in the policy file.
   local sub="${1:-list}"
   [ "$#" -gt 0 ] && shift
   local name="${1:-$(workspace_sandbox_name)}"
-  local seen_file="$AGB_STATE_ROOT/$name/watcher-seen.txt"
+  local decide_seen="$AGB_STATE_ROOT/$name/decide-seen.txt"
+  local watcher_seen="$AGB_STATE_ROOT/$name/watcher-seen.txt"
   case "$sub" in
     list)
-      if [ ! -f "$seen_file" ]; then
-        echo "(no seen-list for $name)"
-        return 0
+      local any=0
+      printf '%-50s  %-30s  %s\n' "BINARY" "HOST:PORT" "DECISION"
+      for f in "$decide_seen" "$watcher_seen"; do
+        [ -s "$f" ] || continue
+        any=1
+        awk -F'|' '{
+          d = (NF >= 4 ? $4 : "(legacy)")
+          printf "%-50s  %s:%-23s  %s\n", $1, $2, $3, d
+        }' "$f"
+      done
+      if [ -f "$WORKSPACE_POLICY_FILE" ]; then
+        local auto_count
+        auto_count=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null || echo 0)
+        if [ "$auto_count" -gt 0 ]; then
+          echo
+          echo "  $auto_count auto_* rule(s) in $WORKSPACE_POLICY_FILE (persisted approvals)"
+          any=1
+        fi
       fi
-      printf '%-50s  %s\n' "BINARY" "HOST:PORT"
-      awk -F'|' '{printf "%-50s  %s:%s\n", $1, $2, $3}' "$seen_file"
+      [ "$any" -eq 0 ] && echo "(no seen-list or auto rules for $name)"
       ;;
     forget)
       local pattern="${1:-}"
       [ -z "$pattern" ] && err "usage: agentbox approve forget <host-or-pattern> [NAME]"
-      [ -f "$seen_file" ] || { echo "(no seen-list)"; return 0; }
-      local before after
-      before=$(wc -l < "$seen_file" | tr -d ' ')
-      grep -v "$pattern" "$seen_file" > "$seen_file.tmp" 2>/dev/null || true
-      mv "$seen_file.tmp" "$seen_file"
-      after=$(wc -l < "$seen_file" | tr -d ' ')
-      log "removed $((before-after)) entries matching '$pattern' (was $before, now $after)"
+      local total_removed=0
+      for f in "$decide_seen" "$watcher_seen"; do
+        [ -f "$f" ] || continue
+        local before after
+        before=$(wc -l < "$f" | tr -d ' ')
+        grep -v "$pattern" "$f" > "$f.tmp" 2>/dev/null || true
+        mv "$f.tmp" "$f"
+        after=$(wc -l < "$f" | tr -d ' ')
+        total_removed=$(( total_removed + (before - after) ))
+      done
+      log "removed $total_removed entries matching '$pattern' from seen-lists"
+      log "Note: auto_* rules in $WORKSPACE_POLICY_FILE are not touched; edit by hand or use 'agentbox approve reset' to wipe all."
       ;;
     reset|clear)
-      if [ -f "$seen_file" ]; then
-        local n; n=$(wc -l < "$seen_file" | tr -d ' ')
-        : > "$seen_file"
-        log "cleared seen-list ($n entries removed)"
-      else
-        echo "(already empty)"
+      local n=0
+      for f in "$decide_seen" "$watcher_seen"; do
+        if [ -s "$f" ]; then
+          n=$(( n + $(wc -l < "$f" | tr -d ' ') ))
+          : > "$f"
+        fi
+      done
+      log "cleared seen-list ($n entries removed across both files)"
+      # Also remove auto_* rules from the workspace policy file.
+      if [ -f "$WORKSPACE_POLICY_FILE" ]; then
+        local before_auto after_auto
+        before_auto=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null || echo 0)
+        auto_policy_remove_all
+        after_auto=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null || echo 0)
+        log "removed $((before_auto - after_auto)) auto_* rule(s) from $WORKSPACE_POLICY_FILE"
+      fi
+      # Hot-reload the now-cleaner policy if the sandbox is running.
+      if openshell sandbox list 2>/dev/null | awk '{print $1}' | grep -qx "$name"; then
+        openshell policy set "$name" --policy "$WORKSPACE_POLICY_FILE" --wait >/dev/null 2>&1 && \
+          log "hot-reloaded $WORKSPACE_POLICY_FILE on $name" || \
+          warn "couldn't hot-reload (no running sandbox?)"
       fi
       ;;
     *)
@@ -2890,11 +3031,10 @@ cmd_policy() {
       printf '\nRun "agentbox policy reload" to apply network changes to the running sandbox,\nor "agentbox destroy && claude" to apply static field changes.\n' >&2
       ;;
     reset)
-      # Rewrite .agentbox.policy.yaml from the deny-all+defaults template, wipe
-      # the watcher seen-list, and hot-reload network rules on the running sandbox
-      # (if any). Static fields take effect on next `claude` (destroy + recreate
-      # is implied if you want a fully fresh sandbox).
-      log "resetting .agentbox.policy.yaml in $PWD to default template"
+      # Rewrite .agentbox.policy.yaml from the deny-all+defaults template (this
+      # also wipes any auto_* rules accumulated from approval prompts), clear
+      # the seen-list, and hot-reload network rules on the running sandbox.
+      log "resetting .agentbox.policy.yaml in $PWD to default template (wipes auto_* rules too)"
       write_default_policy "$WORKSPACE_POLICY_FILE"
       local state_dir
       state_dir="$AGB_STATE_ROOT/$name"
