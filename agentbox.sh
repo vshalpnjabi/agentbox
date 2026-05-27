@@ -1555,6 +1555,157 @@ cmd_attach() {
   exec tmux -L "$AGB_TMUX_SOCKET" attach -d -t "$session"
 }
 
+# ---- workspace config (.agentbox.toml) ----
+# Per-workspace overrides for sandbox resources (cpu, memory) and other knobs
+# (image, policy). Static fields require destroy+recreate to take effect since
+# openshell doesn't expose a live-resize API; the --apply flag does this in one
+# step (state is preserved across destroy via mutagen state-sync).
+
+agb_toml_set() {
+  local file=".agentbox.toml"
+  local key="$1" val="$2"
+  [ ! -f "$file" ] && printf '# agentbox per-workspace config (auto-edited)\n' > "$file"
+  if grep -q "^[[:space:]]*${key}[[:space:]]*=" "$file"; then
+    local tmp; tmp=$(mktemp)
+    awk -v k="$key" -v v="$val" '
+      $0 ~ "^[[:space:]]*"k"[[:space:]]*=" { print k " = \"" v "\""; next }
+      { print }
+    ' "$file" > "$tmp" && mv "$tmp" "$file"
+  else
+    printf '%s = "%s"\n' "$key" "$val" >> "$file"
+  fi
+}
+
+agb_toml_unset() {
+  local file=".agentbox.toml" key="$1"
+  [ ! -f "$file" ] && return 0
+  local tmp; tmp=$(mktemp)
+  awk -v k="$key" '$0 !~ "^[[:space:]]*"k"[[:space:]]*=" { print }' "$file" > "$tmp" && mv "$tmp" "$file"
+  # Tidy: remove empty/comment-only files
+  if [ -z "$(grep -v '^[[:space:]]*\(#\|$\)' "$file")" ]; then
+    rm -f "$file"
+  fi
+}
+
+cmd_resize() {
+  # Adjust sandbox resources for this workspace. Writes to .agentbox.toml,
+  # then either tells the user to destroy+recreate or does it for them.
+  #
+  # Examples:
+  #   agentbox resize                    # show effective config
+  #   agentbox resize show               # same
+  #   agentbox resize cpu 4              # set cpu
+  #   agentbox resize cpu 4 memory 4Gi   # set multiple
+  #   agentbox resize cpu 4 --apply      # set + destroy + auto-recreate
+  #   agentbox resize unset cpu          # revert cpu to default
+  local apply=0
+  local pending_unset=0
+  local pairs=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --apply|--recreate|-a) apply=1; shift ;;
+      show|"")               cmd_resize_show; return 0 ;;
+      help|-h|--help)        cmd_resize_show; return 0 ;;
+      unset)                 pending_unset=1; shift ;;
+      cpu|memory|disk|image|policy)
+        if [ "$pending_unset" -eq 1 ]; then
+          pairs+=("__unset__:$1")
+          pending_unset=0
+          shift
+        else
+          [ -z "${2:-}" ] && err "missing value for '$1' (try: agentbox resize $1 4)"
+          pairs+=("$1:$2")
+          shift 2
+        fi
+        ;;
+      *) err "unknown 'resize' arg: '$1'. Try: agentbox resize show" ;;
+    esac
+  done
+
+  if [ "${#pairs[@]}" -eq 0 ]; then
+    cmd_resize_show
+    return 0
+  fi
+
+  local p key val changed=0
+  for p in "${pairs[@]}"; do
+    key="${p%%:*}"; val="${p#*:}"
+    if [ "$key" = "__unset__" ]; then
+      agb_toml_unset "$val"
+      log "unset $val (will use default on next launch)"
+      changed=1
+      continue
+    fi
+    case "$key" in
+      disk)
+        warn "openshell doesn't expose a disk-size flag; ignoring '$key'. Disk capacity comes from the Docker storage driver — adjust via Docker Desktop settings (Resources → Disk image size) for a global change."
+        continue
+        ;;
+      cpu)
+        case "$val" in [0-9]*) ;; *) err "cpu must be a number, got '$val'" ;; esac
+        ;;
+      memory)
+        case "$val" in
+          [0-9]*[GMK]i|[0-9]*[GMK]) ;;
+          *) err "memory must be like '4Gi', '512Mi', '2G' — got '$val'" ;;
+        esac
+        ;;
+    esac
+    agb_toml_set "$key" "$val"
+    log "set $key = $val"
+    changed=1
+  done
+
+  [ "$changed" -eq 0 ] && return 0
+
+  local name; name=$(workspace_sandbox_name)
+  echo
+  log "wrote $PWD/.agentbox.toml"
+  log "openshell can't live-resize a running sandbox; the new values take effect on the NEXT sandbox creation."
+
+  if [ "$apply" -eq 1 ]; then
+    log "--apply: destroying $name now (workspace + state preserved on host)"
+    cmd_destroy "$name"
+    log "done. Next 'claude' / 'codex' / 'opencode' will create a fresh sandbox with the new resources."
+  else
+    local phase; phase=$(sandbox_phase "$name" 2>/dev/null || echo "")
+    if [ "$phase" = "Ready" ]; then
+      log "current sandbox '$name' is running with old values. To apply now:"
+      log "  agentbox destroy && claude        # or codex / opencode"
+      log "  (or re-run with --apply)"
+    else
+      log "no running sandbox; new values will apply on first agent launch."
+    fi
+  fi
+}
+
+cmd_resize_show() {
+  # Print the effective config for the current workspace.
+  load_config
+  local name; name=$(workspace_sandbox_name)
+  printf '\n  workspace: %s\n' "$PWD"
+  printf '  sandbox:   %s\n' "$name"
+  local phase; phase=$(sandbox_phase "$name" 2>/dev/null || echo "")
+  printf '  phase:     %s\n' "${phase:-not created}"
+  printf '\n  Effective config:\n'
+  printf '    image:    %s\n' "$AGB_IMAGE"
+  printf '    cpu:      %s\n' "$AGB_CPU"
+  printf '    memory:   %s\n' "$AGB_MEMORY"
+  [ -n "$AGB_POLICY" ] && printf '    policy:   %s\n' "$AGB_POLICY"
+  printf '\n'
+  if [ -f .agentbox.toml ]; then
+    printf '  Source: .agentbox.toml overrides defaults:\n'
+    sed 's/^/    /' .agentbox.toml
+  else
+    printf '  Source: defaults (no .agentbox.toml in workspace)\n'
+  fi
+  printf '\n  Set:    agentbox resize cpu 4 memory 4Gi\n'
+  printf '  Apply:  agentbox resize cpu 4 memory 4Gi --apply\n'
+  printf '  Unset:  agentbox resize unset cpu\n'
+  printf '\n  (Disk size is not adjustable via openshell flags — comes from\n'
+  printf '   the Docker storage driver. Adjust via Docker Desktop → Resources.)\n\n'
+}
+
 cmd_auth() {
   # Per-agent host-side auth setup. Each agent has its own credential file;
   # agentbox uploads them into the sandbox on every launch (and for claude,
@@ -2302,6 +2453,17 @@ Management:
                                passing commands: 'agentbox ssh -- ls -la')
   agentbox attach [NAME]       Reattach to this workspace's tmux session
                                (created automatically when an agent runs)
+  agentbox resize              Show effective sandbox config (cpu/memory/...)
+  agentbox resize <key> <val>  Set a value in .agentbox.toml. Keys: cpu,
+                               memory, image, policy. Examples:
+                                 agentbox resize cpu 4
+                                 agentbox resize memory 4Gi
+                                 agentbox resize cpu 4 memory 4Gi --apply
+                               --apply destroys + recreates the sandbox now
+                               (host state preserved). Without --apply, run
+                               'agentbox destroy && claude' to apply.
+                               Disk size: not adjustable via openshell —
+                               configure via Docker Desktop's storage driver.
   agentbox policy show [NAME]  Print active policy on sandbox
   agentbox policy edit [NAME]  Edit .agentbox.policy.yaml in $EDITOR
   agentbox policy reload [N]   Push workspace policy to running sandbox
@@ -2526,6 +2688,7 @@ if [ "$self_name" = "agentbox" ] || [ "$self_name" = "agentbox.sh" ]; then
     shell)   cmd_shell "$@" ;;
     ssh)     cmd_ssh "$@" ;;
     attach)  cmd_attach "$@" ;;
+    resize)  cmd_resize "$@" ;;
     policy)  cmd_policy "$@" ;;
     approve)       cmd_approve "$@" ;;
     audit)         cmd_audit "$@" ;;
