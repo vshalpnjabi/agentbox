@@ -2,7 +2,7 @@
 
 **For:** A Claude Code session working inside the `agentbox` repository.  
 **Status:** OpenShell-side implementation is **complete** on branch
-`interactive-enforcement` of `vshalpnjabi/OpenShell`.  
+`interactive-enforcement` of `vshalpnjabi/OpenShell` (latest: `9a59c33`).  
 **Goal:** Add an HTTP decision server to agentbox so the OpenShell proxy can
 hold denied requests open while the user approves or rejects them, instead of
 immediately 403-ing.
@@ -228,8 +228,7 @@ network_policies:
           fallback: deny        # agent gets 403 on timeout / server error
         access: full            # base allow (satisfies validator)
         deny_rules:
-          - name: gate-all      # overrides base → forces allowed=false
-            method: "*"         # all HTTP methods
+          - method: "*"         # all HTTP methods — overrides base → forces allowed=false
             path: "**"          # all paths ("**" is the always-match sentinel)
     binaries:
       - path: "**"              # any binary spawned by the agent
@@ -277,8 +276,7 @@ network_policies:
           fallback: deny
         access: full
         deny_rules:
-          - name: gate-all
-            method: "*"
+          - method: "*"
             path: "**"
     binaries:
       - path: "**"
@@ -296,8 +294,7 @@ network_policies:
           fallback: deny
         access: full
         deny_rules:
-          - name: gate-all
-            method: "*"
+          - method: "*"
             path: "**"
     binaries:
       - path: "**"
@@ -309,6 +306,35 @@ network_policies:
 > explicit enforce entry, give allow-list policy names that sort before interactive
 > ones (e.g. `aaa-claude-api` before `zzz-interactive-gate`), or keep them in
 > separate, non-overlapping host sets.
+
+---
+
+## What's been verified (and what hasn't)
+
+### Confirmed working
+
+The OPA/Rego evaluation layer is verified correct by two unit tests
+(`opa::tests::deny_rules_force_deny_request_*` in `crates/openshell-sandbox/src/opa.rs`):
+
+- With `access: full` + `deny_rules: [{method: "*", path: "**"}]`, regorus
+  evaluates `deny_request = true` and `allow_request = false`. ✅
+- The proxy code in `relay.rs` and `proxy.rs` has the `Interactive` arm fully
+  wired: when `allowed = false` and `enforcement = Interactive`, it calls
+  `consult_interactive_endpoint()`. ✅
+- The `L7DenyRuleDef` schema does **not** have a `name` field — the template
+  previously had `name: gate-all` inside deny_rules which would have been
+  rejected by `serde(deny_unknown_fields)`. Fixed in this doc. ✅
+
+### Still needs live validation
+
+The unit tests load policy data from YAML directly into regorus. In production
+the data travels: YAML → `NetworkPolicyDef` → proto `NetworkEndpoint` →
+`proto_to_opa_data_json` → regorus. Code review confirms deny_rules are
+preserved through this path, but it hasn't been tested with a running
+supervisor. **The smoke test below is the critical validation step.** If the
+mock decider receives no POST after applying the three-ingredient policy, the
+proto round-trip is the remaining suspect — add a test calling
+`OpaEngine::from_proto` with a `ProtoSandboxPolicy` containing deny_rules.
 
 ---
 
@@ -378,8 +404,10 @@ the incoming decision request back to the right sandbox in its registry.
 
 ```bash
 # On your Mac — build from the interactive-enforcement branch
+# Minimum commit: 9a59c33 (websocket Interactive arm compile fix)
 brew uninstall openshell 2>/dev/null || true
 cd ~/Library/CloudStorage/Dropbox/github.com/openshell-interactive-enforcement
+git pull   # ensure you're at 9a59c33 or later
 cargo install --path crates/openshell-cli
 
 # Restart the daemon
