@@ -1665,29 +1665,21 @@ YAML
     local sb port
     sb=$(workspace_sandbox_name)
     port=$(decide_server_port_for_sandbox "$sb")
-
-    # Hosts to put behind interactive enforcement. Comma-separated; each
-    # entry becomes its own endpoint block under interactive_gate.
-    # Default is *.example.com so the demo runs out of the box; override
-    # in real use with something like:
-    #   AGENTBOX_INTERACTIVE_HOSTS="*.github.com,api.openai.com,*.stripe.com"
-    # Note: openshell's OPA glob treats '.' as a segment delimiter — bare '*'
-    # is rejected by the L7 validator. Use '*.zone' patterns.
-    local hosts="${AGENTBOX_INTERACTIVE_HOSTS:-*.example.com}"
-
     cat >> "$target" <<YAML
 
   # ---- interactive enforcement (opt-in via AGENTBOX_INTERACTIVE_POLICY=1) ----
   #
-  # Holds every request to the listed hosts at the openshell proxy while
-  # agentbox prompts you (ntfy / alerter / osascript). Allow → tunnel
-  # proceeds; Deny / timeout → agent sees 403.
+  # The single endpoint below is a DEMO: it gates *.example.com so you can
+  # smoke-test the held-connection flow. To gate real hosts (e.g. your prod
+  # API, *.github.com, billing dashboards), EDIT THIS FILE — duplicate the
+  # endpoint block under \`endpoints:\` once per host you want held, change
+  # the \`host:\` value, then run \`agentbox policy reload\`. The YAML file
+  # is the single source of truth; agentbox does not maintain a parallel
+  # env-based list.
   #
-  # Hosts come from \$AGENTBOX_INTERACTIVE_HOSTS (default: *.example.com).
-  # Reset the policy with \`agentbox policy reset\` after changing the env var.
-  #
-  # The three required ingredients (see docs/openshell-interactive-enforcement.md
-  # for why each is needed; getting any one wrong silently disables the path):
+  # The three ingredients all need to be present for interactive to fire
+  # (see docs/openshell-interactive-enforcement.md for why each matters;
+  # getting any one wrong silently disables the path):
   #
   #   - protocol: rest        - enables openshell's L7 inspector, which is the
   #                             only path that consults \`enforcement.mode\`
@@ -1697,6 +1689,10 @@ YAML
   #                             every request, which is what triggers the
   #                             Interactive arm of the proxy decision
   #
+  # Wildcard semantics: openshell's OPA glob uses '.' as a segment
+  # delimiter, so '*.zone' matches subdomains of zone but NOT the apex.
+  # List the apex separately if you need it. Bare '*' is rejected.
+  #
   # Requires openshell built from the interactive-enforcement branch:
   #   https://github.com/vshalpnjabi/OpenShell/tree/interactive-enforcement
   # Stock openshell silently downgrades this to plain \`enforce\` (no
@@ -1704,15 +1700,7 @@ YAML
   interactive_gate:
     name: interactive-gate
     endpoints:
-YAML
-    # Emit one endpoint block per host from the comma-separated list.
-    local h
-    local IFS=','
-    for h in $hosts; do
-      h="${h# }"; h="${h% }"  # trim surrounding spaces
-      [ -z "$h" ] && continue
-      cat >> "$target" <<YAML
-      - host: "$h"
+      - host: "*.example.com"
         port: 443
         protocol: rest
         enforcement:
@@ -1724,9 +1712,6 @@ YAML
         deny_rules:
           - method: "*"
             path: "**"
-YAML
-    done
-    cat >> "$target" <<YAML
     binaries:
       - { path: "**" }
 YAML
