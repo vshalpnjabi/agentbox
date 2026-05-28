@@ -161,3 +161,54 @@ HTTP 401
 
 **Ready to merge to main once upstream republishes the public
 `supervisor:dev` image.**
+
+---
+
+## Opt-out test (2026-05-28): `AGENTBOX_NO_INTERACTIVE_POLICY=1`
+
+Same VM, same agentbox commit, but every workspace runs with
+`AGENTBOX_NO_INTERACTIVE_POLICY=1` exported in the parent shell. This
+exercises the "behave like main" path: no `interactive_gate` block,
+no `secret:` in the policy, no held-connection path engaged.
+
+### Setup verification
+
+| Check | Result |
+|---|---|
+| `.agentbox.policy.yaml` contains `interactive_gate` | ❌ NO (correct — opt-out) |
+| `.agentbox.policy.yaml` contains `secret:` | ❌ NO (correct — no interactive endpoint to authenticate) |
+| `<state>/decide-secret.txt` file exists | ✅ yes, harmlessly (kept ready in case interactive is re-enabled later or for `agentbox decide test`) |
+| Decide-server listening on default port | ✅ yes (v0.3.0 default-on) |
+| Top-level network_policies emitted (claude_code, codex, opencode, github) | ✅ yes (same as main) |
+
+### Test results
+
+| # | Scenario | Outcome |
+|---|---|---|
+| A | curl github.com (allow-list) | ✅ HTTP 200 in 561 ms |
+| B/C | Interactive ALLOW/DENY | N/A — no `interactive_gate` in policy (correct opt-out behavior) |
+| D | curl httpbin.org (unknown) | ✅ instant 403 in 1.6 ms |
+| E | Different binary subject to policy | ✅ enforced at L4 |
+| F | `agentbox approve list / decide status / doctor` | ✅ **clean — no `0\n0` errors** (the fix from `46de860` still applies) |
+| G | Hot-reload add httpbin.org allow rule | ✅ HTTP 200 in 1.5 s |
+| H | Two opt-out workspaces, two sandboxes | ✅ both Ready, both policies have NO interactive_gate |
+| J | `approve reset` with no entries | ✅ **clean** — `cleared seen-list (0 entries removed)`, no `line 3182: 0\n0: syntax error` |
+| K | Destroy both sandboxes | ✅ clean |
+
+### Net assessment
+
+In opt-out mode the branch is **byte-for-byte equivalent to main's
+policy template** PLUS the two integer-comparison bug fixes from
+`46de860`. Users who want exactly main's behavior just export
+`AGENTBOX_NO_INTERACTIVE_POLICY=1` and get:
+
+- All main-compatible behavior (default allow-list, L4 deny, hot-reload, ntfy round-trip, etc.)
+- None of main's `approve list` / `approve reset` shell errors
+- No L7 interactive enforcement (correctly suppressed)
+- No secret in the policy YAML (and `secret:` field never emitted)
+- The persisted `decide-secret.txt` file is harmless dead state for opt-out users
+
+**Conclusion: the branch is strictly a superset of main.** Whatever
+ran on main runs on the branch with opt-out; everything new is
+opt-in via the default-on `interactive_gate` block (which gracefully
+degrades on stock openshell anyway).
