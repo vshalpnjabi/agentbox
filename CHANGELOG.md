@@ -2,6 +2,24 @@
 
 All notable changes to agentbox.
 
+## [v0.4.7](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.7) — 2026-05-28
+
+Removes the in-installer `docker pull` entirely. install.sh on macOS no longer touches the keychain.
+
+v0.4.5 and v0.4.6 tried (and failed) to bypass `docker-credential-osxkeychain` so the installer could pull `rust:1-bookworm` cleanly. After verifying on a fresh Mac that **Docker Desktop forces the keychain helper at the engine level** — meaning `docker --config <empty>` does not bypass it — we're taking the right approach: don't call `docker pull` from install.sh.
+
+The user pulls the image themselves once, in their terminal (where Docker Desktop's keychain integration works natively, or they can use Colima/alternative runtime if they prefer):
+
+```bash
+docker pull rust:1-bookworm
+```
+
+Then re-runs the installer. install.sh checks for the image with `docker image inspect rust:1-bookworm`; if cached, the cross-compile proceeds via `docker run`. `docker run` on a locally-present image does not contact the registry, so the credential helper is never invoked during install.
+
+If the image isn't cached, install.sh errors out with explicit instructions to pull manually.
+
+Reverts the "anonymous --config" attempt from v0.4.6 (it didn't actually bypass the keychain helper — Docker Desktop's engine integration overrides client-side config).
+
 ## [v0.4.6](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.6) — 2026-05-28
 
 Refinement of the v0.4.5 Docker-pull fix.

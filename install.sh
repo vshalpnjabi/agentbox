@@ -86,38 +86,38 @@ build_supervisor_for_linux_container() {
   # corrupt the returned path. Don't lose this >&2 redirect.
   log "cross-compiling openshell-sandbox for $platform via Docker (~5-10 min first time)" >&2
 
-  # ---- pre-pull the toolchain image ANONYMOUSLY so the keychain credential
-  # helper is never invoked ----
+  # ---- require rust:1-bookworm to already be pulled locally ----
   #
-  # rust:1-bookworm is a public Docker Hub image and anonymous pulls of it
-  # are explicitly allowed. But Docker Desktop on macOS ships with
-  # `~/.docker/config.json` containing `"credsStore": "osxkeychain"`, which
-  # makes EVERY pull (anonymous or not) call docker-credential-osxkeychain
-  # to look up Docker Hub creds first. In a non-TTY-friendly context
-  # (e.g. `bash -c "$(curl ...)"` from a fresh shell) that helper can't
-  # unlock the keychain and exits 1 — Docker treats helper failure as
-  # fatal and the pull never happens.
+  # We deliberately do NOT call `docker pull` from install.sh. On macOS,
+  # Docker Desktop routes every registry interaction through
+  # docker-credential-osxkeychain at the engine level (regardless of
+  # client-side --config), which means an in-installer pull either:
+  #   - prompts the user for their macOS keychain password mid-install, OR
+  #   - silently fails with "keychain cannot be accessed" when the helper
+  #     is invoked from a non-TTY subprocess.
+  # Neither is acceptable for a one-shot installer.
   #
-  # We work around this by pointing Docker at an EMPTY config directory
-  # for just this pull. No credsStore set in there → no helper invoked →
-  # plain anonymous pull. Doesn't touch the user's real ~/.docker/config.json
-  # or affect any future `docker login` they do.
+  # Instead: the user pulls the image manually in their terminal once,
+  # where Docker Desktop's keychain integration works natively (or they
+  # can use any alternative they like — Colima, a remote registry, etc.).
+  # Once cached locally, `docker run rust:1-bookworm ...` doesn't touch
+  # the registry, so the cross-compile below runs keychain-free.
   if ! docker image inspect rust:1-bookworm >/dev/null 2>&1; then
-    log "pulling rust:1-bookworm Docker image anonymously (~1.5GB; one-time)" >&2
-    local anon_dockercfg
-    anon_dockercfg=$(mktemp -d -t agentbox-dockercfg.XXXXXX) || \
-      err "could not create temp Docker config dir for anonymous pull"
-    printf '{}\n' > "$anon_dockercfg/config.json"
-    if ! docker --config "$anon_dockercfg" pull --platform "$platform" rust:1-bookworm >&2; then
-      rm -rf "$anon_dockercfg"
-      err "docker pull rust:1-bookworm failed even with anonymous config.
-       This is unusual — likely a network/connectivity issue (Docker Hub down,
-       firewall, VPN, rate limit). Try pulling manually in your terminal:
+    err "rust:1-bookworm Docker image is not present locally.
+
+       install.sh deliberately does not run \`docker pull\` itself on macOS,
+       because Docker Desktop forces the macOS keychain credential helper
+       on every pull (even for public anonymous images).
+
+       Pull the image once in your terminal:
+
            docker pull rust:1-bookworm
-       and re-run when that succeeds."
-    fi
-    rm -rf "$anon_dockercfg"
+
+       Then re-run the installer. The image will be cached locally and
+       install.sh will use it via \`docker run\` (which does NOT contact
+       the registry for cached images, so no keychain access)."
   fi
+  log "rust:1-bookworm already cached locally — proceeding with cross-compile" >&2
 
   mkdir -p "$tdir"
   # Run in a Linux Docker container matching the supervisor's runtime arch.
