@@ -3306,7 +3306,11 @@ cmd_approve() {
       done
       if [ -f "$WORKSPACE_POLICY_FILE" ]; then
         local auto_count
-        auto_count=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null || echo 0)
+        # grep -c prints '0' AND exits 1 on no matches; `|| echo 0` would
+        # then append a second '0' making the value multiline. Use wc -l
+        # on the matched lines instead so we get a single integer.
+        auto_count=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null)
+        [ -z "$auto_count" ] && auto_count=0
         if [ "$auto_count" -gt 0 ]; then
           echo
           echo "  $auto_count auto_* rule(s) in $WORKSPACE_POLICY_FILE (persisted approvals)"
@@ -3343,9 +3347,9 @@ cmd_approve() {
       # Also remove auto_* rules from the workspace policy file.
       if [ -f "$WORKSPACE_POLICY_FILE" ]; then
         local before_auto after_auto
-        before_auto=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null || echo 0)
+        before_auto=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null); [ -z "$before_auto" ] && before_auto=0
         auto_policy_remove_all
-        after_auto=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null || echo 0)
+        after_auto=$(grep -cE '^  auto_[a-zA-Z0-9_]+:[[:space:]]*$' "$WORKSPACE_POLICY_FILE" 2>/dev/null);  [ -z "$after_auto" ]  && after_auto=0
         log "removed $((before_auto - after_auto)) auto_* rule(s) from $WORKSPACE_POLICY_FILE"
       fi
       # Hot-reload the now-cleaner policy if the sandbox is running.
