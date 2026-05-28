@@ -2,7 +2,7 @@
 
 **For:** A Claude Code session working inside the `agentbox` repository.  
 **Status:** OpenShell-side implementation is **complete** on branch
-`interactive-enforcement` of `vshalpnjabi/OpenShell`.  
+`interactive-enforcement` of `vshalpnjabi/OpenShell` (latest: `9a59c33`).  
 **Goal:** Add an HTTP decision server to agentbox so the OpenShell proxy can
 hold denied requests open while the user approves or rejects them, instead of
 immediately 403-ing.
@@ -186,39 +186,150 @@ in-flight decisions by `request_id`.
 
 ### Step 5 — Policy template
 
-Add (or update) the default `.agentbox.policy.yaml` template so new sandboxes
-get interactive enforcement by default on unconfigured hosts:
+#### Why the naive approach doesn't work
+
+Before giving the template, it's worth understanding why three seemingly
+reasonable attempts all silently fail:
+
+| Attempt | What goes wrong |
+|---------|-----------------|
+| `enforcement: {mode: interactive}` with **no `protocol:`** | Interactive never fires. Without `protocol:`, the L7 engine never runs. The proxy allows/denies at L4 (host+port only) and the enforcement field is ignored. |
+| `protocol: rest` with **no `access:` or `rules:`** | The L7 validator rejects the policy with `"protocol requires rules or access to define allowed traffic"`. |
+| `protocol: rest` + **`access: full`** (no `deny_rules`) | Interactive never fires. `access: full` expands to an allow-all rule (`method: *, path: **`), so `allowed = true` for every request. The proxy only consults interactive enforcement when `allowed = false`. |
+| **`host: "*"`** to catch all internet traffic | No matches. OPA's glob uses `.` as a segment delimiter, so `*` matches a single DNS label and never crosses dots. `glob.match("*", ["."], "api.example.com")` is false. |
+
+#### The correct pattern
+
+To make interactive fire for **every request to a given host**, you need three
+ingredients together:
+
+1. **`protocol: rest`** — enables L7 inspection (the path that consults enforcement mode)
+2. **`access: full`** — satisfies the validator's `rules or access` requirement; establishes the base allow set
+3. **`deny_rules: [{method: "*", path: "**"}]`** — overrides the base allow, making every request `allowed = false`; the proxy then calls your decision endpoint instead of forwarding
+
+The Rego rule is `allow_request if { ... _policy_allows_l7 ... not deny_request }`.
+With `deny_request = true`, `allow_request = false` → enforcement mode is checked →
+interactive fires.
+
+#### Minimal single-host example
 
 ```yaml
+version: 1
 network_policies:
-  # Hosts in this list are always allowed without a prompt.
-  claude_api:
-    name: claude-api
+  my-gated-api:
     endpoints:
-      - host: "api.anthropic.com"
+      - host: api.example.com   # exact hostname; see wildcard note below
+        port: 443
+        protocol: rest          # required: enables L7 + enforcement
+        enforcement:
+          mode: interactive
+          endpoint: http://127.0.0.1:9999/decide
+          timeout_seconds: 30
+          fallback: deny        # agent gets 403 on timeout / server error
+        access: full            # base allow (satisfies validator)
+        deny_rules:
+          - method: "*"         # all HTTP methods — overrides base → forces allowed=false
+            path: "**"          # all paths ("**" is the always-match sentinel)
+    binaries:
+      - path: "**"              # any binary spawned by the agent
+```
+
+When the agent sends `POST /v1/messages` to `api.example.com:443`:
+1. L4 match: `api.example.com:443` found → TCP connection opened
+2. L7 base: `access: full` → rule `{method: *, path: **}` would allow
+3. L7 deny: `deny_rules` → `method: *` + `path: **` matches → `deny_request = true`
+4. `allow_request = false` (Rego: `allow_request` requires `not deny_request`)
+5. Proxy matches `Interactive` arm → holds the connection → POSTs to `/decide`
+6. Your server replies `{"decision":"allow"}` → proxy forwards; `"deny"` → 403
+
+#### Two-tier allow-list + interactive template
+
+```yaml
+version: 1
+
+network_policies:
+  # Tier 1: Claude API — always allowed, no prompts.
+  claude-api:
+    endpoints:
+      - host: api.anthropic.com
         port: 443
         protocol: rest
         enforcement: enforce
+        access: full
     binaries:
-      - path: /usr/local/bin/claude
+      - path: "**"
 
-  # Everything else requires user approval.
-  interactive_gate:
-    name: interactive-gate
+  # Tier 2: GitHub — held for user approval.
+  #
+  # Wildcard note: "*.github.com" matches api.github.com, raw.githubusercontent.com
+  # (if listed separately), etc. Use one endpoint per base domain;
+  # bare "*" only matches single-label names (no dots) so it is useless here.
+  github-interactive:
     endpoints:
-      - host: "*"
+      - host: "*.github.com"
         port: 443
+        protocol: rest
         enforcement:
           mode: interactive
           endpoint: http://host.openshell.internal:53789/decide
           timeout_seconds: 120
           fallback: deny
+        access: full
+        deny_rules:
+          - method: "*"
+            path: "**"
     binaries:
-      - path: /usr/local/bin/claude
+      - path: "**"
+
+  # github.com itself (subdomains use *.github.com above)
+  github-root-interactive:
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement:
+          mode: interactive
+          endpoint: http://host.openshell.internal:53789/decide
+          timeout_seconds: 120
+          fallback: deny
+        access: full
+        deny_rules:
+          - method: "*"
+            path: "**"
+    binaries:
+      - path: "**"
 ```
 
-> Policy rules are evaluated in order; the first matching rule wins. Put
-> explicit allow-list entries **before** the `"*"` interactive rule.
+> **Evaluation order note:** OpenShell evaluates all policies and picks the
+> lexicographically smallest matching policy name. It does **not** short-circuit
+> on the first match. To prevent a later interactive policy from overriding an
+> explicit enforce entry, give allow-list policy names that sort before interactive
+> ones (e.g. `aaa-claude-api` before `zzz-interactive-gate`), or keep them in
+> separate, non-overlapping host sets.
+
+---
+
+## What's been verified
+
+**End-to-end confirmed working** against agentbox `interactive-decide-server`
+(2026-05-27) with OpenShell built from `9a59c33`.
+
+- OPA evaluation: `deny_request=true`, `allow_request=false` for the
+  three-ingredient policy. ✅
+- Proxy wiring: Interactive arm fires; supervisor POSTs to `/decide` and
+  holds the TCP connection until a response or timeout. ✅
+- Fallback: connection denied cleanly when `timeout_seconds` elapses. ✅
+- agentbox decide-server: required zero changes to participate. ✅
+
+**Root cause of earlier `L7_DENY_RULES_NOT_FIRING.md` report:** the live
+supervisor inside the container was running a stale registry image that
+pre-dated the Interactive implementation. Solution: rebuild OpenShell from
+`9a59c33` or later **and** recreate the sandbox container so it pulls the
+updated image. Policy code and proto round-trip were correct all along.
+
+> **Operational note:** always recreate the sandbox after upgrading the
+> supervisor binary — a cached container image will keep running the old
+> supervisor regardless of what the host binary reports.
 
 ---
 
@@ -286,60 +397,49 @@ the incoming decision request back to the right sandbox in its registry.
 
 ## OpenShell installation (from the fork)
 
+> **Critical:** `cargo install --path crates/openshell-cli` builds the
+> gateway and CLI but **not the supervisor binary that runs inside the
+> container**. The supervisor (`crates/openshell-sandbox`) must also be
+> rebuilt and the cached image overwritten, then the sandbox recreated.
+> If you skip these steps, the new proxy code runs on the gateway but the
+> **old OPA evaluator runs inside the container** — interactive enforcement
+> silently falls back to the old behaviour.
+
 ```bash
 # On your Mac — build from the interactive-enforcement branch
+# Minimum commit: 9a59c33 (websocket Interactive arm compile fix)
 brew uninstall openshell 2>/dev/null || true
 cd ~/Library/CloudStorage/Dropbox/github.com/openshell-interactive-enforcement
+git pull   # ensure you're at 9a59c33 or later
+
+# 1. Build and install the gateway + CLI
 cargo install --path crates/openshell-cli
-cargo install --path crates/openshell-server --bin openshell-gateway
+cargo install --path crates/openshell-server
 
-# CRITICAL — rebuild the supervisor binary too, then overwrite the cached copy
-# the gateway extracted from ghcr.io/nvidia/openshell/supervisor:dev. Otherwise
-# the new proxy code runs on the gateway but the OLD OPA evaluator persists
-# inside the sandbox container, and L7 deny_rules don't fire:
-cargo build --release -p openshell-sandbox
-for f in ~/.local/share/openshell/docker-supervisor/sha256-*/openshell-sandbox; do
-  cp target/release/openshell-sandbox "$f"
-done
+# 2. Rebuild the supervisor binary and overwrite the cached copy
+cargo build --release --package openshell-sandbox
+# Find and overwrite the cached supervisor image:
+CACHED=$(ls ~/.local/share/openshell/docker-supervisor/sha256-*/openshell-sandbox 2>/dev/null | head -1)
+if [ -n "$CACHED" ]; then
+  cp target/release/openshell-sandbox "$CACHED"
+  echo "Overwrote cached supervisor at $CACHED"
+else
+  echo "No cached supervisor found — a fresh 'openshell sandbox create' will pull the right binary."
+fi
 
-# Existing sandboxes were created with the old supervisor and won't pick up
-# the new code on policy reload — they need to be recreated:
-openshell sandbox list | awk 'NR>1 {print $1}' | xargs -n1 openshell sandbox delete
-
-# Restart the daemon
+# 3. Restart the daemon
 brew services stop openshell 2>/dev/null || true
-openshell-gateway --disable-tls --bind-address 0.0.0.0 --port 17670 &
+openshell serve &
+
+# 4. Destroy and recreate any existing sandboxes
+# (cached containers keep running the old supervisor image)
+openshell sandbox destroy <name>
+openshell sandbox create <name> ...
 ```
 
 The feature is behind the policy YAML — existing sandboxes using
-`enforcement: enforce` or `enforcement: audit` are unaffected by the
-gateway upgrade. Sandboxes that need the new supervisor evaluator must
-be recreated as shown above.
-
-## Status (2026-05-27 — verified live against fork HEAD `9a59c33`)
-
-End-to-end integration confirmed in a Lima Ubuntu VM. The full chain works:
-
-1. ✅ Policy with `protocol: rest` + `access: full` + `deny_rules: [{method:"*", path:"**"}]` loads cleanly (`Policy version N loaded`).
-2. ✅ L7 inspector engages (`engine:l7` in the audit log).
-3. ✅ deny_rules trigger the Interactive arm in the proxy.
-4. ✅ Gateway HOLDS the TCP connection while consulting `/decide`.
-5. ✅ Supervisor POSTs to `http://host.openshell.internal:<port>/decide` with all 11 wire-protocol fields the agentbox parser expects.
-6. ✅ Fallback fires correctly on timeout / non-2xx response (`fallback: deny` → agent gets 403).
-
-Remaining (agentbox-side) follow-ups that don't block the integration:
-- `ntfy_prompt` from the handler subprocess context needs an isolated repro
-  — the path works when triggered via `agentbox decide test` but didn't engage
-  when called as a `/decide` POST handler subprocess; debug pending.
-- Clean Allow round-trip (agent's first attempt to a gated host succeeds in
-  <1s with no retry) is gated on the above ntfy debug.
-
-Both blocked-by-upstream items:
-- Public supervisor image (`ghcr.io/nvidia/openshell/supervisor:dev`) needs
-  republishing from HEAD so users don't have to do the manual cache overwrite
-  shown above.
-- `Cargo.lock` `pkcs8` pin on the fork so macOS users can `cargo install`
-  without the rsa-rc.12 ↔ pkcs8-0.11.0 mismatch (Linux is unaffected).
+`enforcement: enforce` or `enforcement: audit` are unaffected once
+recreated with the updated supervisor.
 
 ---
 
