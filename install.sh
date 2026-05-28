@@ -17,26 +17,27 @@
 #   AGENTBOX_SKIP_BREW=1                 Don't auto-install deps via brew; just check.
 #   AGENTBOX_YES=1                       Don't prompt for confirmation on dep install.
 #
-#   AGENTBOX_INTERACTIVE_OPENSHELL=1     Also build openshell from source from the
-#                                        vshalpnjabi/OpenShell interactive-enforcement
-#                                        branch and replace the cached supervisor binary
-#                                        so the fork's L7 held-connection prompt path
-#                                        works out of the box. Without this flag, agentbox
-#                                        installs as usual and the L4-watcher fallback
-#                                        handles unknown hosts (default behavior).
-#   AGENTBOX_REVERT_OPENSHELL=1          Undo a previous AGENTBOX_INTERACTIVE_OPENSHELL=1
-#                                        run: move the fork-built openshell + gateway
-#                                        aside, destroy existing sandboxes, nuke the
-#                                        cached supervisor (gateway re-pulls
-#                                        ghcr.io/nvidia/openshell/supervisor:dev next
-#                                        time), restart the stock daemon. Asks for
-#                                        confirmation before destroying sandboxes unless
-#                                        AGENTBOX_YES=1.
-#   AGENTBOX_OPENSHELL_REPO=…            Override the fork URL (default:
-#                                        https://github.com/vshalpnjabi/OpenShell.git).
-#   AGENTBOX_OPENSHELL_BRANCH=…          Override the fork branch (default:
-#                                        1-interactive-enforcement/vshalpnjabi).
-#   AGENTBOX_OPENSHELL_PREFIX=~/src      Where to clone the fork (default ~/src/openshell-fork).
+#   AGENTBOX_INTERACTIVE_OPENSHELL        Tri-state knob for the openshell install:
+#       unset / empty                       Don't touch openshell (default; agentbox
+#                                           uses whatever stock openshell you have).
+#       1 / true / yes                      Build openshell from source from the
+#                                           vshalpnjabi/OpenShell interactive-enforcement
+#                                           branch and replace the cached supervisor binary
+#                                           so the fork's L7 held-connection prompt path
+#                                           works out of the box.
+#       0 / false / no                      Revert any previous fork install: move the
+#                                           fork-built openshell + gateway aside as
+#                                           .fork-bak (preserved, not deleted), destroy
+#                                           existing sandboxes (asks unless
+#                                           AGENTBOX_YES=1), nuke the cached supervisor
+#                                           (gateway re-pulls supervisor:dev), restart
+#                                           the stock daemon. No-op if no fork binaries
+#                                           are present.
+#   AGENTBOX_OPENSHELL_REPO=…              Override the fork URL (default:
+#                                          https://github.com/vshalpnjabi/OpenShell.git).
+#   AGENTBOX_OPENSHELL_BRANCH=…            Override the fork branch (default:
+#                                          1-interactive-enforcement/vshalpnjabi).
+#   AGENTBOX_OPENSHELL_PREFIX=~/src        Where to clone the fork (default ~/src/openshell-fork).
 
 set -euo pipefail
 
@@ -286,12 +287,14 @@ confirm() {
   return 0   # No tty: default YES for install (the curl-pipe-bash assumption)
 }
 
-# ---- AGENTBOX_REVERT_OPENSHELL=1 — early intercept (no agentbox install needed) ----
-# Revert the openshell stack to its stock (brew/distro) state and exit. The
-# agentbox shim/state is untouched; only the fork-built openshell binaries
-# + supervisor cache are removed.
-case "${AGENTBOX_REVERT_OPENSHELL:-0}" in
-  1|true|yes|on)
+# ---- AGENTBOX_INTERACTIVE_OPENSHELL=0 — early-intercept revert path ----
+# Tri-state semantics on this var:
+#   1/true/yes  → build & install fork (runs later, after agentbox install)
+#   0/false/no  → revert any previous fork install and EXIT (no agentbox
+#                 reinstall needed for revert)
+#   unset/other → don't touch openshell at all (default)
+case "${AGENTBOX_INTERACTIVE_OPENSHELL:-}" in
+  0|false|no|off)
     revert_openshell_interactive
     exit 0
     ;;
@@ -498,7 +501,7 @@ cat <<EOF
   Revert back to stock openshell anytime (moves fork binaries aside, destroys
   sandboxes, restarts the brew/distro daemon):
 
-    AGENTBOX_REVERT_OPENSHELL=1 \\
+    AGENTBOX_INTERACTIVE_OPENSHELL=0 \\
       curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh | bash
 
   Bypass agentbox for one invocation: AGENTBOX_BYPASS=1 claude
