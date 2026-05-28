@@ -2,7 +2,49 @@
 
 All notable changes to agentbox.
 
-## [v0.4.9](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.9) — 2026-05-28
+## [v0.4.10](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.10) — 2026-05-28
+
+End-to-end testing of the fork-only install path on macOS revealed that the openshell `interactive-enforcement` fork has a **fundamental upstream bug** that breaks every subprocess-spawning agent (claude, codex, copilot, opencode, …). This release shelves the fork integration path and brings agentbox back to a clean, working state on stock openshell 0.0.42 — plus documents what we found so future work can pick up where we left off.
+
+### Upstream bug discovered
+
+The fork's supervisor (`crates/openshell-sandbox/src/proxy.rs:1215-1245`) denies any network connection where two PIDs share the same socket inode with different `policy_key()`s. That sounds reasonable in the abstract, but rejects the **most common legitimate case**: a parent agent (e.g. `claude`) opens an API socket, then `fork()`+`exec()`s a subprocess (uv-managed Python, npx, Bash tool, …) that inherits the parent's open sockets via standard POSIX semantics. The supervisor sees `inode N held by PIDs [142, 168]`, attributes them to different binaries, and denies.
+
+The deny log row is also unactionable: `binary=-` and `pid=0` (the supervisor explicitly refuses to attribute the connection), so the L4 watcher can't even display a meaningful approval prompt or persist an `auto_*` rule.
+
+Detailed write-up + suggested fix (relax check when all holders share a root ancestor): `docs/interactive-enforcement/AMBIGUOUS_SHARED_SOCKET_OWNERSHIP_BREAKS_AGENTS.md` in the openshell-interactive-enforcement repo.
+
+### Changes in v0.4.10
+
+- **`AGENTBOX_INTERACTIVE_POLICY` is now opt-IN** (was default-on as of the original v0.4.0 ship). Stock openshell 0.0.42 fails to parse the fork's `enforcement: { mode: interactive, ... }` map with `invalid type: map, expected a string`, refusing to start any sandbox in a workspace that had the default `.agentbox.policy.yaml`. The comment in agentbox.sh claiming "stock silently downgrades the rule" was incorrect — it does NOT downgrade, it fails the parse. Set `AGENTBOX_INTERACTIVE_POLICY=1` explicitly only after the upstream fork is fixed and you're running the fork's gateway.
+  - **If you hit `network_policies.interactive_gate.endpoints.[0].enforcement: invalid type: map`**: `cd` into your workspace and run `agentbox policy reset` (uses the new template without `interactive_gate`), then re-launch your agent.
+
+- **`AGENTBOX_INTERACTIVE_OPENSHELL=1` now prints a clear EXPERIMENTAL warning** explaining the upstream bug, pointing at the bug report, recommending stock + L4-watcher path, and sleeps 5 seconds so the user can see the warning before the build kicks off. The build itself still works (you get fork-built `openshell`, `openshell-gateway`, and cross-compiled Linux `openshell-sandbox`) — what doesn't work is claude on top of it.
+
+- **Removed `swap_brew_openshell_to_fork` and `restore_brew_openshell_from_stock_bak` helpers** introduced in v0.4.9 (never published). They were the "half-fork, half-stock" approach: swap brew binaries with fork while keeping the brew launchd plist. That path is dead — both because we found the brew launchd plist lacks `OPENSHELL_DRIVERS=docker` (stock auto-detects, fork requires explicit), and more importantly because the upstream bug blocks any fork-based path. Revert path is correspondingly simplified.
+
+### Confirmed working on stock 0.0.42
+
+- agentbox L4 watcher path: SIGSTOP + macOS alerter dialog on `DENIED` events ✓
+- pypi/npm auto-allow via `auto_*` rules persisted in workspace `.agentbox.policy.yaml` after first approval ✓
+- mutagen workspace + state sync ✓
+- tmux session wrap ✓
+- decide-server (host-side, bearer-token-auth) — runs default-on but no opps fire under stock since stock never POSTs to `/decide`. Harmless ✓
+
+### Recovery for hosts that ran v0.4.4–v0.4.7's experimental fork-install
+
+`AGENTBOX_INTERACTIVE_OPENSHELL=0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh)"` runs the revert path: moves `~/.cargo/bin/openshell{,-gateway}` to `.fork-bak`, destroys agentbox-managed sandboxes (so they re-pull stock supervisor), wipes the supervisor cache, restarts the brew openshell service. If brew openshell got partially mangled (db migration error, cert mismatch), do a full reset:
+
+```bash
+brew services stop openshell
+mv /opt/homebrew/var/openshell /opt/homebrew/var/openshell.OLD-$(date +%s)
+mv ~/.config/openshell/gateways/openshell ~/.config/openshell/gateways/openshell.OLD-$(date +%s)
+brew uninstall openshell && brew install openshell
+brew services start openshell
+openshell gateway add https://127.0.0.1:17670 --local --name openshell
+```
+
+## [v0.4.9](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.9) — 2026-05-28 (superseded by v0.4.10)
 
 Fix: with `AGENTBOX_INTERACTIVE_OPENSHELL=1`, install.sh now also swaps the Homebrew-installed openshell binaries with the fork build (so the running gateway daemon is the fork, not stock). And the revert path (`=0`) cleanly restores the brew binaries from a `.stock-bak` backup.
 

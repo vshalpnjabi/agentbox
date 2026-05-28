@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Embedded version. Bump when cutting a release; tag the commit as v<version>.
-AGENTBOX_VERSION="0.4.9"
+AGENTBOX_VERSION="0.4.10"
 
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"
@@ -1708,26 +1708,32 @@ network_policies:
       - { path: /usr/bin/ssh }
 YAML
 
-  # Opt-in interactive-enforcement block. Appended only when both
+  # Opt-IN interactive-enforcement block. Appended only when
   # AGENTBOX_INTERACTIVE_POLICY=1 is set AND we can determine the sandbox's
-  # decide-server port. When the openshell `interactive-enforcement` branch
-  # is upstream and shipped in the user's openshell install, this rule lets
-  # ANY denied host be approved on the fly via the alerter/ntfy prompt —
-  # without an L4 reject + retry roundtrip. See:
-  # docs/openshell-interactive-enforcement.md
-  # Default-on for this branch (the whole point of interactive-decide-server
-  # is to ship interactive enforcement). Opt out with
-  # AGENTBOX_NO_INTERACTIVE_POLICY=1 for workspaces that should stay on the
-  # pure L4-watcher path. Stock openshell silently downgrades the rule to
-  # plain `enforce` regardless, so leaving it default-on is harmless there.
-  if ! is_truthy "${AGENTBOX_NO_INTERACTIVE_POLICY:-}"; then
+  # decide-server port. When the openshell `interactive-enforcement` fork
+  # is built + running on the host, this rule lets ANY denied host be
+  # approved on the fly via the alerter/ntfy prompt — without an L4 reject
+  # + retry roundtrip. See: docs/openshell-interactive-enforcement.md
+  #
+  # NOTE: stock openshell (NVIDIA 0.0.42 and earlier) does NOT silently
+  # downgrade the `enforcement: { mode, ... }` map — it FAILS the YAML
+  # parse with `invalid type: map, expected a string`, which makes the
+  # sandbox refuse to start. So this block is off by default and must be
+  # opted into explicitly. The fork upstreaming is also blocked by a
+  # separate issue (ambiguous shared socket ownership denies normal
+  # subprocess patterns) — see the bug report under
+  # ~/.../openshell-interactive-enforcement/docs/interactive-enforcement/.
+  #
+  # When the fork upstream is fixed, flip the default by editing
+  # AGENTBOX_INTERACTIVE_POLICY default below.
+  if is_truthy "${AGENTBOX_INTERACTIVE_POLICY:-}"; then
     local sb port secret
     sb=$(workspace_sandbox_name)
     port=$(decide_server_port_for_sandbox "$sb")
     secret=$(ensure_decide_secret "$sb")
     cat >> "$target" <<YAML
 
-  # ---- interactive enforcement (default-on; AGENTBOX_NO_INTERACTIVE_POLICY=1 to disable) ----
+  # ---- interactive enforcement (opt-in via AGENTBOX_INTERACTIVE_POLICY=1) ----
   #
   # The single endpoint below is a DEMO: it gates *.example.com so you can
   # smoke-test the held-connection flow. To gate real hosts (e.g. your prod

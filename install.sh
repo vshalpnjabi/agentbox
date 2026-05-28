@@ -150,174 +150,6 @@ build_supervisor_for_linux_container() {
   printf '%s\n' "$linux_bin"
 }
 
-# ---- helper: swap brew-installed openshell with the fork binaries ----
-#
-# WHY this is needed beyond just `cp` to ~/.cargo/bin:
-#
-# On macOS, openshell is typically installed via Homebrew, which puts
-# binaries at /opt/homebrew/opt/openshell/bin/{openshell,openshell-gateway}
-# and also installs a launchd plist (~/Library/LaunchAgents/homebrew.
-# mxcl.openshell.plist) that runs openshell-gateway as a background
-# service. PATH puts /opt/homebrew/bin BEFORE ~/.cargo/bin in most
-# shells, AND the launchd plist hardcodes the brew binary path. Result:
-# even after we copy fork binaries to ~/.cargo/bin, the running gateway
-# daemon is still stock 0.0.42 and `which openshell` still returns
-# /opt/homebrew/bin/openshell.
-#
-# This caused a subtle bug where the fork supervisor (correctly running
-# inside sandbox containers) couldn't talk to its gateway because the
-# stock gateway doesn't ship the sandbox-token RPCs the fork supervisor
-# expects, and the sandbox loops on "no sandbox token source available".
-#
-# Fix: replace the brew-installed binaries with the fork binaries (after
-# backing up the originals as .stock-bak), then restart the brew service
-# so launchd picks up the fork gateway. The .stock-bak files let
-# revert_openshell_interactive() restore the original behavior cleanly.
-swap_brew_openshell_to_fork() {
-  # Only meaningful on macOS with brew-installed openshell.
-  [ "$(uname)" = "Darwin" ] || return 0
-  command -v brew >/dev/null 2>&1 || { log "brew not on PATH; skipping brew binary swap"; return 0; }
-  local brew_prefix
-  brew_prefix=$(brew --prefix openshell 2>/dev/null) || true
-  if [ -z "$brew_prefix" ] || [ ! -d "$brew_prefix/bin" ]; then
-    log "brew openshell formula not installed; skipping brew binary swap"
-    return 0
-  fi
-
-  log "swapping brew openshell binaries with fork builds"
-  log "  brew prefix: $brew_prefix"
-
-  # Stop the running stock gateway so we can replace the on-disk binary.
-  # `brew services stop` is idempotent and returns 0 even if not running.
-  if brew services list 2>/dev/null | awk '$1 == "openshell" {print $2}' | grep -q started; then
-    log "  stopping brew openshell service"
-    brew services stop openshell >/dev/null 2>&1 || true
-    sleep 1
-  fi
-
-  # Belt-and-suspenders: orphan stock gateway processes that survived the
-  # service stop (we observed this on at least one Mac during testing).
-  local orphans
-  orphans=$(pgrep -f 'openshell-gateway' || true)
-  if [ -n "$orphans" ]; then
-    log "  killing orphan gateway pids: $orphans"
-    # shellcheck disable=SC2086
-    kill $orphans 2>/dev/null || true
-    sleep 1
-    orphans=$(pgrep -f 'openshell-gateway' || true)
-    if [ -n "$orphans" ]; then
-      # shellcheck disable=SC2086
-      kill -9 $orphans 2>/dev/null || true
-    fi
-  fi
-
-  local swapped=0
-  for bin in openshell openshell-gateway; do
-    local brew_bin="$brew_prefix/bin/$bin"
-    local fork_bin="$HOME/.cargo/bin/$bin"
-    local stock_bak="${brew_bin}.stock-bak"
-
-    [ -f "$fork_bin" ] || { warn "  fork binary missing: $fork_bin (skipping)"; continue; }
-    [ -f "$brew_bin" ] || { warn "  brew binary missing: $brew_bin (skipping)"; continue; }
-
-    # Back up the stock binary the FIRST time only (idempotent). If
-    # .stock-bak already exists, we've swapped before — keep the
-    # original .stock-bak as the canonical pre-fork binary.
-    if [ ! -f "$stock_bak" ]; then
-      chmod u+w "$brew_bin" 2>/dev/null || true
-      cp -p "$brew_bin" "$stock_bak" || err "failed to back up $brew_bin -> $stock_bak"
-      chmod a-w "$stock_bak" 2>/dev/null || true
-      log "  backed up: $brew_bin -> $stock_bak"
-    else
-      log "  stock backup already exists: $stock_bak (keeping original)"
-    fi
-
-    # Replace the brew binary with the fork. Use the same atomic-mv
-    # pattern we use for the supervisor cache (writes to .new, renames
-    # atomically) — never leaves a half-written brew binary on disk.
-    chmod u+w "$brew_bin" 2>/dev/null || true
-    cp "$fork_bin" "${brew_bin}.new" || err "failed to stage ${brew_bin}.new"
-    chmod 555 "${brew_bin}.new"
-    mv -f "${brew_bin}.new" "$brew_bin" || err "failed to atomic-rename ${brew_bin}.new -> $brew_bin"
-    log "  installed fork: $brew_bin"
-    swapped=1
-  done
-
-  if [ "$swapped" = "1" ]; then
-    log "  restarting brew openshell service"
-    brew services start openshell 2>&1 | tail -1 || \
-      warn "  brew services start openshell failed; start it manually"
-    sleep 2
-    local now_running
-    now_running=$(pgrep -f openshell-gateway || true)
-    [ -n "$now_running" ] && ok "  brew service restarted; gateway pid(s): $now_running" || \
-      warn "  no openshell-gateway process running after restart"
-  fi
-}
-
-# ---- helper: restore stock brew openshell binaries from .stock-bak ----
-#
-# Inverse of swap_brew_openshell_to_fork. Restores /opt/homebrew/opt/
-# openshell/bin/{openshell,openshell-gateway} from their .stock-bak
-# siblings, stops/restarts the brew service so launchd picks up stock,
-# then deletes the .stock-bak files (we don't need them anymore — if
-# the user re-runs `AGENTBOX_INTERACTIVE_OPENSHELL=1` we'll back up
-# afresh).
-#
-# Safe to call when no swap was ever performed: it returns 0 if no
-# .stock-bak files are present.
-restore_brew_openshell_from_stock_bak() {
-  [ "$(uname)" = "Darwin" ] || return 0
-  command -v brew >/dev/null 2>&1 || return 0
-  local brew_prefix
-  brew_prefix=$(brew --prefix openshell 2>/dev/null) || return 0
-  [ -d "$brew_prefix/bin" ] || return 0
-
-  # If no .stock-bak files exist, there's nothing to restore.
-  local have_bak=0
-  for bin in openshell openshell-gateway; do
-    [ -f "$brew_prefix/bin/$bin.stock-bak" ] && have_bak=1
-  done
-  [ "$have_bak" = "0" ] && return 0
-
-  log "restoring stock brew openshell binaries from .stock-bak"
-
-  # Stop the running fork gateway so we can swap the binary back.
-  if brew services list 2>/dev/null | awk '$1 == "openshell" {print $2}' | grep -q started; then
-    log "  stopping brew openshell service"
-    brew services stop openshell >/dev/null 2>&1 || true
-    sleep 1
-  fi
-  # Kill any orphan gateway processes.
-  local orphans
-  orphans=$(pgrep -f 'openshell-gateway' || true)
-  if [ -n "$orphans" ]; then
-    # shellcheck disable=SC2086
-    kill $orphans 2>/dev/null || true
-    sleep 1
-  fi
-
-  for bin in openshell openshell-gateway; do
-    local brew_bin="$brew_prefix/bin/$bin"
-    local stock_bak="${brew_bin}.stock-bak"
-    if [ -f "$stock_bak" ]; then
-      chmod u+w "$brew_bin" 2>/dev/null || true
-      chmod u+w "$stock_bak" 2>/dev/null || true
-      mv -f "$stock_bak" "${brew_bin}.new" || err "failed to stage restore of $brew_bin"
-      chmod 555 "${brew_bin}.new"
-      mv -f "${brew_bin}.new" "$brew_bin" || err "failed to atomic-rename restore of $brew_bin"
-      log "  restored stock: $brew_bin"
-    else
-      log "  no .stock-bak for $bin (already stock?)"
-    fi
-  done
-
-  log "  restarting brew openshell service"
-  brew services start openshell 2>&1 | tail -1 || \
-    warn "  brew services start openshell failed; start it manually"
-  sleep 2
-}
-
 # ---- helper: build openshell from the interactive-enforcement fork ----
 #
 # Opt-in via AGENTBOX_INTERACTIVE_OPENSHELL=1. Builds openshell-cli,
@@ -335,7 +167,23 @@ build_openshell_interactive() {
   prefix="${AGENTBOX_OPENSHELL_PREFIX:-$HOME/src}"
   target="$prefix/openshell-fork"
 
-  log "=== building openshell interactive-enforcement fork (opt-in) ==="
+  log "=== building openshell interactive-enforcement fork (opt-in, experimental) ==="
+  warn ""
+  warn "AGENTBOX_INTERACTIVE_OPENSHELL=1 is currently EXPERIMENTAL and breaks"
+  warn "claude (and any agent that spawns subprocesses) due to an upstream"
+  warn "bug in the fork's supervisor: 'ambiguous shared socket ownership'"
+  warn "denies any network connection from a process that fork+exec'd a child."
+  warn ""
+  warn "Bug report: openshell-interactive-enforcement/docs/interactive-"
+  warn "  enforcement/AMBIGUOUS_SHARED_SOCKET_OWNERSHIP_BREAKS_AGENTS.md"
+  warn ""
+  warn "Recommended path: stay on stock openshell (default). agentbox's L4"
+  warn "watcher path (SIGSTOP + macOS dialog on denies) works well and is"
+  warn "what the rest of agentbox is built around."
+  warn ""
+  warn "Continuing in 5 seconds — this build will succeed, but claude won't"
+  warn "work end-to-end until the upstream bug is fixed."
+  sleep 5
 
   # ---- platform-specific build deps ----
   local missing_build=()
@@ -482,10 +330,6 @@ build_openshell_interactive() {
     log "    agentbox destroy <each-sandbox>   # so containers pick up the new binary"
   fi
 
-  # ---- swap brew openshell binaries with fork (so `which openshell` + the
-  # running daemon are both the fork, not stock from Homebrew) ----
-  swap_brew_openshell_to_fork
-
   ok "openshell fork installed (head $head_sha)"
   echo
   warn "Existing sandboxes are running the OLD supervisor. To pick up the new"
@@ -507,25 +351,11 @@ revert_openshell_interactive() {
 
   local fork_cli="$HOME/.cargo/bin/openshell"
   local fork_gw="$HOME/.cargo/bin/openshell-gateway"
-  local brew_prefix=""
-  command -v brew >/dev/null 2>&1 && brew_prefix=$(brew --prefix openshell 2>/dev/null) || true
-  local have_brew_swap=0
-  if [ -n "$brew_prefix" ]; then
-    for bin in openshell openshell-gateway; do
-      [ -f "$brew_prefix/bin/$bin.stock-bak" ] && have_brew_swap=1
-    done
-  fi
-  if [ ! -f "$fork_cli" ] && [ ! -f "$fork_gw" ] && [ "$have_brew_swap" = "0" ]; then
-    warn "no fork-built openshell binaries in \$HOME/.cargo/bin and no"
-    warn ".stock-bak files in $brew_prefix/bin — nothing to revert."
+  if [ ! -f "$fork_cli" ] && [ ! -f "$fork_gw" ]; then
+    warn "no fork-built openshell binaries in \$HOME/.cargo/bin — nothing to revert."
     warn "If stock openshell already on PATH, you're done."
     return 0
   fi
-
-  # Restore the brew-installed openshell binaries from .stock-bak FIRST,
-  # before we move the fork binaries aside. This stops the brew service,
-  # swaps the binaries back, and restarts the service running stock.
-  restore_brew_openshell_from_stock_bak
 
   # Move the fork binaries aside so PATH falls through to stock if the
   # user has $HOME/.cargo/bin earlier in PATH than brew. Don't delete
