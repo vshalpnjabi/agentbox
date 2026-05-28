@@ -2,6 +2,34 @@
 
 All notable changes to agentbox.
 
+## [v0.4.9](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.9) — 2026-05-28
+
+Fix: with `AGENTBOX_INTERACTIVE_OPENSHELL=1`, install.sh now also swaps the Homebrew-installed openshell binaries with the fork build (so the running gateway daemon is the fork, not stock). And the revert path (`=0`) cleanly restores the brew binaries from a `.stock-bak` backup.
+
+### Why this was needed beyond `cp` to `~/.cargo/bin`
+
+On macOS, Homebrew installs openshell to `/opt/homebrew/opt/openshell/bin/{openshell,openshell-gateway}` and registers a launchd service (`~/Library/LaunchAgents/homebrew.mxcl.openshell.plist`) that auto-starts the gateway on login. Two problems with our previous install:
+
+1. PATH puts `/opt/homebrew/bin` BEFORE `~/.cargo/bin` in most shells, so `which openshell` returned the stock binary even though the fork was installed.
+2. The launchd plist hardcodes the brew binary path, so the running gateway daemon was stock 0.0.42 — even after the fork was built.
+
+Symptom: sandbox containers ran the fork supervisor (good — the cache overwrite from v0.4.4–v0.4.8 worked) but the supervisor couldn't talk to the gateway because stock 0.0.42 doesn't ship the sandbox-token RPCs the fork supervisor expects. The sandbox loops on `no sandbox token source available — set one of OPENSHELL_SANDBOX_TOKEN, OPENSHELL_SANDBOX_TOKEN_FILE, or OPENSHELL_K8S_SA_TOKEN_FILE`.
+
+### What v0.4.9 does
+
+Two new helpers in install.sh:
+
+- **`swap_brew_openshell_to_fork`** — called at the end of `build_openshell_interactive`. Stops the brew service, kills any orphan gateway processes, backs up `/opt/homebrew/opt/openshell/bin/{openshell,openshell-gateway}` to `.stock-bak` (idempotent — first run only), atomic-renames the fork binaries from `~/.cargo/bin/` over the brew paths, restarts the brew service. Now `which openshell` and the running daemon are both the fork.
+- **`restore_brew_openshell_from_stock_bak`** — called early in `revert_openshell_interactive`. Stops the brew service, atomic-renames `.stock-bak` files back to the brew paths, restarts the brew service. The fork binaries in `~/.cargo/bin/` are still moved aside to `.fork-bak` afterward (as before).
+
+Both helpers are no-ops on non-macOS hosts and when brew openshell isn't installed.
+
+### Known limitation: sandbox JWT issuance
+
+Even with the fork gateway running, the fork sandbox supervisor still reports `no sandbox token source available` because the gateway needs a JWT signing key configured to mint per-sandbox tokens. The stock launchd plist doesn't set the JWT-key env vars the fork expects, and the existing certgen run by `brew install openshell` only produced the stock cert bundle (mTLS pair, no JWT signing keypair).
+
+This is an upstream fork-configuration gap, not an agentbox bug. Workaround: run the fork gateway's `generate-certs` to produce a cert bundle including JWT keys, then point the launchd plist at the new bundle. We'll fix this in a follow-up release once we've validated the right config path.
+
 ## [v0.4.8](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.8) — 2026-05-28
 
 Fix: supervisor cache update on macOS now uses atomic `mv` instead of in-place `cp`, defeating Docker Desktop's FS-cache-by-inode behavior.
