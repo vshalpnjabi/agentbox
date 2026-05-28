@@ -2,6 +2,12 @@
 
 All notable changes to agentbox.
 
+## [v0.4.2](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.2) — 2026-05-28
+
+Hotfix for the `AGENTBOX_INTERACTIVE_OPENSHELL=1` install path on macOS.
+
+- **`cargo install --path crates/openshell-server` failed with E0308 on macOS even though `cargo build` succeeded.** `cargo install --path` does its own dep resolution and ignores the workspace's `Cargo.lock` unless `--locked` is passed — which on macOS causes the long-standing rsa-0.10.0-rc.12 ↔ pkcs8 enum-variant mismatch to re-emerge, even though upstream's `Cargo.lock` pins `pkcs8=0.11.0-rc.11` specifically to avoid it. Fix: drop `cargo install` for both binaries (CLI and gateway) and just `install -m 755 target/release/openshell{,-gateway} $HOME/.cargo/bin/` after the workspace-locked `cargo build --release` step that already ran. Deterministic, ignores cargo's per-package resolver entirely. Same end state.
+
 ## [v0.4.1](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.1) — 2026-05-28
 
 Hotfix for the install one-liner documented in v0.4.0.

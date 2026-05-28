@@ -139,12 +139,18 @@ build_openshell_interactive() {
       -p openshell-cli -p openshell-server -p openshell-sandbox ) || \
     err "openshell build failed"
 
-  # ---- install CLI + gateway to ~/.cargo/bin ----
-  log "installing openshell + openshell-gateway to \$HOME/.cargo/bin"
-  ( cd "$target" && cargo install --path crates/openshell-cli    --bin openshell         --offline --force ) 2>&1 | tail -2 || \
-    err "cargo install openshell-cli failed"
-  ( cd "$target" && cargo install --path crates/openshell-server --bin openshell-gateway --offline --force ) 2>&1 | tail -2 || \
-    err "cargo install openshell-gateway failed"
+  # ---- install CLI + gateway to ~/.cargo/bin via direct copy ----
+  # We deliberately avoid `cargo install --path` here. `cargo install` does
+  # its own dep resolution and ignores the workspace's Cargo.lock unless
+  # `--locked` is passed — which on macOS causes the rsa-0.10.0-rc.12
+  # ↔ pkcs8 enum-variant mismatch to re-emerge (E0308) even though the
+  # workspace lock pins pkcs8=0.11.0-rc.11 to avoid exactly this. The
+  # binaries were already built by the `cargo build --release` step
+  # above with the workspace's locked deps, so we just copy them.
+  log "installing openshell + openshell-gateway to \$HOME/.cargo/bin (direct copy)"
+  mkdir -p "$HOME/.cargo/bin"
+  install -m 755 "$target/target/release/openshell"         "$HOME/.cargo/bin/openshell"         || err "copy openshell failed"
+  install -m 755 "$target/target/release/openshell-gateway" "$HOME/.cargo/bin/openshell-gateway" || err "copy openshell-gateway failed"
 
   # ---- overwrite cached supervisor (created by the gateway on first run) ----
   local cache="$HOME/.local/share/openshell/docker-supervisor"
