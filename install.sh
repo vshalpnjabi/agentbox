@@ -24,6 +24,14 @@
 #                                        works out of the box. Without this flag, agentbox
 #                                        installs as usual and the L4-watcher fallback
 #                                        handles unknown hosts (default behavior).
+#   AGENTBOX_REVERT_OPENSHELL=1          Undo a previous AGENTBOX_INTERACTIVE_OPENSHELL=1
+#                                        run: move the fork-built openshell + gateway
+#                                        aside, destroy existing sandboxes, nuke the
+#                                        cached supervisor (gateway re-pulls
+#                                        ghcr.io/nvidia/openshell/supervisor:dev next
+#                                        time), restart the stock daemon. Asks for
+#                                        confirmation before destroying sandboxes unless
+#                                        AGENTBOX_YES=1.
 #   AGENTBOX_OPENSHELL_REPO=…            Override the fork URL (default:
 #                                        https://github.com/vshalpnjabi/OpenShell.git).
 #   AGENTBOX_OPENSHELL_BRANCH=…          Override the fork branch (default:
@@ -161,6 +169,102 @@ build_openshell_interactive() {
   warn "    # then 'claude' in that workspace will recreate"
 }
 
+# ---- helper: revert openshell back to the stock (brew/distro) install ----
+#
+# Inverse of build_openshell_interactive: move the fork-built binaries aside
+# so PATH lookup hits the stock ones again, destroy any sandboxes that are
+# running the fork's supervisor, blow away the supervisor cache (gateway
+# will re-pull ghcr.io/nvidia/openshell/supervisor:dev), and restart the
+# stock daemon on macOS. Refuses if there's nothing to revert.
+revert_openshell_interactive() {
+  log "=== reverting fork-built openshell back to stock ==="
+
+  local fork_cli="$HOME/.cargo/bin/openshell"
+  local fork_gw="$HOME/.cargo/bin/openshell-gateway"
+  if [ ! -f "$fork_cli" ] && [ ! -f "$fork_gw" ]; then
+    warn "no fork-built openshell binaries found in \$HOME/.cargo/bin —"
+    warn "nothing to revert. If stock openshell already on PATH, you're done."
+    return 0
+  fi
+
+  # Move the fork binaries aside so PATH falls through to stock. Don't
+  # delete outright — keep them as .fork-bak in case the user wants to
+  # flip back without rebuilding.
+  if [ -f "$fork_cli" ]; then
+    mv -f "$fork_cli" "${fork_cli}.fork-bak"
+    log "moved fork CLI to ${fork_cli}.fork-bak"
+  fi
+  if [ -f "$fork_gw" ]; then
+    mv -f "$fork_gw" "${fork_gw}.fork-bak"
+    log "moved fork gateway to ${fork_gw}.fork-bak"
+  fi
+
+  # Destroy existing sandboxes (they have the fork's supervisor binary
+  # baked into their container layer, so new policy decisions would use
+  # old code if we leave them running).
+  local sandboxes=""
+  if command -v openshell >/dev/null 2>&1; then
+    sandboxes=$(openshell sandbox list 2>/dev/null | awk 'NR>1 && $1 ~ /^agentbox-/ {print $1}' || true)
+  fi
+  if [ -n "$sandboxes" ]; then
+    log "agentbox-managed sandboxes that will be destroyed:"
+    printf '    %s\n' $sandboxes
+    if confirm "Destroy these sandboxes now?"; then
+      for sb in $sandboxes; do
+        if [ -x "$HOME/.local/share/agentbox/bin/agentbox" ]; then
+          "$HOME/.local/share/agentbox/bin/agentbox" destroy "$sb" 2>&1 | tail -1
+        else
+          openshell sandbox delete "$sb" 2>&1 | tail -1
+        fi
+      done
+    else
+      warn "skipped sandbox destroy; you can run agentbox destroy <name> manually later"
+    fi
+  fi
+
+  # Nuke the supervisor cache so the gateway re-extracts from the
+  # published image on the next sandbox launch.
+  local cache="$HOME/.local/share/openshell/docker-supervisor"
+  if [ -d "$cache" ]; then
+    log "removing cached supervisor binaries at $cache"
+    rm -rf "$cache"
+  fi
+
+  # Stop any running gateway so the next start picks up the stock binary.
+  case "$(uname)" in
+    Darwin)
+      if command -v brew >/dev/null 2>&1; then
+        log "restarting brew openshell service"
+        brew services stop openshell 2>&1 | tail -1 || true
+        sleep 1
+        brew services start openshell 2>&1 | tail -1 || \
+          warn "brew services start openshell failed; run it manually"
+      else
+        warn "brew not on PATH; start the stock daemon manually"
+      fi
+      ;;
+    Linux)
+      log "stopping any running openshell-gateway"
+      pkill -f openshell-gateway 2>/dev/null || true
+      warn "Restart your distro's openshell service manually if you have one"
+      ;;
+  esac
+
+  # rehash so subsequent `openshell` lookups find the stock binary
+  hash -r 2>/dev/null || true
+
+  ok "revert complete"
+  echo
+  log "verify with:"
+  log "    which openshell           # should NOT be \$HOME/.cargo/bin/openshell"
+  log "    openshell --version       # should match your stock install (e.g. brew 0.0.42)"
+  log
+  log "fork binaries are preserved at:"
+  log "    ${fork_cli}.fork-bak"
+  log "    ${fork_gw}.fork-bak"
+  log "Remove them with 'rm \$HOME/.cargo/bin/openshell*.fork-bak' if you want them gone."
+}
+
 # ---- platform check ----
 case "$(uname)" in
   Darwin) ;;
@@ -181,6 +285,17 @@ confirm() {
   fi
   return 0   # No tty: default YES for install (the curl-pipe-bash assumption)
 }
+
+# ---- AGENTBOX_REVERT_OPENSHELL=1 — early intercept (no agentbox install needed) ----
+# Revert the openshell stack to its stock (brew/distro) state and exit. The
+# agentbox shim/state is untouched; only the fork-built openshell binaries
+# + supervisor cache are removed.
+case "${AGENTBOX_REVERT_OPENSHELL:-0}" in
+  1|true|yes|on)
+    revert_openshell_interactive
+    exit 0
+    ;;
+esac
 
 # ---- detect mode ----
 # We're in "local" mode IFF we were invoked as a real file (not via bash -c)
@@ -379,6 +494,12 @@ cat <<EOF
   cached supervisor binary. After that, every new workspace's sandbox uses the
   L7 held-connection prompt path by default (opt out per-workspace with
   AGENTBOX_NO_INTERACTIVE_POLICY=1).
+
+  Revert back to stock openshell anytime (moves fork binaries aside, destroys
+  sandboxes, restarts the brew/distro daemon):
+
+    AGENTBOX_REVERT_OPENSHELL=1 \\
+      curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh | bash
 
   Bypass agentbox for one invocation: AGENTBOX_BYPASS=1 claude
 
