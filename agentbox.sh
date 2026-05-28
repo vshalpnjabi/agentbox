@@ -229,15 +229,31 @@ watcher_call_decide_server() {
     --arg rid "watcher-$(date +%s%N 2>/dev/null || date +%s)" \
     '{schema_version:1, request_id:$rid, sandbox_name:$sb, host:$host, port:$port, binary:$bin, pid:$pid, source:$src}') || return 1
 
+  # Bearer token must match what the decide-server was started with (and
+  # what the policy YAML's `secret:` field carries). Without it the
+  # server returns 401 and we'd fail-closed. Reading the file on every
+  # call is cheap and means a secret rotation takes effect immediately.
+  local secret=""
+  [ -f "$(decide_server_secret_file "$sandbox")" ] && \
+    secret=$(cat "$(decide_server_secret_file "$sandbox")" 2>/dev/null || true)
+
   # Timeout slightly longer than prompt_approval's internal 300s. If the
   # call fails (server died, network blocked), curl exits non-zero, we
   # return non-zero. Watcher's caller treats failure as a terminal Deny
   # (agent unfrozen, gets the original 403 from openshell — same as if
   # the user had clicked Deny manually).
-  curl -fsS --max-time 360 -X POST \
-    -H "Content-Type: application/json" \
-    --data "$body" \
-    "http://127.0.0.1:$srv_port/decide" 2>/dev/null
+  if [ -n "$secret" ]; then
+    curl -fsS --max-time 360 -X POST \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $secret" \
+      --data "$body" \
+      "http://127.0.0.1:$srv_port/decide" 2>/dev/null
+  else
+    curl -fsS --max-time 360 -X POST \
+      -H "Content-Type: application/json" \
+      --data "$body" \
+      "http://127.0.0.1:$srv_port/decide" 2>/dev/null
+  fi
 }
 
 # Look up the LAST decision for a (binary, host, port) tuple across both
@@ -1142,10 +1158,40 @@ cmd_watch_internal() {
 # Currently opt-in via AGENTBOX_DECIDE_SERVER=1 — defaults off until openshell
 # Interactive mode actually exists upstream.
 
-decide_server_pid_file()  { echo "$(watcher_state_dir "$1")/decide-server.pid"; }
-decide_server_port_file() { echo "$(watcher_state_dir "$1")/decide-server.port"; }
-decide_server_log_file()  { echo "$(watcher_state_dir "$1")/decide-server.log"; }
-decide_server_seen_file() { echo "$(watcher_state_dir "$1")/decide-seen.txt"; }
+decide_server_pid_file()    { echo "$(watcher_state_dir "$1")/decide-server.pid"; }
+decide_server_port_file()   { echo "$(watcher_state_dir "$1")/decide-server.port"; }
+decide_server_log_file()    { echo "$(watcher_state_dir "$1")/decide-server.log"; }
+decide_server_seen_file()   { echo "$(watcher_state_dir "$1")/decide-seen.txt"; }
+decide_server_secret_file() { echo "$(watcher_state_dir "$1")/decide-secret.txt"; }
+
+# Per-sandbox shared bearer token for openshell ↔ decide-server auth.
+# Created once on first call, persisted at decide-secret.txt (mode 600).
+# Both the policy YAML (`secret:` field on each interactive endpoint)
+# and the python decide-server (`--secret-file` arg) read the same file —
+# single source of truth. The L4 watcher's own POSTs include it too so
+# the server can't tell them apart from openshell's, but it can reject
+# any other origin.
+ensure_decide_secret() {
+  local sandbox="$1"
+  local f
+  f=$(decide_server_secret_file "$sandbox")
+  if [ -s "$f" ]; then
+    cat "$f"
+    return 0
+  fi
+  mkdir -p "$(dirname "$f")"
+  local secret
+  if command -v openssl >/dev/null 2>&1; then
+    secret=$(openssl rand -hex 32)
+  elif command -v xxd >/dev/null 2>&1; then
+    secret=$(head -c 32 /dev/urandom | xxd -p -c 64)
+  else
+    secret=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  fi
+  printf '%s\n' "$secret" > "$f"
+  chmod 600 "$f"
+  printf '%s' "$secret"
+}
 
 # Resolve the directory of agentbox.sh, following symlinks (portable across
 # macOS where readlink(1) lacks -f). $AGB_ROOT/agentbox.sh is a symlink into
@@ -1250,6 +1296,13 @@ decide_server_ensure() {
   # only do this on trusted networks until the auth story is settled.
   local bind="${AGENTBOX_DECIDE_BIND:-127.0.0.1}"
 
+  # Ensure the per-sandbox shared secret exists; same file is referenced
+  # from the policy YAML's `secret:` field so the openshell gateway and the
+  # decide-server agree on the bearer token.
+  ensure_decide_secret "$sandbox" >/dev/null
+  local secret_file
+  secret_file=$(decide_server_secret_file "$sandbox")
+
   log "starting decide-server for $sandbox on ${bind}:${port}"
   nohup python3 "$py" \
     --port "$port" \
@@ -1257,6 +1310,7 @@ decide_server_ensure() {
     --sandbox "$sandbox" \
     --handler "$handler" \
     --pid-file "$pf" \
+    --secret-file "$secret_file" \
     >"$log_file" 2>&1 &
   disown 2>/dev/null || true
 
@@ -1667,9 +1721,10 @@ YAML
   # pure L4-watcher path. Stock openshell silently downgrades the rule to
   # plain `enforce` regardless, so leaving it default-on is harmless there.
   if ! is_truthy "${AGENTBOX_NO_INTERACTIVE_POLICY:-}"; then
-    local sb port
+    local sb port secret
     sb=$(workspace_sandbox_name)
     port=$(decide_server_port_for_sandbox "$sb")
+    secret=$(ensure_decide_secret "$sb")
     cat >> "$target" <<YAML
 
   # ---- interactive enforcement (default-on; AGENTBOX_NO_INTERACTIVE_POLICY=1 to disable) ----
@@ -1713,6 +1768,7 @@ YAML
           endpoint: http://host.openshell.internal:${port}/decide
           timeout_seconds: 120
           fallback: deny
+          secret: ${secret}
         access: full
         deny_rules:
           - method: "*"
@@ -2248,7 +2304,17 @@ cmd_decide_test() {
     '{schema_version:1, request_id:$rid, host:$host, port:$port, binary:$binary, pid:0, method:"GET", path:"/", protocol:"rest", policy_name:"manual_test", sandbox_name:$sb}')
 
   log "POST http://127.0.0.1:$srv_port/decide  $binary -> $host:$port"
-  curl -fsS -X POST -H "Content-Type: application/json" --data "$body" "http://127.0.0.1:$srv_port/decide"
+  local secret=""
+  [ -f "$(decide_server_secret_file "$sandbox")" ] && \
+    secret=$(cat "$(decide_server_secret_file "$sandbox")" 2>/dev/null || true)
+  if [ -n "$secret" ]; then
+    curl -fsS -X POST \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $secret" \
+      --data "$body" "http://127.0.0.1:$srv_port/decide"
+  else
+    curl -fsS -X POST -H "Content-Type: application/json" --data "$body" "http://127.0.0.1:$srv_port/decide"
+  fi
   echo
 }
 

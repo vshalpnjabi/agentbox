@@ -34,12 +34,34 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _consteq(a: str, b: str) -> bool:
+    # hmac.compare_digest is constant-time over equal-length inputs;
+    # short-circuits cleanly when lengths differ (still safe).
+    import hmac
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
 class DecideHandler(BaseHTTPRequestHandler):
     handler_cmd: list = []
     sandbox_name: str = ""
+    expected_secret: str = ""  # populated from --secret-file at startup
 
     def log_message(self, fmt, *args):
         _log(fmt % args)
+
+    def _auth_ok(self) -> bool:
+        # No secret configured → backwards-compat (allow unauthenticated).
+        # In production agentbox writes a per-sandbox secret on first
+        # decide_server_ensure, so this empty branch is mostly a defense
+        # for `decide test` invocations that may pre-date the secret.
+        if not self.expected_secret:
+            return True
+        hdr = self.headers.get("Authorization", "")
+        if not hdr.startswith("Bearer "):
+            return False
+        token = hdr[len("Bearer "):].strip()
+        # Constant-time compare to avoid leaking secret length via timing.
+        return _consteq(token, self.expected_secret)
 
     def _reply_json(self, status: int, body: dict) -> None:
         data = json.dumps(body).encode("utf-8")
@@ -68,6 +90,13 @@ class DecideHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/decide":
             self._reply_text(404, "not found\n")
+            return
+
+        if not self._auth_ok():
+            # 401 makes the openshell proxy treat this as an error and apply
+            # `fallback: deny` (cleaner than letting the handler run). The
+            # body is for human debuggers.
+            self._reply_json(401, {"decision": "deny", "reason": "invalid bearer token"})
             return
 
         try:
@@ -146,6 +175,12 @@ def main() -> int:
         help="Shell command invoked per request with JSON on stdin (must print JSON to stdout)",
     )
     ap.add_argument("--pid-file", help="Write own PID to this file")
+    ap.add_argument(
+        "--secret-file",
+        help="Path to a file holding the shared bearer token. Required-Authorization "
+             "for every POST /decide. Omitted/missing/empty file → unauthenticated mode "
+             "(backwards compat; not recommended).",
+    )
     args = ap.parse_args()
 
     # The handler is a shell command line; let /bin/sh parse it.
@@ -153,6 +188,19 @@ def main() -> int:
 
     DecideHandler.handler_cmd = handler_cmd
     DecideHandler.sandbox_name = args.sandbox
+
+    expected_secret = ""
+    if args.secret_file:
+        try:
+            with open(args.secret_file, "r") as f:
+                expected_secret = f.read().strip()
+        except OSError as e:
+            _log(f"could not read --secret-file {args.secret_file}: {e}; running unauthenticated")
+    DecideHandler.expected_secret = expected_secret
+    if expected_secret:
+        _log(f"bearer-token auth enabled (secret loaded from {args.secret_file})")
+    else:
+        _log("bearer-token auth DISABLED (no --secret-file or empty); accepting any POST")
 
     if args.pid_file:
         try:
