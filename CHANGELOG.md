@@ -2,6 +2,18 @@
 
 All notable changes to agentbox.
 
+## [v0.4.6](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.6) — 2026-05-28
+
+Refinement of the v0.4.5 Docker-pull fix.
+
+v0.4.5 explicitly pre-pulled `rust:1-bookworm` so a credential-helper failure surfaced clearly, but still required the user to either unlock their keychain (`security -v unlock-keychain ...`) or take Docker out of the credsStore loop. That's friction.
+
+v0.4.6 just stops calling the credential helper for this one pull. `rust:1-bookworm` is a public image and anonymous pull is allowed — the only reason Docker contacts the keychain is that `~/.docker/config.json` has `credsStore: osxkeychain` set globally, which routes all pulls through the helper even when no auth is needed.
+
+Fix: pre-pull with `docker --config <empty-tmpdir> pull rust:1-bookworm`. The empty config has no `credsStore`, so Docker doesn't ask the keychain helper and does a plain anonymous pull. We `rm -rf` the temp config after the pull. The user's real `~/.docker/config.json` is untouched, future `docker login` works exactly as before.
+
+If the pull still fails, it's now genuinely a network/connectivity problem (Docker Hub outage, firewall, VPN, rate limit) and the error message says so.
+
 ## [v0.4.5](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.5) — 2026-05-28
 
 Two hotfixes for v0.4.4 macOS installs.

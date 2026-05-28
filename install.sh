@@ -86,30 +86,37 @@ build_supervisor_for_linux_container() {
   # corrupt the returned path. Don't lose this >&2 redirect.
   log "cross-compiling openshell-sandbox for $platform via Docker (~5-10 min first time)" >&2
 
-  # ---- pre-pull the toolchain image so the credential helper error
-  # surface stays out of the build's stderr noise ----
+  # ---- pre-pull the toolchain image ANONYMOUSLY so the keychain credential
+  # helper is never invoked ----
   #
-  # On macOS with Docker Desktop, even an anonymous pull of a public image
-  # calls `docker-credential-osxkeychain` to look up Docker Hub creds. If
-  # the user's login keychain is locked (common in non-TTY-friendly contexts
-  # like `bash -c "$(curl ...)"`), the helper errors with:
-  #   "keychain cannot be accessed because the current session does not
-  #    allow user interaction"
-  # …and `docker run` exits before the cargo build ever starts. Doing the
-  # pull explicitly here lets us catch that one specific failure and give
-  # the user a one-line copy-paste fix instead of a cryptic stack trace.
+  # rust:1-bookworm is a public Docker Hub image and anonymous pulls of it
+  # are explicitly allowed. But Docker Desktop on macOS ships with
+  # `~/.docker/config.json` containing `"credsStore": "osxkeychain"`, which
+  # makes EVERY pull (anonymous or not) call docker-credential-osxkeychain
+  # to look up Docker Hub creds first. In a non-TTY-friendly context
+  # (e.g. `bash -c "$(curl ...)"` from a fresh shell) that helper can't
+  # unlock the keychain and exits 1 — Docker treats helper failure as
+  # fatal and the pull never happens.
+  #
+  # We work around this by pointing Docker at an EMPTY config directory
+  # for just this pull. No credsStore set in there → no helper invoked →
+  # plain anonymous pull. Doesn't touch the user's real ~/.docker/config.json
+  # or affect any future `docker login` they do.
   if ! docker image inspect rust:1-bookworm >/dev/null 2>&1; then
-    log "pulling rust:1-bookworm Docker image (~1.5GB; one-time)" >&2
-    if ! docker pull --platform "$platform" rust:1-bookworm >&2; then
-      err "docker pull rust:1-bookworm failed. If you saw a 'keychain cannot be accessed' error,
-       run:
-           security -v unlock-keychain ~/Library/Keychains/login.keychain-db
-       (you'll be prompted for your macOS login password), then re-run:
-           AGENTBOX_INTERACTIVE_OPENSHELL=1 bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh)\"
-
-       Alternative: pull the image manually in your terminal first, then re-run:
-           docker pull rust:1-bookworm"
+    log "pulling rust:1-bookworm Docker image anonymously (~1.5GB; one-time)" >&2
+    local anon_dockercfg
+    anon_dockercfg=$(mktemp -d -t agentbox-dockercfg.XXXXXX) || \
+      err "could not create temp Docker config dir for anonymous pull"
+    printf '{}\n' > "$anon_dockercfg/config.json"
+    if ! docker --config "$anon_dockercfg" pull --platform "$platform" rust:1-bookworm >&2; then
+      rm -rf "$anon_dockercfg"
+      err "docker pull rust:1-bookworm failed even with anonymous config.
+       This is unusual — likely a network/connectivity issue (Docker Hub down,
+       firewall, VPN, rate limit). Try pulling manually in your terminal:
+           docker pull rust:1-bookworm
+       and re-run when that succeeds."
     fi
+    rm -rf "$anon_dockercfg"
   fi
 
   mkdir -p "$tdir"
