@@ -1661,13 +1661,18 @@ YAML
   # ANY denied host be approved on the fly via the alerter/ntfy prompt —
   # without an L4 reject + retry roundtrip. See:
   # docs/openshell-interactive-enforcement.md
-  if is_truthy "${AGENTBOX_INTERACTIVE_POLICY:-}"; then
+  # Default-on for this branch (the whole point of interactive-decide-server
+  # is to ship interactive enforcement). Opt out with
+  # AGENTBOX_NO_INTERACTIVE_POLICY=1 for workspaces that should stay on the
+  # pure L4-watcher path. Stock openshell silently downgrades the rule to
+  # plain `enforce` regardless, so leaving it default-on is harmless there.
+  if ! is_truthy "${AGENTBOX_NO_INTERACTIVE_POLICY:-}"; then
     local sb port
     sb=$(workspace_sandbox_name)
     port=$(decide_server_port_for_sandbox "$sb")
     cat >> "$target" <<YAML
 
-  # ---- interactive enforcement (opt-in via AGENTBOX_INTERACTIVE_POLICY=1) ----
+  # ---- interactive enforcement (default-on; AGENTBOX_NO_INTERACTIVE_POLICY=1 to disable) ----
   #
   # The single endpoint below is a DEMO: it gates *.example.com so you can
   # smoke-test the held-connection flow. To gate real hosts (e.g. your prod
