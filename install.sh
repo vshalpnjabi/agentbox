@@ -280,17 +280,37 @@ build_openshell_interactive() {
   [ -f "$supervisor_src" ] || err "supervisor source missing: $supervisor_src"
 
   # ---- overwrite cached supervisor (created by the gateway on first run) ----
+  #
+  # We deliberately do NOT use `cp -f "$src" "$dst"` here. On macOS,
+  # Docker Desktop's filesystem layer (VirtioFS / gRPC FUSE) caches
+  # bind-mount source contents by INODE inside the Linux VM. An
+  # in-place `cp -f` reuses the existing inode, so the VM keeps serving
+  # the OLD content to any container that mounts this path — even
+  # AFTER the host file on disk is correct. Symptom: sandbox container
+  # reports `exec /opt/openshell/bin/openshell-sandbox: exec format
+  # error` because it's still reading the previous (wrong-arch) binary
+  # through the FS cache, even though `file <hostpath>` on the host
+  # shows the new binary perfectly.
+  #
+  # Writing to a .new sibling and atomic-renaming gives the destination
+  # a NEW inode, which forces Docker Desktop's FS cache to refresh on
+  # next read. Linux hosts don't have this caching issue but the
+  # write-then-rename pattern is still safer (atomic update; no
+  # half-written file ever visible at the target path).
   local cache="$HOME/.local/share/openshell/docker-supervisor"
   if compgen -G "$cache/sha256-*/openshell-sandbox" > /dev/null; then
     log "overwriting cached supervisor binary in $cache/sha256-*/openshell-sandbox"
     for f in "$cache"/sha256-*/openshell-sandbox; do
-      cp -f "$supervisor_src" "$f"
+      cp -f "$supervisor_src" "${f}.new" || err "failed to write ${f}.new"
+      chmod 755 "${f}.new"
+      mv -f "${f}.new" "$f" || err "failed to atomic-rename ${f}.new -> $f"
     done
     ok "supervisor cache refreshed (new sha: $(sha256sum < "$supervisor_src" 2>/dev/null | awk '{print substr($1,1,12)}'))"
   else
     log "no cached supervisor yet — will be created on first sandbox launch"
     log "after the first sandbox runs (and the gateway pulls supervisor:dev), re-run:"
-    log "    cp $supervisor_src $cache/sha256-*/openshell-sandbox"
+    log "    cp $supervisor_src $cache/sha256-*/openshell-sandbox.new && \\"
+    log "      mv $cache/sha256-*/openshell-sandbox.new $cache/sha256-*/openshell-sandbox"
     log "    agentbox destroy <each-sandbox>   # so containers pick up the new binary"
   fi
 

@@ -2,6 +2,30 @@
 
 All notable changes to agentbox.
 
+## [v0.4.8](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.8) — 2026-05-28
+
+Fix: supervisor cache update on macOS now uses atomic `mv` instead of in-place `cp`, defeating Docker Desktop's FS-cache-by-inode behavior.
+
+Symptom: After running `AGENTBOX_INTERACTIVE_OPENSHELL=1` install on macOS, the supervisor cache file (`~/.local/share/openshell/docker-supervisor/sha256-*/openshell-sandbox`) was the correct cross-compiled Linux ELF binary when checked on the host (`file <path>` reported `ELF 64-bit LSB ... ARM aarch64`), but launching `claude` still gave `exec /opt/openshell/bin/openshell-sandbox: exec format error` in a loop. Reading the bind-mounted path from inside a `docker run` against the sandbox image showed the **stale Mach-O Darwin binary** (Mach-O magic `CF FA ED FE`, original Darwin build size) — completely different content than what `cat`/`file` showed on the host.
+
+Root cause: Docker Desktop on macOS uses VirtioFS / gRPC FUSE to share host filesystem with the Linux VM that runs containers. That layer caches bind-mount source contents **by inode**. An in-place `cp -f` reuses the existing inode; the VM keeps serving the previous cached content forever, even after the host file is correct. The cache only invalidates when the inode changes.
+
+Fix: in `install.sh`'s supervisor-cache overwrite, write to a `.new` sibling file then atomic-rename it onto the cache path. `mv` creates a new inode; Docker Desktop's FS cache refreshes on the next container read.
+
+Linux hosts don't hit this bug (no virtualized FS layer), but the write-then-rename pattern is still safer (atomic update, no half-written file ever visible at the target path).
+
+If you ran v0.4.4–v0.4.7 install on macOS and saw `exec format error` even after the install completed, v0.4.8 fixes future installs. To recover your current state without re-installing, manually:
+
+```bash
+CACHE=~/.local/share/openshell/docker-supervisor/sha256-*/openshell-sandbox
+SRC=~/src/openshell-fork/target-linux-arm64/release/openshell-sandbox    # or target-linux-amd64
+rm -f $CACHE
+cp $SRC $CACHE.new
+chmod 755 $CACHE.new
+mv $CACHE.new $CACHE
+agentbox destroy <each-sandbox>     # so a new container picks up the refreshed bind-mount
+```
+
 ## [v0.4.7](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.7) — 2026-05-28
 
 Removes the in-installer `docker pull` entirely. install.sh on macOS no longer touches the keychain.
