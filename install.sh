@@ -487,10 +487,12 @@ cat <<EOF
 
   Held-connection prompts (no 403-then-retry, first request is authoritative):
   Re-run the installer with the fork-build flag to install the interactive
-  openshell stack alongside agentbox:
+  openshell stack alongside agentbox. NOTE the \`bash -c "\$(curl ...)"\` form:
+  in \`VAR=1 curl ... | bash\` the env var is set on curl, NOT bash, so the
+  build silently no-ops.
 
     AGENTBOX_INTERACTIVE_OPENSHELL=1 \\
-      curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh | bash
+      bash -c "\$(curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh)"
 
   This builds openshell-cli, openshell-server, and openshell-sandbox from the
   vshalpnjabi/OpenShell 1-interactive-enforcement branch and overwrites the
@@ -502,7 +504,7 @@ cat <<EOF
   sandboxes, restarts the brew/distro daemon):
 
     AGENTBOX_INTERACTIVE_OPENSHELL=0 \\
-      curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh | bash
+      bash -c "\$(curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh)"
 
   Bypass agentbox for one invocation: AGENTBOX_BYPASS=1 claude
 

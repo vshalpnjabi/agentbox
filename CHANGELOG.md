@@ -2,6 +2,12 @@
 
 All notable changes to agentbox.
 
+## [v0.4.1](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.1) — 2026-05-28
+
+Hotfix for the install one-liner documented in v0.4.0.
+
+- **`AGENTBOX_INTERACTIVE_OPENSHELL=1 curl ... | bash` silently no-ops** (post-install help text). In that form the env var applies to `curl`, not to the `bash` reading the piped script — so the build path is never reached even though install.sh prints "agentbox installed" and exits cleanly. Updated install.sh's post-install help text to recommend the correct form: `AGENTBOX_INTERACTIVE_OPENSHELL=1 bash -c "$(curl -fsSL .../install.sh)"`, with a NOTE block calling out the pipe-vs-bash-c distinction explicitly. Same fix for the `=0` revert recipe. No code-path changes — the install logic itself was always correct; only the advertised invocation was wrong.
+
 ## [v0.4.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.0) — 2026-05-28
 
 Headline: **openshell interactive enforcement is wired end-to-end**. With the openshell fork from `vshalpnjabi/OpenShell` branch `1-interactive-enforcement/vshalpnjabi`, agentbox now supports held-connection prompts on the agent's *first* outbound request to a gated host — no 403-then-retry round-trip, the agent's first attempt is authoritative. New install flag builds and installs the fork in a single curl-pipe-bash. Bearer-token auth between openshell ↔ decide-server. Per-sandbox secret auto-generated, persisted in state dir, emitted into the policy YAML. Plus: two main-side `approve` integer-comparison bugs fixed as a side effect.
