@@ -341,15 +341,36 @@ if [ "$MODE" = "bootstrap" ]; then
     err "Homebrew not found. Install from https://brew.sh first, then re-run."
   }
 
+  # When AGENTBOX_INTERACTIVE_OPENSHELL=1, we build + install openshell from
+  # source ourselves in the build phase later, so we DON'T list openshell in
+  # the brew-install deps (the brew tap `nvidia/openshell` is gone/moved
+  # anyway and would 404). In any other mode, we still rely on the user
+  # having stock openshell on PATH (warn if missing in the local-install
+  # checks below — that's already there).
   declare -a deps=(
     "git:git"
-    "openshell:nvidia/openshell/openshell"
     "mutagen:mutagen-io/mutagen/mutagen"
     "alerter:vjeantet/tap/alerter"
     "qrencode:qrencode"
     "jq:jq"
     "tmux:tmux"
   )
+  case "${AGENTBOX_INTERACTIVE_OPENSHELL:-}" in
+    1|true|yes|on)
+      log "AGENTBOX_INTERACTIVE_OPENSHELL=1 — skipping brew openshell (will build from source later)"
+      ;;
+    *)
+      # Mention openshell as an explicit requirement when not using the
+      # fork-build path. We don't `brew install` it (the tap is 404),
+      # just print actionable guidance.
+      if ! command -v openshell >/dev/null 2>&1; then
+        warn "openshell not on PATH — install it manually:"
+        warn "  • fork (recommended): re-run this installer with AGENTBOX_INTERACTIVE_OPENSHELL=1"
+        warn "  • upstream NVIDIA: https://github.com/NVIDIA/OpenShell/releases"
+        warn "(continuing the agentbox install; sandboxes will fail until openshell is available)"
+      fi
+      ;;
+  esac
 
   missing=()
   for entry in "${deps[@]}"; do

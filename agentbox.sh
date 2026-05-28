@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Embedded version. Bump when cutting a release; tag the commit as v<version>.
-AGENTBOX_VERSION="0.4.2"
+AGENTBOX_VERSION="0.4.3"
 
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"

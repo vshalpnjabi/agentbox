@@ -2,6 +2,12 @@
 
 All notable changes to agentbox.
 
+## [v0.4.3](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.3) — 2026-05-28
+
+Hotfix for the `AGENTBOX_INTERACTIVE_OPENSHELL=1` install path.
+
+- **Don't `brew install` openshell when we're about to build it from source.** Previously the install.sh dep list always included `openshell:nvidia/openshell/openshell` — fine when there's a brew tap, broken now that `nvidia/homebrew-openshell` is 404. Worse: when `AGENTBOX_INTERACTIVE_OPENSHELL=1`, brew-installing openshell was completely redundant (we're about to build + install it from source in the build phase). Fix: drop openshell from the brew-install dep list. When `=1`, log "will build from source later" and proceed. When `=1` is NOT set, warn that openshell needs to be installed manually (point at the upstream releases page) and let the install continue — sandboxes will fail until openshell is available, but the rest of agentbox installs cleanly.
+
 ## [v0.4.2](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.2) — 2026-05-28
 
 Hotfix for the `AGENTBOX_INTERACTIVE_OPENSHELL=1` install path on macOS.
