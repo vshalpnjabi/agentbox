@@ -2,6 +2,67 @@
 
 All notable changes to agentbox.
 
+## [v0.4.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.0) — 2026-05-28
+
+Headline: **openshell interactive enforcement is wired end-to-end**. With the openshell fork from `vshalpnjabi/OpenShell` branch `1-interactive-enforcement/vshalpnjabi`, agentbox now supports held-connection prompts on the agent's *first* outbound request to a gated host — no 403-then-retry round-trip, the agent's first attempt is authoritative. New install flag builds and installs the fork in a single curl-pipe-bash. Bearer-token auth between openshell ↔ decide-server. Per-sandbox secret auto-generated, persisted in state dir, emitted into the policy YAML. Plus: two main-side `approve` integer-comparison bugs fixed as a side effect.
+
+### Headline features
+
+- **L7 held-connection prompts via the openshell interactive-enforcement fork** (`44b9cc5`, `2c404e3`, `137f346`, `ef32942`). When the workspace policy contains an `enforcement.mode: interactive` block (default-on now, opt out per-workspace with `AGENTBOX_NO_INTERACTIVE_POLICY=1`), the openshell gateway holds the agent's TCP connection while POSTing a JSON decision request to the host-side decide-server. agentbox runs `prompt_approval` (ntfy / alerter / osascript / zenity / TTY), returns `{"decision":"allow"|"deny"}`, the gateway releases the held connection accordingly. The agent's first HTTP attempt completes with the decided outcome — no retry needed. End-to-end verified at 204 ms in `docs/baseline-vs-branch-confidence-tests.md`. Falls back gracefully to the L4 watcher path against stock openshell (interactive_gate is silently downgraded to plain enforce).
+
+- **Bearer-token auth between openshell ↔ decide-server** (`9f2881a`). Upstream's `1-interactive-enforcement/vshalpnjabi` branch now signs every `/decide` POST with `Authorization: Bearer <secret>` and expects the matching secret in the policy YAML's `secret:` field. agentbox auto-generates a 32-byte hex secret per sandbox at `<state>/decide-secret.txt` (mode 600) on first sandbox creation, emits it into the policy YAML, loads it into the python decide-server, and threads it through the L4 watcher's own POSTs. `agentbox-decide.py` uses `hmac.compare_digest` for constant-time validation. Wrong / missing bearer returns HTTP 401 with `{"decision":"deny","reason":"invalid bearer token"}` — openshell treats any non-2xx as an error and applies `fallback: deny`, so unauthorized requests get clean denies without leaking timing info.
+
+- **`AGENTBOX_INTERACTIVE_OPENSHELL=1` builds the fork during install** (`43b9b70`, consolidated in `6046112`). One-shot:
+  ```
+  AGENTBOX_INTERACTIVE_OPENSHELL=1 \
+    curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh | bash
+  ```
+  Clones the openshell fork (`vshalpnjabi/OpenShell` branch `1-interactive-enforcement/vshalpnjabi`), runs `cargo build --release` for openshell-cli, openshell-server, openshell-sandbox, installs the CLI + gateway binaries to `$HOME/.cargo/bin`, and overwrites the cached supervisor at `~/.local/share/openshell/docker-supervisor/sha256-*/openshell-sandbox` so containers extract the new binary. macOS: ensures `brew install z3 rust` + injects `BINDGEN_EXTRA_CLANG_ARGS` so z3-sys finds z3.h. Linux: prints the apt + rustup commands and bails (won't sudo blindly). Knobs: `AGENTBOX_OPENSHELL_REPO`, `AGENTBOX_OPENSHELL_BRANCH`, `AGENTBOX_OPENSHELL_PREFIX`.
+
+- **`AGENTBOX_INTERACTIVE_OPENSHELL=0` reverts the fork build to stock** (`6046112`). Symmetric inverse — moves the fork-built binaries to `.fork-bak` (preserved, not deleted), destroys agentbox-managed sandboxes (asks unless `AGENTBOX_YES=1`), nukes the supervisor cache, and restarts the brew openshell service on macOS (or kills the gateway + reminds you on Linux). Top-level early intercept — doesn't reinstall agentbox, just reverts openshell. No-op if no fork binaries are present.
+
+### Decide-server improvements
+
+- **Full openshell wire-protocol parsing** (`44b9cc5`). All 11 fields the gateway emits (`schema_version`, `request_id`, `sandbox_name`, `binary`, `pid`, `host`, `port`, `method`, `path`, `protocol`, `policy_name`) parsed in `cmd_decide_handler_internal`. Validation gates: schema version mismatch → 401, sandbox-name mismatch → 401, missing required fields → 400. PROMPT audit log lines now include method + path + protocol + policy_name + pid so reviewers can see what the agent was about to do.
+
+- **`ThreadingHTTPServer`** (`7e8ebfc`). Replaces single-threaded `HTTPServer`. The old server's accept loop stalled while a handler was waiting on user input (ntfy long-poll), starving health probes and parallel /decide POSTs. With threading, each request runs in its own thread, `daemon_threads = True` so shutdown doesn't block on in-flight prompts.
+
+- **Configurable bind via `AGENTBOX_DECIDE_BIND`** (`44b9cc5`). Default `127.0.0.1`; set to `0.0.0.0` when the openshell gateway runs inside a container and reaches the host via `host.openshell.internal`. `agentbox decide status` shows the active bind + the sandbox-reachable endpoint URL.
+
+- **Lifecycle hygiene** (`7e8ebfc`). `decide_server_ensure` now health-probes the tracked pid via the bound port; if alive but unresponsive (e.g., wedged on a stale connection), SIGTERM → SIGKILL → restart. `decide_server_stop` escalates SIGTERM → SIGKILL after 1 s of grace. Prevents the "pid alive, port listening, connections time out" failure mode.
+
+- **`agentbox decide test` auto-ensures the server** (`a9aeec8`). Previously errored "decide-server not running — run 'agentbox decide start' or launch an agent". Now silently starts the server before sending the test POST, since the only reason to invoke `decide test` is to exercise the endpoint.
+
+### Policy template
+
+- **Default-on `interactive_gate` block emitted by `write_default_policy`** (`ef32942`). Demo target is `*.example.com` so the policy is at least valid out of the box; users edit the YAML to change hosts (the YAML is the single source of truth — no parallel env-based list). Block uses the doc-prescribed shape (`protocol: rest` + `access: full` + `deny_rules: [{method:"*", path:"**"}]`) plus the per-sandbox `secret:`. Opt out per-workspace with `AGENTBOX_NO_INTERACTIVE_POLICY=1`.
+
+- **`ssh` command auto-ensures watcher + decide-server** (`dd46f41`). `agentbox ssh <sandbox>` previously skipped the prompt infrastructure entirely; if the watcher had died (e.g., across a Mac sleep cycle) you'd see no prompt when running a network command from your SSH session. Now both ensures fire idempotently before exec'ing ssh.
+
+- **Wildcard `Allow` now grants apex + wildcard** (`ed04028`). openshell's wildcard semantics match subdomains only, not the apex. Clicking Allow on a banner about `github.com` previously added `*.github.com` to the policy, which silently kept `github.com` itself denied. Now AllowWildcard adds BOTH endpoints in one shot (wildcard for the zone, exact host for the apex).
+
+### Bug fixes
+
+- **`approve list` / `approve reset` integer-comparison crash** (`46de860`). Previously: `auto_count=$(grep -c ... || echo 0)`. When `grep -c` finds zero matches it prints `0` AND exits 1, so `|| echo 0` runs and appends a second `0` — producing the multi-line value `"0\n0"` that subsequent shell integer comparisons rejected with `[: 0\n0: integer expression expected`. Same bug surfaced as `line 3182: 0\n0: syntax error in expression` inside `$((before_auto - after_auto))` in the reset path, where it cascaded into `unknown agent 'agentbox'` from the dispatch chain. Fix: drop the `|| echo 0` and use a defensive `[ -z "$x" ] && x=0` instead.
+
+- **`prompt_approval` crash on `/dev/tty` without a controlling terminal** (`95d056f`). The TTY fallback's `[ -r /dev/tty ]` test passes whenever the device node is readable, but in a daemonised handler subprocess (decide-server spawns the handler) there's no controlling terminal and `read -r ans < /dev/tty` errors with ENXIO. With `set -u`, the next reference to `$ans` aborted the handler ("ans: unbound variable"), the handler exited 1, the decide-server returned 500, and openshell's interactive enforcement fell back to deny — making the user's allow click silently impossible. Fix: probe open-ability with `{ : < /dev/tty; } 2>/dev/null` (forces ENXIO to surface), initialize `local ans=""`, tolerate read failures.
+
+- **Wildcard `Allow` on apex hosts no longer silently fails** (`ed04028`). See above under "Policy template".
+
+### Documentation
+
+- **`docs/openshell-interactive-enforcement.md`** — full integration spec, kept in sync with upstream changes; documents the supervisor-cache + sandbox-recreate gotcha discovered the hard way.
+- **`docs/testing-fork-in-vm.md`** — Lima VM walkthrough for building openshell from source, replacing the supervisor cache, and running the full integration test (256 lines).
+- **`docs/baseline-vs-branch-confidence-tests.md`** — 11-scenario test matrix run three times: vs main, vs branch with bearer-token auth, vs branch in opt-out mode. Verifies the branch is a strict superset of main + the new interactive path works end-to-end (214 lines).
+- **CLAUDE.md rule 10** rewritten to cover the new wire-protocol fields, configurable bind, and opt-in `AGENTBOX_INTERACTIVE_POLICY=1` policy block.
+- **Upstream bug docs** (in `vshalpnjabi/OpenShell/docs/interactive-enforcement/`): authored `PHASE4_BLOCKER.md` (rsa/pkcs8), `L7_DENY_RULES_NOT_FIRING.md` (policy schema), `SUPERVISOR_DECIDE_POST_NEVER_REACHES_ENDPOINT.md` (HTTP_PROXY recursion + tokio thread starvation + DNS resolver). All three resolved upstream by the time this release ships.
+
+### Compatibility
+
+- **Stock openshell users**: no behavior change. The `interactive_gate` block written into new policies is silently downgraded to plain `enforce` by stock openshell. The L4 watcher path continues to handle unknown hosts as before (403 then retry).
+- **Fork openshell users** (via `AGENTBOX_INTERACTIVE_OPENSHELL=1` or self-built): held-connection prompts on first attempt, no retry needed.
+- **Per-workspace opt-out**: `AGENTBOX_NO_INTERACTIVE_POLICY=1` in the shell makes new workspaces emit no `interactive_gate` block — exactly main's behavior.
+
 ## [v0.3.0](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.3.0) — 2026-05-27
 
 Headline: **L4 watcher decisions now route through the decide-server (default-on)**, giving us a single decision pipeline that's already exercised in production while we wait for openshell upstream to ship `enforcement: interactive`. Wildcard approvals (`Allow all *.parent.host`) gain a third button on every prompt UI.
