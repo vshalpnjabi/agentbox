@@ -2,6 +2,28 @@
 
 All notable changes to agentbox.
 
+## [v0.4.5](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.5) — 2026-05-28
+
+Two hotfixes for v0.4.4 macOS installs.
+
+### Fix 1: `install: supervisor source missing` (caller-captured stdout contaminated by progress log)
+
+The `build_supervisor_for_linux_container` helper introduced in v0.4.4 returns the path to the cross-compiled Linux binary via stdout, intended to be captured by `supervisor_src=$(build_supervisor_for_linux_container "$target")` in the caller. But the leading `log "cross-compiling openshell-sandbox for $platform via Docker..."` inside the helper also wrote to stdout (the `log` helper defaults to stdout), so the command-substitution captured the log line + the path. The subsequent `[ -f "$supervisor_src" ]` test failed against the contaminated string and the install bailed with `supervisor source missing` — without ever overwriting the supervisor cache.
+
+The Docker cross-compile itself worked fine in v0.4.4 (the Linux ELF binary was produced at `$openshell-fork/target-linux-$arch/release/openshell-sandbox`). The bug was purely in handing that path back to the caller.
+
+Fix: redirect the leading `log` call in `build_supervisor_for_linux_container` to stderr (`>&2`) so only the final `printf '%s\n' "$linux_bin"` reaches stdout. Added a comment locking this in.
+
+If you ran the v0.4.4 install on macOS and saw `install: supervisor source missing: install: cross-compiling ...`, re-running with v0.4.5 picks up the already-built binary (cargo target cache + Docker image layers are reused) and finishes in seconds.
+
+### Fix 2: `docker: error getting credentials ... keychain cannot be accessed` on first-run pull
+
+Symptom on a fresh Mac install: `Unable to find image 'rust:1-bookworm' locally` followed by `docker: error getting credentials - err: exit status 1, out: "keychain cannot be accessed because the current session does not allow user interaction"`.
+
+Root cause: Docker Desktop on macOS calls `docker-credential-osxkeychain` to look up Docker Hub credentials even for **anonymous public** pulls. Running `bash -c "$(curl ...)"` puts Docker's helper in a context where it can't get TTY input to unlock the keychain, so the helper errors out before the image is fetched. `docker run` then fails because the image isn't local.
+
+Fix: pre-pull `rust:1-bookworm` explicitly before `docker run`. If the pull fails, the installer now prints an exact copy-paste recovery message pointing at `security -v unlock-keychain ~/Library/Keychains/login.keychain-db` (with the manual `docker pull rust:1-bookworm` alternative) instead of letting Docker's raw error fall through with no context.
+
 ## [v0.4.4](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.4) — 2026-05-28
 
 Two fixes that came out of fresh-install testing on macOS.

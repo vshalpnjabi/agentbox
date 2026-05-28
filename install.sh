@@ -79,7 +79,39 @@ build_supervisor_for_linux_container() {
   docker info >/dev/null 2>&1 || \
     err "docker daemon not running — start Docker Desktop / colima / orbstack and re-run"
 
-  log "cross-compiling openshell-sandbox for $platform via Docker (~5-10 min first time)"
+  # Everything from here on writes to STDERR — this function returns its
+  # result (path to the linux binary) via stdout via the final printf, so
+  # any progress/log lines emitted to stdout would be captured into the
+  # caller's $(build_supervisor_for_linux_container) substitution and
+  # corrupt the returned path. Don't lose this >&2 redirect.
+  log "cross-compiling openshell-sandbox for $platform via Docker (~5-10 min first time)" >&2
+
+  # ---- pre-pull the toolchain image so the credential helper error
+  # surface stays out of the build's stderr noise ----
+  #
+  # On macOS with Docker Desktop, even an anonymous pull of a public image
+  # calls `docker-credential-osxkeychain` to look up Docker Hub creds. If
+  # the user's login keychain is locked (common in non-TTY-friendly contexts
+  # like `bash -c "$(curl ...)"`), the helper errors with:
+  #   "keychain cannot be accessed because the current session does not
+  #    allow user interaction"
+  # …and `docker run` exits before the cargo build ever starts. Doing the
+  # pull explicitly here lets us catch that one specific failure and give
+  # the user a one-line copy-paste fix instead of a cryptic stack trace.
+  if ! docker image inspect rust:1-bookworm >/dev/null 2>&1; then
+    log "pulling rust:1-bookworm Docker image (~1.5GB; one-time)" >&2
+    if ! docker pull --platform "$platform" rust:1-bookworm >&2; then
+      err "docker pull rust:1-bookworm failed. If you saw a 'keychain cannot be accessed' error,
+       run:
+           security -v unlock-keychain ~/Library/Keychains/login.keychain-db
+       (you'll be prompted for your macOS login password), then re-run:
+           AGENTBOX_INTERACTIVE_OPENSHELL=1 bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh)\"
+
+       Alternative: pull the image manually in your terminal first, then re-run:
+           docker pull rust:1-bookworm"
+    fi
+  fi
+
   mkdir -p "$tdir"
   # Run in a Linux Docker container matching the supervisor's runtime arch.
   # We use a separate CARGO_TARGET_DIR so we don't trample the native host
