@@ -47,6 +47,70 @@ warn() { printf '%sinstall:%s %s\n' "$c_yellow" "$c_reset" "$*" >&2; }
 err()  { printf '%sinstall:%s %s\n' "$c_red"    "$c_reset" "$*" >&2; exit 1; }
 ok()   { printf '%sinstall:%s %s\n' "$c_green"  "$c_reset" "$*"; }
 
+# ---- helper: cross-compile the supervisor binary for the sandbox container ----
+#
+# The supervisor binary lives at /opt/openshell/bin/openshell-sandbox INSIDE
+# the Linux sandbox container. On Linux hosts, host==container OS so the
+# native cargo build is fine. On macOS hosts, a native build produces a
+# Darwin Mach-O binary which the Linux container can't exec ("exec format
+# error" at sandbox start).
+#
+# This helper runs `cargo build -p openshell-sandbox` inside a Linux Docker
+# container matching the host's CPU arch (Docker Desktop on macOS uses
+# host-arch Linux containers by default, so linux/arm64 on Apple Silicon
+# and linux/amd64 on Intel Macs). The Rust toolchain image is pulled once
+# (~1.5GB) and reused; the apt-get of libz3-dev + clang adds ~2 min on
+# first run.
+#
+# Echoes the path to the built Linux binary on stdout. Errors out on failure.
+build_supervisor_for_linux_container() {
+  local target="$1"
+  local arch platform tdir
+  case "$(uname -m)" in
+    arm64|aarch64) arch="arm64" ;;
+    x86_64|amd64)  arch="amd64" ;;
+    *) err "unsupported host arch '$(uname -m)' — can't pick Docker platform" ;;
+  esac
+  platform="linux/$arch"
+  tdir="$target/target-linux-$arch"
+
+  command -v docker >/dev/null 2>&1 || \
+    err "docker required to cross-compile openshell-sandbox for $platform (host is $(uname))"
+  docker info >/dev/null 2>&1 || \
+    err "docker daemon not running — start Docker Desktop / colima / orbstack and re-run"
+
+  log "cross-compiling openshell-sandbox for $platform via Docker (~5-10 min first time)"
+  mkdir -p "$tdir"
+  # Run in a Linux Docker container matching the supervisor's runtime arch.
+  # We use a separate CARGO_TARGET_DIR so we don't trample the native host
+  # build cache (which is keyed by host triple).
+  docker run --rm --platform "$platform" \
+      -v "$target:/src" \
+      -w /src \
+      -e CARGO_TARGET_DIR=/src/target-linux-"$arch" \
+      rust:1-bookworm \
+      bash -c '
+        set -e
+        apt-get update -qq
+        apt-get install -y -qq libz3-dev clang pkg-config build-essential >/dev/null
+        cargo build --release -p openshell-sandbox
+      ' >&2 || err "Docker cross-compile of openshell-sandbox failed (see log above)"
+
+  local linux_bin="$tdir/release/openshell-sandbox"
+  [ -f "$linux_bin" ] || err "cross-compile finished but expected output not found: $linux_bin"
+
+  # Sanity check: confirm we actually got a Linux ELF binary for the right arch.
+  if command -v file >/dev/null 2>&1; then
+    local fmt; fmt=$(file -b "$linux_bin" 2>/dev/null || echo "?")
+    case "$fmt" in
+      *ELF*) log "linux supervisor binary: $fmt" >&2 ;;
+      *)     warn "cross-compile produced unexpected format: $fmt (expected Linux ELF)" ;;
+    esac
+  fi
+
+  printf '%s\n' "$linux_bin"
+}
+
 # ---- helper: build openshell from the interactive-enforcement fork ----
 #
 # Opt-in via AGENTBOX_INTERACTIVE_OPENSHELL=1. Builds openshell-cli,
@@ -134,10 +198,21 @@ build_openshell_interactive() {
   head_sha=$(git -C "$target" rev-parse --short HEAD)
   log "openshell head: $head_sha"
 
-  log "building openshell-cli, openshell-server, openshell-sandbox (release; ~3-8 min first time)"
-  ( cd "$target" && cargo build --release \
-      -p openshell-cli -p openshell-server -p openshell-sandbox ) || \
-    err "openshell build failed"
+  log "building openshell-cli + openshell-server (host-native release; ~3-8 min first time)"
+  # NOTE: We intentionally do NOT build openshell-sandbox here on macOS —
+  # that binary runs INSIDE a Linux container as the supervisor, so a
+  # native Darwin Mach-O build is unusable there ("exec format error" when
+  # the container tries to start it). Linux hosts can build all three
+  # in one shot. See build_supervisor_for_linux_container() below.
+  if [ "$(uname)" = "Linux" ]; then
+    ( cd "$target" && cargo build --release \
+        -p openshell-cli -p openshell-server -p openshell-sandbox ) || \
+      err "openshell build failed"
+  else
+    ( cd "$target" && cargo build --release \
+        -p openshell-cli -p openshell-server ) || \
+      err "openshell host build failed (openshell-cli + openshell-server)"
+  fi
 
   # ---- install CLI + gateway to ~/.cargo/bin via direct copy ----
   # We deliberately avoid `cargo install --path` here. `cargo install` does
@@ -152,18 +227,31 @@ build_openshell_interactive() {
   install -m 755 "$target/target/release/openshell"         "$HOME/.cargo/bin/openshell"         || err "copy openshell failed"
   install -m 755 "$target/target/release/openshell-gateway" "$HOME/.cargo/bin/openshell-gateway" || err "copy openshell-gateway failed"
 
+  # ---- produce the LINUX openshell-sandbox binary for the supervisor cache ----
+  # The supervisor binary must match the container's OS+arch (Linux), so on
+  # macOS we cross-build via Docker. On Linux we already have it from the
+  # native cargo build above.
+  local supervisor_src
+  if [ "$(uname)" = "Darwin" ]; then
+    supervisor_src=$(build_supervisor_for_linux_container "$target") || \
+      err "could not produce Linux openshell-sandbox binary (see error above)"
+  else
+    supervisor_src="$target/target/release/openshell-sandbox"
+  fi
+  [ -f "$supervisor_src" ] || err "supervisor source missing: $supervisor_src"
+
   # ---- overwrite cached supervisor (created by the gateway on first run) ----
   local cache="$HOME/.local/share/openshell/docker-supervisor"
   if compgen -G "$cache/sha256-*/openshell-sandbox" > /dev/null; then
     log "overwriting cached supervisor binary in $cache/sha256-*/openshell-sandbox"
     for f in "$cache"/sha256-*/openshell-sandbox; do
-      cp -f "$target/target/release/openshell-sandbox" "$f"
+      cp -f "$supervisor_src" "$f"
     done
-    ok "supervisor cache refreshed (new sha: $(sha256sum < "$target/target/release/openshell-sandbox" 2>/dev/null | awk '{print substr($1,1,12)}'))"
+    ok "supervisor cache refreshed (new sha: $(sha256sum < "$supervisor_src" 2>/dev/null | awk '{print substr($1,1,12)}'))"
   else
     log "no cached supervisor yet — will be created on first sandbox launch"
     log "after the first sandbox runs (and the gateway pulls supervisor:dev), re-run:"
-    log "    cp $target/target/release/openshell-sandbox $cache/sha256-*/openshell-sandbox"
+    log "    cp $supervisor_src $cache/sha256-*/openshell-sandbox"
     log "    agentbox destroy <each-sandbox>   # so containers pick up the new binary"
   fi
 

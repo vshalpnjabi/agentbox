@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Embedded version. Bump when cutting a release; tag the commit as v<version>.
-AGENTBOX_VERSION="0.4.3"
+AGENTBOX_VERSION="0.4.4"
 
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"
@@ -2121,6 +2121,12 @@ cmd_stop() {
 }
 
 cmd_destroy() {
+  # Host state at $AGB_STATE_ROOT/$name is the source of truth that gets
+  # mutagen-synced INTO the sandbox on each launch (claude project history,
+  # watcher seen-list, decide-server cache + secret, audit log). It is
+  # never deleted by destroy — destroy is a sandbox-lifecycle operation,
+  # not a state-eraser. The legacy --purge flag is still accepted for
+  # backwards compatibility but is now a no-op for host state (we warn).
   local purge=0
   local name=""
   while [ "$#" -gt 0 ]; do
@@ -2130,10 +2136,11 @@ cmd_destroy() {
     esac
   done
   [ -z "$name" ] && name=$(workspace_sandbox_name)
+  log "destroying $name (sandbox + sync + ssh block; host state preserved at $AGB_STATE_ROOT/$name)"
   if [ "$purge" -eq 1 ]; then
-    log "destroying $name + purging host state ($AGB_STATE_ROOT/$name)"
-  else
-    log "destroying $name (sandbox + sync + ssh block; host state preserved at $AGB_STATE_ROOT/$name)"
+    warn "--purge is deprecated and no longer removes host state."
+    warn "Host state ($AGB_STATE_ROOT/$name) is the source of truth and is always preserved."
+    warn "To remove it, delete the directory manually: rm -rf '$AGB_STATE_ROOT/$name'"
   fi
   watcher_stop "$name"
   decide_server_stop "$name"
@@ -2150,9 +2157,6 @@ cmd_destroy() {
       !skip { print }
     ' "$SSH_CONFIG" > "$SSH_CONFIG.agbtmp"
     mv "$SSH_CONFIG.agbtmp" "$SSH_CONFIG"
-  fi
-  if [ "$purge" -eq 1 ]; then
-    rm -rf "$AGB_STATE_ROOT/$name"
   fi
 }
 
@@ -3614,8 +3618,14 @@ Per-agent host-side auth setup (so sandboxes auto-authenticate):
                                                 CLAUDE_CODE_OAUTH_TOKEN env)
     codex     ~/.codex/auth.json
     opencode  ~/.local/share/opencode/auth.json
-  agentbox destroy [NAME]      Delete sandbox + ssh block (host state PRESERVED)
-  agentbox destroy --purge [N] Also wipe ~/.local/share/agentbox/state/<sandbox>/
+  agentbox destroy [NAME]      Delete sandbox + ssh block. Host state at
+                                ~/.local/share/agentbox/state/<sandbox>/ is
+                                NEVER deleted (it is the source of truth that
+                                mutagen-syncs INTO the sandbox on next launch).
+  agentbox destroy --purge [N] Deprecated alias for `destroy [N]`. The --purge
+                                flag is accepted but no longer wipes host state
+                                (delete it manually with `rm -rf` if you really
+                                want to).
 
 Approval prompts (macOS):
   When an agent inside the sandbox hits a network deny (host:port not in

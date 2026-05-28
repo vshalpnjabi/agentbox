@@ -2,6 +2,28 @@
 
 All notable changes to agentbox.
 
+## [v0.4.4](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.4) — 2026-05-28
+
+Two fixes that came out of fresh-install testing on macOS.
+
+### Fix: "exec format error" when launching sandboxes after `AGENTBOX_INTERACTIVE_OPENSHELL=1` install on macOS
+
+Symptom: `claude` in a workspace failed with `exec /opt/openshell/bin/openshell-sandbox: exec format error` (repeated for each retry), and the sandbox never came up.
+
+Root cause: `cargo build -p openshell-sandbox` runs on the host, which on macOS produces a Darwin Mach-O binary. The supervisor lives at `/opt/openshell/bin/openshell-sandbox` **inside the Linux sandbox container** — a Mach-O binary can't `exec` there. Our previous install overwrote the supervisor cache with the Darwin build, so every new sandbox got the wrong-OS binary baked in.
+
+Fix: On macOS, the `build_openshell_interactive` helper now cross-compiles `openshell-sandbox` for `linux/$arch` (matching the host's CPU arch — `linux/arm64` on Apple Silicon, `linux/amd64` on Intel) by running `cargo build -p openshell-sandbox` inside a `rust:1-bookworm` Docker container. Only that one binary needs cross-compile; `openshell-cli` and `openshell-server` still build natively on the host because they run on the host. On Linux hosts, the existing native build is used unchanged.
+
+Requires Docker (already required to run openshell sandboxes at all). The Rust toolchain image is pulled once (~1.5GB) and the apt-get of libz3-dev + clang adds ~2 min on the first build.
+
+If you're on macOS and already hit the bad-binary cache, the v0.4.4 install fixes it for you: re-run `AGENTBOX_INTERACTIVE_OPENSHELL=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh)"`, then `openshell sandbox list` and `agentbox destroy <name>` for each `agentbox-*` (so the new containers pick up the cross-compiled Linux supervisor).
+
+### Change: `agentbox destroy --purge` no longer wipes host state
+
+Host state at `~/.local/share/agentbox/state/<sandbox>/` is the source of truth — it's what mutagen syncs INTO the sandbox on each launch (claude project history, watcher seen-list, decide-server cache + per-sandbox secret, audit log). Destroying the sandbox should not destroy that.
+
+`agentbox destroy --purge` previously did `rm -rf` on the state dir. v0.4.4 removes that — the `--purge` flag is still accepted for backwards compatibility but is a no-op for state, and emits a deprecation warning pointing at `rm -rf` if you really want to delete it. Behavior change: state is preserved unconditionally now. `agentbox destroy` was already preserving state by default; this just closes the one path that wasn't.
+
 ## [v0.4.3](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.3) — 2026-05-28
 
 Hotfix for the `AGENTBOX_INTERACTIVE_OPENSHELL=1` install path.
