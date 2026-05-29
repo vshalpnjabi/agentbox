@@ -2,6 +2,23 @@
 
 All notable changes to agentbox.
 
+## [v0.4.15](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.15) — 2026-05-29
+
+`install.sh`: `AGENTBOX_INTERACTIVE_OPENSHELL=0` now continues into the normal agentbox install/update after the revert.
+
+Previously the `=0` branch ran the openshell revert and immediately `exit 0`ed — useful if you only wanted to revert, but not what most callers expected when piping the installer through curl. `bash -c "$(curl ...)"` with `=0` would revert your openshell but leave agentbox itself at whatever stale version was already installed.
+
+v0.4.15 makes `=0` a "revert + update" combo: it runs `revert_openshell_interactive` (no-op if no fork bits to revert), prints "revert complete — continuing", and falls through to the normal agentbox install/update path. One command, two effects:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vshalpnjabi/agentbox/main/install.sh \
+  | AGENTBOX_INTERACTIVE_OPENSHELL=0 bash
+```
+
+Result: openshell reverted to stock + agentbox upgraded to latest. Idempotent — safe to re-run.
+
+`=1` (fork install) and unset (default, leave openshell alone) behaviors are unchanged.
+
 ## [v0.4.14](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.14) — 2026-05-29
 
 Bounded-wait policy update — middle ground between v0.4.12's 7s blocking wait and v0.4.13's fully-async commit.

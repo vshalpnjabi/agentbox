@@ -32,7 +32,9 @@
 #                                           AGENTBOX_YES=1), nuke the cached supervisor
 #                                           (gateway re-pulls supervisor:dev), restart
 #                                           the stock daemon. No-op if no fork binaries
-#                                           are present.
+#                                           are present. **THEN continues with the
+#                                           normal agentbox install/update flow** so you
+#                                           get the latest agentbox bits in one shot.
 #   AGENTBOX_OPENSHELL_REPO=…              Override the fork URL (default:
 #                                          https://github.com/vshalpnjabi/OpenShell.git).
 #   AGENTBOX_OPENSHELL_BRANCH=…            Override the fork branch (default:
@@ -457,16 +459,18 @@ confirm() {
   return 0   # No tty: default YES for install (the curl-pipe-bash assumption)
 }
 
-# ---- AGENTBOX_INTERACTIVE_OPENSHELL=0 — early-intercept revert path ----
+# ---- AGENTBOX_INTERACTIVE_OPENSHELL=0 — revert path ----
 # Tri-state semantics on this var:
 #   1/true/yes  → build & install fork (runs later, after agentbox install)
-#   0/false/no  → revert any previous fork install and EXIT (no agentbox
-#                 reinstall needed for revert)
+#   0/false/no  → revert any previous fork install, then continue with the
+#                 normal agentbox install/update flow (so users can do
+#                 "revert + update to latest agentbox" in a single curl-pipe).
 #   unset/other → don't touch openshell at all (default)
 case "${AGENTBOX_INTERACTIVE_OPENSHELL:-}" in
   0|false|no|off)
     revert_openshell_interactive
-    exit 0
+    log "revert complete — continuing with normal agentbox install/update"
+    echo
     ;;
 esac
 
