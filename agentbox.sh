@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Embedded version. Bump when cutting a release; tag the commit as v<version>.
-AGENTBOX_VERSION="0.4.10"
+AGENTBOX_VERSION="0.4.11"
 
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"
@@ -317,6 +317,40 @@ watcher_ensure() {
 
   local pf
   pf=$(watcher_pid_file "$sandbox")
+
+  # ---- ATOMIC SPAWN GUARD ----
+  # Without a lock around the orphan-cleanup + pid-file-check + spawn block
+  # below, two concurrent watcher_ensure calls (separate `claude` invocations
+  # racing in different shells) can both pass the checks and both spawn.
+  # Result: two watchers per sandbox, each reading every deny, each spawning
+  # an alerter dialog, focus-thrashing the user's terminal, and racing on
+  # `openshell policy update`. mkdir is atomic on POSIX filesystems so the
+  # first caller wins the lock; others wait briefly then return (the winning
+  # caller has either spawned or detected an already-alive watcher by then).
+  local state_dir_early
+  state_dir_early=$(watcher_state_dir "$sandbox")
+  mkdir -p "$state_dir_early"
+  local lock="$state_dir_early/.watcher_ensure.lock"
+  local lock_wait=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    # Lock held — check if owner is alive, otherwise treat as stale.
+    local lock_owner
+    lock_owner=$(cat "$lock/owner" 2>/dev/null || true)
+    if [ -z "$lock_owner" ] || ! kill -0 "$lock_owner" 2>/dev/null; then
+      log "watcher_ensure: stale lock from dead pid ${lock_owner:-?}, clearing"
+      rm -rf "$lock"
+      continue
+    fi
+    lock_wait=$((lock_wait + 1))
+    if [ "$lock_wait" -gt 50 ]; then
+      log "watcher_ensure: another spawn (pid $lock_owner) holding lock >5s; bailing"
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "$$" > "$lock/owner"
+  # Release on any exit path (success, return, error, signal).
+  trap 'rm -rf '"$lock"'' RETURN
 
   # Belt-and-suspenders cleanup: kill any orphaned watchers for THIS sandbox
   # by pgrep pattern. The pid file only tracks the most recently started
@@ -1458,10 +1492,20 @@ cmd_decide_handler_internal() {
 
   case "$response" in
     Allow)
+      # `openshell policy update ... --wait` blocks until the supervisor
+      # confirms the new policy is active. On stock 0.0.42 this routinely
+      # takes ~5-10s (gateway round-trip + supervisor policy reload). The
+      # agent stays SIGSTOP'd this whole time, which is what users perceive
+      # as "slow to unfreeze after clicking Allow". This isn't agentbox
+      # overhead — it's openshell's baseline. The fork was somewhat faster
+      # but isn't currently usable (see v0.4.10 known limitation).
+      echo "[decide] applying policy update for ${host}:${port} (stock openshell takes ~5-10s)" >&2
+      local _t0=$(date +%s)
       if openshell policy update "$sandbox" \
           --add-endpoint "${host}:${port}" \
           --binary "$binary" \
           --wait >/dev/null 2>&1; then
+        echo "[decide] policy active after $(( $(date +%s) - _t0 ))s" >&2
         printf '%s|allow\n' "$key" >> "$seen_file"
         auto_policy_append "$host" "$port" "$binary"
         audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (policy hot-reloaded + persisted)"
@@ -3472,10 +3516,16 @@ cmd_policy() {
       write_default_policy "$WORKSPACE_POLICY_FILE"
       local state_dir
       state_dir="$AGB_STATE_ROOT/$name"
-      if [ -f "$state_dir/watcher-seen.txt" ]; then
-        log "clearing watcher seen-list ($state_dir/watcher-seen.txt)"
-        : > "$state_dir/watcher-seen.txt"
-      fi
+      # Clear BOTH seen-lists. Reading-side (`get_seen_decision_for_key`)
+      # checks decide-seen.txt FIRST, so leaving stale wildcard allows
+      # there silently suppresses future prompts even after a "reset".
+      # Earlier versions only cleared watcher-seen.txt which was the gap.
+      for seen in "$state_dir/watcher-seen.txt" "$state_dir/decide-seen.txt"; do
+        if [ -f "$seen" ]; then
+          log "clearing seen-list ($seen)"
+          : > "$seen"
+        fi
+      done
       if openshell sandbox list 2>/dev/null | awk '{print $1}' | grep -qx "$name"; then
         log "hot-reloading network policy on running sandbox $name"
         openshell policy set "$name" --policy "$WORKSPACE_POLICY_FILE" --wait 2>&1 | tail -3

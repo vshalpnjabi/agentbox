@@ -2,6 +2,32 @@
 
 All notable changes to agentbox.
 
+## [v0.4.11](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.11) — 2026-05-29
+
+Three fixes uncovered while re-testing the L4 watcher path on stock 0.0.42.
+
+### Fix: `agentbox policy reset` now clears BOTH seen-lists
+
+Previously `policy reset` only truncated `watcher-seen.txt`, leaving `decide-seen.txt` untouched. The lookup function `get_seen_decision_for_key` checks `decide-seen.txt` first and `watcher-seen.txt` second (decide-seen wins). Result: a `reset` would regenerate the policy from the deny-all template but stale `allow_wildcard` entries in `decide-seen.txt` would silently suppress every future prompt for those host/binary tuples — denies would log to the audit, watcher would log `suppressed (previously allow_wildcard)`, but no alerter would fire and the agent would just see its connection refused with no opportunity to approve.
+
+Recovery for hosts that already had this happen: `policy reset` in v0.4.11 will clear both files. Until you have v0.4.11, manually:
+
+```bash
+: > ~/.local/share/agentbox/state/<sandbox>/decide-seen.txt
+```
+
+### Fix: `flock`-style spawn guard prevents duplicate watchers per sandbox
+
+`watcher_ensure` had a TOCTOU race: two concurrent `claude` invocations in different shells could both pass the orphan-cleanup + pid-file checks and both spawn a watcher. We observed this in practice — `pgrep -af '__watch'` showed two PIDs per sandbox, both reading every deny line from the audit stream, both invoking the alerter, and (the worst symptom) producing rapid alerter spawn/dismiss cycles that thrashed the terminal's mouse focus.
+
+v0.4.11 wraps the critical section in an `mkdir`-based mutex (atomic on POSIX). First caller into `watcher_ensure` for a given sandbox wins the lock; concurrent callers wait up to 5s for the lock to release (with stale-lock detection via the owner pid being alive), then return. Net: exactly one watcher per sandbox, guaranteed.
+
+### UX: progress log for the slow stock policy update
+
+`openshell policy update --wait` on stock 0.0.42 takes ~5-10 seconds (timed at 7s on a Mac mini M2). The watcher's Allow branch blocks on this before unfreezing the agent — that's the "slow to unfreeze after clicking Allow" the user perceives. It's openshell's baseline, not agentbox overhead. The fork was somewhat faster, but isn't currently usable end-to-end (see v0.4.10 known limitation).
+
+v0.4.11 emits a `[decide] applying policy update for <host>:<port> (stock openshell takes ~5-10s)` log line before the `--wait` call and `[decide] policy active after Ns` after it succeeds, so the slowness is at least visible and attributable. Not faster — just honest about where the time is going.
+
 ## [v0.4.10](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.10) — 2026-05-28
 
 End-to-end testing of the fork-only install path on macOS revealed that the openshell `interactive-enforcement` fork has a **fundamental upstream bug** that breaks every subprocess-spawning agent (claude, codex, copilot, opencode, …). This release shelves the fork integration path and brings agentbox back to a clean, working state on stock openshell 0.0.42 — plus documents what we found so future work can pick up where we left off.
