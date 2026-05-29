@@ -2,6 +2,39 @@
 
 All notable changes to agentbox.
 
+## [v0.4.13](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.13) — 2026-05-29
+
+Make Allow feel instant — agent unfreezes immediately after clicking Allow instead of waiting ~7s for `openshell policy update --wait` to complete on stock 0.0.42.
+
+### What was slow
+
+`openshell policy update --wait` blocks the gateway round-trip + supervisor policy reload, which on stock 0.0.42 takes ~5–10 seconds. Previously the watcher kept the agent SIGSTOP'd that whole time before unfreezing. That's the "slow to resume after Allow" the user felt.
+
+For the wildcard path (`Allow *.foo + apex foo`), it was even worse — two sequential blocking updates = ~14s.
+
+### What v0.4.13 does
+
+Decision flow in the decide handler is now:
+
+1. Append `<key>|allow` to seen-list synchronously (commits the decision)
+2. Reply `{decision: allow}` to the watcher synchronously (watcher unfreezes the agent immediately)
+3. Run `openshell policy update --wait` in the background
+4. Audit-log the background result (`BG_POLICY_ACTIVE Ns` or `BG_POLICY_FAIL`)
+
+For `AllowWildcard:*`, the two policy updates also run **in parallel** in the background (~7s instead of ~14s).
+
+### Race window
+
+Between unfreeze and policy-active, the agent may retry the connection and get denied at the supervisor (which still has the old policy). The watcher sees that deny, looks up seen-list, finds `allow`, and immediately unfreezes again without re-prompting. Invisible to the user; the agent just sees a couple of automatic retries before the policy lands.
+
+### Failure mode
+
+If the background policy update genuinely fails (network/gateway error), the seen-list is now stuck on `allow` forever. The audit log carries `BG_POLICY_FAIL ... <reason>` for debugging. Recovery: `agentbox policy reset` (which v0.4.11 already updated to clear both seen-list files).
+
+### Opt-out
+
+`AGENTBOX_SYNC_POLICY_UPDATE=1` reverts to the v0.4.12 blocking behavior if you want the policy guaranteed-active before the agent resumes. Tradeoff: 7s wait.
+
 ## [v0.4.12](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.12) — 2026-05-29
 
 Fix: random text-highlighting on mouse-move inside the agent's tmux pane (especially on Ghostty).

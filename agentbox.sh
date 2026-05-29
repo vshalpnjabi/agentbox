@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Embedded version. Bump when cutting a release; tag the commit as v<version>.
-AGENTBOX_VERSION="0.4.12"
+AGENTBOX_VERSION="0.4.13"
 
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"
@@ -1510,57 +1510,107 @@ cmd_decide_handler_internal() {
   case "$response" in
     Allow)
       # `openshell policy update ... --wait` blocks until the supervisor
-      # confirms the new policy is active. On stock 0.0.42 this routinely
-      # takes ~5-10s (gateway round-trip + supervisor policy reload). The
-      # agent stays SIGSTOP'd this whole time, which is what users perceive
-      # as "slow to unfreeze after clicking Allow". This isn't agentbox
-      # overhead — it's openshell's baseline. The fork was somewhat faster
-      # but isn't currently usable (see v0.4.10 known limitation).
-      echo "[decide] applying policy update for ${host}:${port} (stock openshell takes ~5-10s)" >&2
-      local _t0=$(date +%s)
-      if openshell policy update "$sandbox" \
-          --add-endpoint "${host}:${port}" \
-          --binary "$binary" \
-          --wait >/dev/null 2>&1; then
-        echo "[decide] policy active after $(( $(date +%s) - _t0 ))s" >&2
-        printf '%s|allow\n' "$key" >> "$seen_file"
-        auto_policy_append "$host" "$port" "$binary"
-        audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (policy hot-reloaded + persisted)"
-        _decide_reply "allow" "user approved" "exact" "$host"
+      # confirms the new policy is active. On stock 0.0.42 that's ~5-10s.
+      # We don't make the user wait for that — we commit to the decision
+      # in the seen-list immediately, reply "allow" to the watcher (which
+      # unfreezes the agent right away), and let the policy update finish
+      # in the background.
+      #
+      # Race window: between unfreeze and policy-active, the agent may
+      # retry the connection and get denied at the supervisor. The watcher
+      # will see the deny, check seen-list, find "allow", and immediately
+      # unfreeze again without re-prompting. Invisible to the user; the
+      # agent just experiences a couple retries until the policy lands.
+      #
+      # Failure mode: if the background policy update genuinely fails
+      # (network/gateway error), the seen-list is now stuck on "allow"
+      # forever. The audit log carries USER_ALLOW_FAIL so the user can
+      # debug. Recovery: `agentbox policy reset` clears the seen-list.
+      # Set AGENTBOX_SYNC_POLICY_UPDATE=1 to opt back into the old
+      # blocking behavior.
+      printf '%s|allow\n' "$key" >> "$seen_file"
+      auto_policy_append "$host" "$port" "$binary"
+      if is_truthy "${AGENTBOX_SYNC_POLICY_UPDATE:-}"; then
+        echo "[decide] applying policy update for ${host}:${port} (sync mode, stock openshell takes ~5-10s)" >&2
+        local _t0=$(date +%s)
+        if openshell policy update "$sandbox" \
+            --add-endpoint "${host}:${port}" \
+            --binary "$binary" \
+            --wait >/dev/null 2>&1; then
+          echo "[decide] policy active after $(( $(date +%s) - _t0 ))s" >&2
+          audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (sync; policy active in $(( $(date +%s) - _t0 ))s)"
+        else
+          audit_emit "$sandbox" "decide" "USER_ALLOW_FAIL [src=$source] ${req_id:-?}: $binary -> $host:$port (sync; openshell policy update returned non-zero)"
+        fi
       else
-        audit_emit "$sandbox" "decide" "USER_ALLOW_FAIL [src=$source] ${req_id:-?}: $binary -> $host:$port (openshell policy update returned non-zero)"
-        printf '%s|allow\n' "$key" >> "$seen_file"
-        _decide_reply "allow" "user approved (policy update failed)" "exact" "$host"
+        # Background the slow policy update. We log the launch synchronously
+        # and let a separate process audit-log the result when it finishes.
+        audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (bg policy update started)"
+        (
+          _t0=$(date +%s)
+          if openshell policy update "$sandbox" \
+              --add-endpoint "${host}:${port}" \
+              --binary "$binary" \
+              --wait >/dev/null 2>&1; then
+            audit_emit "$sandbox" "decide" "BG_POLICY_ACTIVE [src=$source] ${req_id:-?}: $binary -> $host:$port ($(( $(date +%s) - _t0 ))s)"
+          else
+            audit_emit "$sandbox" "decide" "BG_POLICY_FAIL [src=$source] ${req_id:-?}: $binary -> $host:$port ($(( $(date +%s) - _t0 ))s)"
+          fi
+        ) </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
       fi
+      _decide_reply "allow" "user approved" "exact" "$host"
       ;;
     AllowWildcard:*)
       # User picked "Allow all *.parent.host" (or clicked Allow on the 2-action
       # alerter, which maps to this path). Add BOTH the wildcard zone AND the
-      # exact apex host to the policy in one shot — openshell wildcards match
-      # subdomains only, so granting just *.github.com would still leave the
-      # apex github.com denied. The "allow" reply covers the current request
-      # (which is for $host); future requests under either pattern pass.
+      # exact apex host to the policy — openshell wildcards match subdomains
+      # only, so granting just *.github.com would leave the apex denied.
+      #
+      # Same backgrounding strategy as the Allow case: commit to the seen-list
+      # immediately, reply "allow" to the watcher so the agent unfreezes, and
+      # let the two policy updates finish in parallel in the background.
       local wild="${response#AllowWildcard:}"
-      local ok_w=0 ok_h=0
-      openshell policy update "$sandbox" \
-        --add-endpoint "${wild}:${port}" \
-        --binary "$binary" \
-        --wait >/dev/null 2>&1 && ok_w=1
-      openshell policy update "$sandbox" \
-        --add-endpoint "${host}:${port}" \
-        --binary "$binary" \
-        --wait >/dev/null 2>&1 && ok_h=1
-      if [ "$ok_w" = "1" ] || [ "$ok_h" = "1" ]; then
-        printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
-        [ "$ok_w" = "1" ] && auto_policy_append "$wild" "$port" "$binary"
-        [ "$ok_h" = "1" ] && auto_policy_append "$host" "$port" "$binary"
-        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (wildcard_ok=$ok_w apex_ok=$ok_h, persisted)"
-        _decide_reply "allow" "user approved wildcard $wild + apex $host" "wildcard" "$wild"
+      printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
+      auto_policy_append "$wild" "$port" "$binary"
+      auto_policy_append "$host" "$port" "$binary"
+      if is_truthy "${AGENTBOX_SYNC_POLICY_UPDATE:-}"; then
+        local ok_w=0 ok_h=0
+        openshell policy update "$sandbox" \
+          --add-endpoint "${wild}:${port}" \
+          --binary "$binary" \
+          --wait >/dev/null 2>&1 && ok_w=1
+        openshell policy update "$sandbox" \
+          --add-endpoint "${host}:${port}" \
+          --binary "$binary" \
+          --wait >/dev/null 2>&1 && ok_h=1
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (sync; wildcard_ok=$ok_w apex_ok=$ok_h)"
       else
-        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD_FAIL [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (both policy updates returned non-zero)"
-        printf '%s|allow_wildcard\n' "$key" >> "$seen_file"
-        _decide_reply "allow" "user approved wildcard $wild (policy update failed)" "wildcard" "$wild"
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (bg policy update started)"
+        (
+          _t0=$(date +%s)
+          # Parallel: both at once, ~7s instead of ~14s.
+          openshell policy update "$sandbox" \
+            --add-endpoint "${wild}:${port}" \
+            --binary "$binary" \
+            --wait >/dev/null 2>&1 &
+          _pid_w=$!
+          openshell policy update "$sandbox" \
+            --add-endpoint "${host}:${port}" \
+            --binary "$binary" \
+            --wait >/dev/null 2>&1 &
+          _pid_h=$!
+          ok_w=0; wait "$_pid_w" && ok_w=1
+          ok_h=0; wait "$_pid_h" && ok_h=1
+          if [ "$ok_w" = "1" ] || [ "$ok_h" = "1" ]; then
+            audit_emit "$sandbox" "decide" "BG_POLICY_ACTIVE [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (wildcard_ok=$ok_w apex_ok=$ok_h, $(( $(date +%s) - _t0 ))s)"
+          else
+            audit_emit "$sandbox" "decide" "BG_POLICY_FAIL [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (both updates failed, $(( $(date +%s) - _t0 ))s)"
+          fi
+        ) </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
       fi
+      _decide_reply "allow" "user approved wildcard $wild + apex $host" "wildcard" "$wild"
       ;;
     Deny)
       printf '%s|deny\n' "$key" >> "$seen_file"
