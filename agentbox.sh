@@ -1436,6 +1436,20 @@ cmd_decide_handler_internal() {
   # pid, method, path, protocol, policy_name. Earlier watcher-internal calls
   # only set host/port/binary/request_id/source — those keep working since the
   # extra fields default to empty.
+  #
+  # `pid` notes:
+  #   - Before openshell `663e5528c` (vshalpnjabi/OpenShell#2) this was always
+  #     null in proxy-originated requests — the relay arms hard-coded pid: None.
+  #     From 663e5528c on, the proxy resolves the socket-owner pid at L4
+  #     CONNECT time and includes it in the body.
+  #   - It's the socket owner, which may be an ANCESTOR process (the parent
+  #     that opened the connection before fork+exec'ing the child holding it).
+  #     Don't assume it's the leaf process.
+  #   - It's a point-in-time snapshot — the process may exit while the
+  #     connection is held. Treat as info-only for prompt UI / audit.
+  # We handle the null/empty case gracefully: `.pid // empty` yields "" which
+  # the ctx-line below conditionally skips. No code change needed when pid
+  # starts being populated upstream.
   local host port binary req_id source schema_version body_sandbox pid method req_path protocol policy_name
   host=$(printf '%s' "$body"           | jq -r '.host // empty'           2>/dev/null || echo "")
   port=$(printf '%s' "$body"           | jq -r '.port // empty'           2>/dev/null || echo "")
