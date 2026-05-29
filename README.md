@@ -282,6 +282,20 @@ To opt out and use the legacy v0.2.0 direct-prompt watcher path: `export AGENTBO
 - **`agentbox destroy && claude`**: full rebuild, same policy, same session history.
 - **Out-of-band container loss** (Docker crash, manual `docker rm`): next agent invocation auto-detects the Error phase, recreates the sandbox, restores state. No manual intervention.
 
+## Tuning Allow-prompt latency
+
+When you click Allow on the approval dialog, agentbox runs `openshell policy update --wait` to make the new endpoint persistent. On stock openshell `0.0.42` that step takes ~5–10 seconds (gateway round-trip + supervisor policy reload). Three behaviors are available:
+
+| Setting | Wait on Allow | Agent retry behavior | Notes |
+|---|---|---|---|
+| `AGENTBOX_SYNC_POLICY_UPDATE=1` | full (~7s) | exactly 1 (succeeds first try) | Pre-v0.4.13 behavior. Max correctness, slowest. |
+| `AGENTBOX_POLICY_UPDATE_TIMEOUT=N` (default **`3`**) | up to N seconds | 1 if update lands in time, else 1–N during background reload | v0.4.14 default. Snappy + clean-retry for most updates. |
+| `AGENTBOX_POLICY_UPDATE_TIMEOUT=0` | 0 (instant) | 1–N during ~7s background reload | v0.4.13 behavior. Instant feel, agent absorbs the reload internally. |
+
+Decisions are always committed to the seen-list synchronously, so a subsequent deny for the same host/binary tuple is immediately cached as Allow and never re-prompts — even if the background update fails. If the update *does* fail and you want to retry, run `agentbox policy reset` to clear the cached decision and re-prompt next time.
+
+Lower `AGENTBOX_POLICY_UPDATE_TIMEOUT` if Allow still feels slow on your machine; raise it (or use `AGENTBOX_SYNC_POLICY_UPDATE=1`) if you see retried connections during the background reload window. The wildcard Allow path (`Allow *.foo + apex foo`) runs both updates in parallel under the same bound.
+
 ## Environment variables
 
 All boolean knobs accept `1` / `true` / `yes` / `on` (case-insensitive):
@@ -314,6 +328,10 @@ All boolean knobs accept `1` / `true` / `yes` / `on` (case-insensitive):
 | `AGENTBOX_SUDO` | Configure NOPASSWD sudo inside the sandbox on next launch (since v0.2.0). |
 | `AGENTBOX_NO_DECIDE_SERVER` | **Opt OUT** of the default-on decide-server. With this set, the watcher uses its legacy direct-prompt path (v0.2.0 behavior). Without this, the watcher routes its L4-deny decisions through the local decide-server so the same code handles both L4 (today) and L7 (future openshell Interactive). |
 | `AGENTBOX_SUPPRESS_REPEATS` | Re-enable the older "decide once, never re-prompt" suppression (v0.2.0 default is always re-prompt). |
+| `AGENTBOX_POLICY_UPDATE_TIMEOUT` | Max seconds to wait for `openshell policy update` to confirm policy active before replying Allow to the agent. Default **`3`** (since v0.4.14). Set `0` for instant reply (pure async, v0.4.13 behavior); set higher to wait longer for the clean-retry guarantee. See [Tuning Allow-prompt latency](#tuning-allow-prompt-latency) below. |
+| `AGENTBOX_SYNC_POLICY_UPDATE` | Force the v0.4.12 pre-bounded-wait behavior: block fully on `openshell policy update --wait`, ignore `AGENTBOX_POLICY_UPDATE_TIMEOUT`. Pre-v0.4.13 correctness at the cost of ~7s/Allow on stock openshell. |
+| `AGENTBOX_INTERACTIVE_POLICY` | **Opt IN** to writing the `interactive_gate` block into the default policy template (since v0.4.10; was default-on before). Only useful if you're running the openshell `interactive-enforcement` fork — stock 0.0.42 fails to parse the fork's `enforcement: { mode: ... }` map. |
+| `AGENTBOX_TMUX_DRAG_SELECT` | **Opt IN** to tmux's native click+drag selection (since v0.4.12; default off). Off by default because tmux's `MouseDrag1Pane` binding enters copy-mode on the slightest mouse motion during a click, which Ghostty et al. surface as "highlighting on mouse move." Scroll-wheel works regardless of this knob. |
 
 ## How it works (architecture sketch)
 
