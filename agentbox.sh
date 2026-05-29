@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Embedded version. Bump when cutting a release; tag the commit as v<version>.
-AGENTBOX_VERSION="0.4.13"
+AGENTBOX_VERSION="0.4.14"
 
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"
@@ -1509,43 +1509,46 @@ cmd_decide_handler_internal() {
 
   case "$response" in
     Allow)
-      # `openshell policy update ... --wait` blocks until the supervisor
-      # confirms the new policy is active. On stock 0.0.42 that's ~5-10s.
-      # We don't make the user wait for that — we commit to the decision
-      # in the seen-list immediately, reply "allow" to the watcher (which
-      # unfreezes the agent right away), and let the policy update finish
-      # in the background.
+      # Three modes:
       #
-      # Race window: between unfreeze and policy-active, the agent may
-      # retry the connection and get denied at the supervisor. The watcher
-      # will see the deny, check seen-list, find "allow", and immediately
-      # unfreeze again without re-prompting. Invisible to the user; the
-      # agent just experiences a couple retries until the policy lands.
+      #   AGENTBOX_SYNC_POLICY_UPDATE=1
+      #     Full blocking wait. Pre-v0.4.13 behavior. Agent waits ~7s
+      #     on stock 0.0.42 for the supervisor to confirm policy active.
+      #     Strongest correctness: agent's next retry succeeds first try.
       #
-      # Failure mode: if the background policy update genuinely fails
-      # (network/gateway error), the seen-list is now stuck on "allow"
-      # forever. The audit log carries USER_ALLOW_FAIL so the user can
-      # debug. Recovery: `agentbox policy reset` clears the seen-list.
-      # Set AGENTBOX_SYNC_POLICY_UPDATE=1 to opt back into the old
-      # blocking behavior.
+      #   AGENTBOX_POLICY_UPDATE_TIMEOUT=0
+      #     Pure async. Reply "allow" instantly; policy update runs in
+      #     background. v0.4.13 behavior. Agent may retry several times
+      #     before policy is active (watcher silently re-unfreezes via
+      #     the now-cached seen=allow each time).
+      #
+      #   AGENTBOX_POLICY_UPDATE_TIMEOUT=N (default 3)
+      #     Bounded wait. Start the update in background, wait up to N
+      #     seconds for it to complete. If it finishes within N, the
+      #     agent's first retry succeeds. If not, reply anyway and let
+      #     the update finish in background. Common case (~7s on stock)
+      #     waits 3s, then 1-2 background retries before success.
+      #
+      # The seen-list commit + auto_policy_append happen SYNCHRONOUSLY
+      # in every mode so a subsequent deny gets seen=allow lookup.
       printf '%s|allow\n' "$key" >> "$seen_file"
       auto_policy_append "$host" "$port" "$binary"
       if is_truthy "${AGENTBOX_SYNC_POLICY_UPDATE:-}"; then
-        echo "[decide] applying policy update for ${host}:${port} (sync mode, stock openshell takes ~5-10s)" >&2
+        echo "[decide] applying policy update for ${host}:${port} (sync mode, ~5-10s on stock)" >&2
         local _t0=$(date +%s)
         if openshell policy update "$sandbox" \
             --add-endpoint "${host}:${port}" \
             --binary "$binary" \
             --wait >/dev/null 2>&1; then
           echo "[decide] policy active after $(( $(date +%s) - _t0 ))s" >&2
-          audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (sync; policy active in $(( $(date +%s) - _t0 ))s)"
+          audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (sync; $(( $(date +%s) - _t0 ))s)"
         else
           audit_emit "$sandbox" "decide" "USER_ALLOW_FAIL [src=$source] ${req_id:-?}: $binary -> $host:$port (sync; openshell policy update returned non-zero)"
         fi
       else
-        # Background the slow policy update. We log the launch synchronously
-        # and let a separate process audit-log the result when it finishes.
-        audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (bg policy update started)"
+        local _timeout="${AGENTBOX_POLICY_UPDATE_TIMEOUT:-3}"
+        audit_emit "$sandbox" "decide" "USER_ALLOW [src=$source] ${req_id:-?}: $binary -> $host:$port (bg policy update; max wait ${_timeout}s)"
+        # Launch update in background (always — so timeout doesn't kill it)
         (
           _t0=$(date +%s)
           if openshell policy update "$sandbox" \
@@ -1557,7 +1560,19 @@ cmd_decide_handler_internal() {
             audit_emit "$sandbox" "decide" "BG_POLICY_FAIL [src=$source] ${req_id:-?}: $binary -> $host:$port ($(( $(date +%s) - _t0 ))s)"
           fi
         ) </dev/null >/dev/null 2>&1 &
+        local _bg_pid=$!
         disown 2>/dev/null || true
+        # Bounded wait: poll up to $_timeout seconds for the bg to finish.
+        # Granularity is 100ms — fine enough to feel snappy, coarse enough
+        # to not burn CPU. macOS sleep accepts fractional seconds.
+        if [ "$_timeout" -gt 0 ]; then
+          local _budget_ms=$(( _timeout * 1000 ))
+          local _elapsed_ms=0
+          while [ "$_elapsed_ms" -lt "$_budget_ms" ] && kill -0 "$_bg_pid" 2>/dev/null; do
+            sleep 0.1
+            _elapsed_ms=$(( _elapsed_ms + 100 ))
+          done
+        fi
       fi
       _decide_reply "allow" "user approved" "exact" "$host"
       ;;
@@ -1586,7 +1601,8 @@ cmd_decide_handler_internal() {
           --wait >/dev/null 2>&1 && ok_h=1
         audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (sync; wildcard_ok=$ok_w apex_ok=$ok_h)"
       else
-        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (bg policy update started)"
+        local _timeout="${AGENTBOX_POLICY_UPDATE_TIMEOUT:-3}"
+        audit_emit "$sandbox" "decide" "USER_ALLOW_WILDCARD [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (bg policy update; max wait ${_timeout}s)"
         (
           _t0=$(date +%s)
           # Parallel: both at once, ~7s instead of ~14s.
@@ -1608,7 +1624,16 @@ cmd_decide_handler_internal() {
             audit_emit "$sandbox" "decide" "BG_POLICY_FAIL [src=$source] ${req_id:-?}: $binary -> {$wild,$host}:$port (both updates failed, $(( $(date +%s) - _t0 ))s)"
           fi
         ) </dev/null >/dev/null 2>&1 &
+        local _bg_pid=$!
         disown 2>/dev/null || true
+        if [ "$_timeout" -gt 0 ]; then
+          local _budget_ms=$(( _timeout * 1000 ))
+          local _elapsed_ms=0
+          while [ "$_elapsed_ms" -lt "$_budget_ms" ] && kill -0 "$_bg_pid" 2>/dev/null; do
+            sleep 0.1
+            _elapsed_ms=$(( _elapsed_ms + 100 ))
+          done
+        fi
       fi
       _decide_reply "allow" "user approved wildcard $wild + apex $host" "wildcard" "$wild"
       ;;

@@ -2,6 +2,36 @@
 
 All notable changes to agentbox.
 
+## [v0.4.14](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.14) — 2026-05-29
+
+Bounded-wait policy update — middle ground between v0.4.12's 7s blocking wait and v0.4.13's fully-async commit.
+
+### Why a middle ground
+
+v0.4.12: wait full ~7s for openshell policy update --wait. Correctness perfect (agent's next retry succeeds first try), but the user perceives the delay.
+
+v0.4.13: reply immediately, run policy update in background. Feels instant, but the agent may auto-retry several times during the ~7s policy reload window before succeeding, and concurrent Allows can race on the policy version (the bug commit `cc5a4e8` originally introduced --wait to prevent).
+
+v0.4.14: wait up to N seconds (default **3**) for the background update to finish. If it completes within the bound, the agent gets the clean v0.4.12-style first-try retry. If it takes longer (rare), we reply anyway and let the update finish in the background — same as v0.4.13.
+
+### Three modes
+
+| Env var | Behavior |
+|---|---|
+| `AGENTBOX_SYNC_POLICY_UPDATE=1` | Full blocking wait (v0.4.12 behavior). Always waits for the supervisor to confirm policy active. ~7s on stock. |
+| `AGENTBOX_POLICY_UPDATE_TIMEOUT=N` | Bounded wait (default `3`). Background the update, wait up to N seconds for completion, then reply. |
+| `AGENTBOX_POLICY_UPDATE_TIMEOUT=0` | Pure async (v0.4.13 behavior). Reply immediately, agent retries during policy reload. |
+
+Default is `AGENTBOX_POLICY_UPDATE_TIMEOUT=3` — feels snappy AND keeps the clean-retry guarantee for most policy updates that complete within that window.
+
+### `AllowWildcard` path same treatment
+
+Two policy updates (wildcard + apex) run in parallel in the background, bounded by the same timeout. ~7s of background work instead of ~14s sequential.
+
+### Tuning
+
+If clicking Allow still feels slow on your machine, lower the timeout: `AGENTBOX_POLICY_UPDATE_TIMEOUT=1` waits 1s then replies. If you're seeing failed retries during the bg window (rare), raise it: `AGENTBOX_POLICY_UPDATE_TIMEOUT=10` essentially restores the sync behavior with a hard ceiling.
+
 ## [v0.4.13](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.13) — 2026-05-29
 
 Make Allow feel instant — agent unfreezes immediately after clicking Allow instead of waiting ~7s for `openshell policy update --wait` to complete on stock 0.0.42.
