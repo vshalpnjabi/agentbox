@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Embedded version. Bump when cutting a release; tag the commit as v<version>.
-AGENTBOX_VERSION="0.4.15"
+AGENTBOX_VERSION="0.4.16"
 
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"
@@ -403,12 +403,33 @@ watcher_ensure() {
   mkdir -p "$state_dir"
   log "starting approval watcher for $sandbox (denials prompt; AGENTBOX_NO_WATCH=1 to disable)"
 
-  # Self-respawn via the hidden __watch subcommand
-  nohup "$AGB_ROOT/agentbox.sh" __watch "$sandbox" \
-    >"$(watcher_log_file "$sandbox")" 2>&1 &
-  local spawn_pid=$!
-  disown 2>/dev/null || true
-  log "watcher spawn pid=$spawn_pid"
+  # Self-respawn via the hidden __watch subcommand. We spawn TWICE if the
+  # first attempt dies immediately — fire-and-forget was too optimistic.
+  # Without the readback, an early-exit __watch (e.g. openshell logs --tail
+  # rejecting auth) leaves us with no watcher, no error visible to the user,
+  # and silent loss of all approval prompts until the next agentbox launch.
+  local spawn_pid attempt
+  for attempt in 1 2; do
+    nohup "$AGB_ROOT/agentbox.sh" __watch "$sandbox" \
+      >>"$(watcher_log_file "$sandbox")" 2>&1 &
+    spawn_pid=$!
+    disown 2>/dev/null || true
+    # Give the spawned bash subshell time to start its main loop AND write
+    # the pid file. 0.5s is enough for nohup + bash startup on every macOS
+    # we've tested; longer than that and the openshell logs --tail RPC has
+    # almost certainly fired (a deny within the first 500ms is extremely
+    # rare in normal use).
+    sleep 0.5
+    if kill -0 "$spawn_pid" 2>/dev/null; then
+      log "watcher spawn pid=$spawn_pid (attempt $attempt — alive)"
+      return 0
+    fi
+    warn "watcher spawn pid=$spawn_pid died within 0.5s (attempt $attempt). See $(watcher_log_file "$sandbox") for details."
+  done
+  warn "watcher_ensure: both spawn attempts died. Run \`agentbox status\` and check $(watcher_log_file "$sandbox")."
+  warn "                 → approval prompts will NOT fire for $sandbox until this is resolved."
+  warn "                 → continuing without watcher; agent denies will just fail with no UI."
+  return 0
 }
 
 watcher_stop() {
@@ -1839,9 +1860,41 @@ network_policies:
       - { path: /usr/bin/codex }
       - { path: /usr/bin/opencode }
       - { path: /usr/bin/git }
+      - { path: /usr/bin/gh }
       - { path: /usr/bin/curl }
       - { path: /usr/bin/wget }
       - { path: /usr/bin/ssh }
+
+  # Common-tools-to-PyPI block. Lets pip / uv / pipx fetch packages without
+  # a first-use prompt. Add more hosts (e.g. private package indexes) by
+  # editing this list or via the Allow flow.
+  pypi:
+    name: pypi
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+    binaries:
+      - { path: /usr/bin/pip }
+      - { path: /usr/bin/pip3 }
+      - { path: /usr/bin/uv }
+      - { path: /usr/bin/pipx }
+      - { path: /usr/local/bin/uv }
+      - { path: /sandbox/.uv/bin/uv }
+
+  # Common-tools-to-npm registry block. Same idea as pypi but for the JS
+  # ecosystem. Covers npm/yarn/pnpm/npx for normal package installs.
+  npm:
+    name: npm
+    endpoints:
+      - { host: registry.npmjs.org, port: 443 }
+      - { host: registry.yarnpkg.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/npm }
+      - { path: /usr/bin/npx }
+      - { path: /usr/bin/yarn }
+      - { path: /usr/bin/pnpm }
+      - { path: /usr/local/bin/npm }
+      - { path: /usr/local/bin/npx }
 YAML
 
   # Opt-IN interactive-enforcement block. Appended only when

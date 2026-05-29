@@ -282,6 +282,29 @@ To opt out and use the legacy v0.2.0 direct-prompt watcher path: `export AGENTBO
 - **`agentbox destroy && claude`**: full rebuild, same policy, same session history.
 - **Out-of-band container loss** (Docker crash, manual `docker rm`): next agent invocation auto-detects the Error phase, recreates the sandbox, restores state. No manual intervention.
 
+## Why per-binary policy (and not "auto-allow everything the agent uses")?
+
+Openshell enforces network policy by **binary path**. The supervisor sees `CONNECT(pid, host, port)`, walks the pid's `/proc/<pid>/exe`, and asks: is this binary allowed to reach this host? Yes or no — no process-tree intent inference, no "well it's the agent's grandchild so it's fine."
+
+That's restrictive on purpose. A "the agent spawned it, so allow it" rule would let any binary the agent invokes — including ones the agent didn't intend to invoke, like a freshly-pip-installed package's pre-install hook — silently exfiltrate to anywhere. Per-binary policy is the cost of catching that.
+
+Agentbox v0.4.16+ pre-allows the **common dev-tool binaries** for the **common services** out of the box:
+
+| Service | Pre-allowed binaries |
+|---|---|
+| Claude API (`api.anthropic.com`, etc.) | `claude` |
+| Codex / OpenAI API | `codex` |
+| OpenCode API | `opencode` |
+| GitHub (`github.com`, `api.github.com`, `raw.githubusercontent.com`, …) | `claude`, `codex`, `opencode`, `git`, `gh`, `curl`, `wget`, `ssh` |
+| PyPI (`pypi.org`, `files.pythonhosted.org`) | `pip`, `pip3`, `uv`, `pipx` |
+| npm (`registry.npmjs.org`, `registry.yarnpkg.com`) | `npm`, `npx`, `yarn`, `pnpm` |
+
+So `gh auth login`, `pip install pandas`, `npm install`, `uv pip install`, `git clone` all work without prompts on a fresh sandbox. Anything outside this set fires a normal approval prompt on first use — click Allow once and it's persisted to `.agentbox.policy.yaml` for that workspace, so the second use is silent.
+
+**If you want broader auto-allow** for everything inside a workspace, edit `.agentbox.policy.yaml` and use `binaries: [ "**" ]` on a service. That trades some isolation for fewer prompts. The L4 watcher will still surface anything denied (e.g. a connection to a host that isn't in any service's endpoints list).
+
+**If you want process-tree attribution** (allow X if it's a descendant of an allowed agent), that's an openshell-supervisor-level change — agentbox can't do it on its own. The fork briefly attempted a stricter version of this and it broke claude's normal `fork()` + `exec()` subprocess pattern (see CHANGELOG v0.4.10 + the upstream bug doc under `~/.../openshell-interactive-enforcement/docs/interactive-enforcement/AMBIGUOUS_SHARED_SOCKET_OWNERSHIP_BREAKS_AGENTS.md`). Pre-populating the default policy is the practical middle path until that upstream issue is resolved.
+
 ## Tuning Allow-prompt latency
 
 When you click Allow on the approval dialog, agentbox runs `openshell policy update --wait` to make the new endpoint persistent. On stock openshell `0.0.42` that step takes ~5–10 seconds (gateway round-trip + supervisor policy reload). Three behaviors are available:

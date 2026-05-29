@@ -2,6 +2,33 @@
 
 All notable changes to agentbox.
 
+## [v0.4.16](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.16) — 2026-05-29
+
+Two fixes from a user session where `gh auth login` failed silently with no Allow prompt.
+
+### Fix: `watcher_ensure` verifies the spawn took (was fire-and-forget)
+
+`watcher_ensure` used to `nohup ... &` the watcher subprocess and immediately return — never verifying the watcher actually started its main loop. If the spawned bash subshell exited early (e.g. `openshell logs --tail` rejecting auth, sandbox stop race, an early `set -e` exit), the parent shell continued thinking everything was fine. Net result: no watcher running, every L4 deny falls on the floor with no prompt, and the user has no visible indication that anything is wrong.
+
+v0.4.16 sleeps 0.5s after spawning, then checks `kill -0` on the spawn pid. If the watcher died:
+1. Log a clear warning with the path to `watcher.log` for debugging
+2. Retry the spawn one more time
+3. If the second attempt also dies, warn loudly (3-line warning explaining what's broken and how to debug), but don't abort — the user might want to proceed without watcher.
+
+The 0.5s delay is conservative: enough for nohup + bash startup + first iteration of `openshell logs --tail` on every macOS we've tested. A genuine deny in the first 500ms is extremely rare in normal use.
+
+### Default policy: pre-allow `gh` + common package-managers (pip, npm, uv, yarn, pnpm)
+
+The default `.agentbox.policy.yaml` template now includes:
+
+- `/usr/bin/gh` in the `github` binaries list (so `gh auth login`, `gh api`, `gh pr` etc. work out of the box without an Allow prompt)
+- A new `pypi` block allowing `pip / pip3 / uv / pipx / sandbox.uv-bin uv` to reach `pypi.org` + `files.pythonhosted.org`
+- A new `npm` block allowing `npm / npx / yarn / pnpm` to reach `registry.npmjs.org` + `registry.yarnpkg.com`
+
+This shifts the "first-use prompt" burden away from the most common developer-CLI workflows — most agent-spawned `gh`, `pip install`, `npm install`, `uv pip` calls now just work. **The policy is still per-binary, per-host**: a malicious binary inside the sandbox can't piggyback on these allowlist entries because openshell enforces by binary path. Add more services / tools by editing the policy or via the Allow flow.
+
+(On why agentbox doesn't auto-allow whatever the agent spawns: openshell enforces by binary path, not by process tree. We could relax that to "if the binary is a descendant of an allowed agent, auto-allow," but that's a supervisor-level change in openshell, not agentbox. See the README's "Why per-binary policy?" section for the longer answer.)
+
 ## [v0.4.15](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.15) — 2026-05-29
 
 `install.sh`: `AGENTBOX_INTERACTIVE_OPENSHELL=0` now continues into the normal agentbox install/update after the revert.
