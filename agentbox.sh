@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Embedded version. Bump when cutting a release; tag the commit as v<version>.
-AGENTBOX_VERSION="0.4.11"
+AGENTBOX_VERSION="0.4.12"
 
 AGB_ROOT="${AGB_ROOT:-$HOME/.local/share/agentbox}"
 AGB_ORIGINALS="$AGB_ROOT/originals.conf"
@@ -890,6 +890,23 @@ apply_agentbox_tmux_settings() {
   # cancels and returns to live input.
   agb_tmux bind-key -T copy-mode    MouseDown1Pane send-keys -X cancel >/dev/null 2>&1 || true
   agb_tmux bind-key -T copy-mode-vi MouseDown1Pane send-keys -X cancel >/dev/null 2>&1 || true
+
+  # Disable tmux click-and-drag selection. The default `MouseDrag1Pane`
+  # binding (root table) runs `copy-mode -M` the instant any motion is
+  # detected while button 1 is pressed. On terminals with sensitive mouse
+  # reporting (notably Ghostty), this fires on essentially every click,
+  # entering copy-mode and continuing the selection as the mouse moves
+  # — the user perceives this as "random highlighting on mouse move."
+  # Removing the binding means scroll-wheel still works (WheelUp/Down)
+  # but click+drag no longer captures selection through tmux. If the
+  # user wants native-terminal selection back, set AGENTBOX_TMUX_DRAG_SELECT=1.
+  if ! is_truthy "${AGENTBOX_TMUX_DRAG_SELECT:-}"; then
+    agb_tmux unbind-key -T root         MouseDrag1Pane    >/dev/null 2>&1 || true
+    agb_tmux unbind-key -T copy-mode    MouseDrag1Pane    >/dev/null 2>&1 || true
+    agb_tmux unbind-key -T copy-mode-vi MouseDrag1Pane    >/dev/null 2>&1 || true
+    agb_tmux unbind-key -T copy-mode    MouseDragEnd1Pane >/dev/null 2>&1 || true
+    agb_tmux unbind-key -T copy-mode-vi MouseDragEnd1Pane >/dev/null 2>&1 || true
+  fi
 }
 
 # Type a retry prompt into the agent's TUI. Preferred delivery path is

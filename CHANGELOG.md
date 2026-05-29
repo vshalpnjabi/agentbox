@@ -2,6 +2,30 @@
 
 All notable changes to agentbox.
 
+## [v0.4.12](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.12) — 2026-05-29
+
+Fix: random text-highlighting on mouse-move inside the agent's tmux pane (especially on Ghostty).
+
+Symptom: as soon as you move the mouse over the agent's terminal, text starts getting highlighted/selected — even without an explicit click+drag. Worse with sensitive mouse-event reporting like Ghostty.
+
+Root cause: tmux's default `MouseDrag1Pane` binding (root table) is:
+```
+if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -M }
+```
+i.e. the moment any motion is detected with button 1 pressed, tmux runs `copy-mode -M`, which enters copy-mode AND keeps the selection following the mouse cursor as long as motion continues. On terminals that report mouse events on essentially every micro-movement during a click (Ghostty is the loudest), this fires immediately and the selection extends as the user moves.
+
+Fix: agentbox now unbinds `MouseDrag1Pane` (root + copy-mode + copy-mode-vi tables) and `MouseDragEnd1Pane` (copy-mode tables). Scroll wheel still works (it uses `WheelUpPane` / `WheelDownPane` bindings, not Drag). Click-to-cancel-copy-mode (added back in v0.3.x) is untouched. You can opt back into tmux's native click+drag selection by setting `AGENTBOX_TMUX_DRAG_SELECT=1`.
+
+Recovery for already-running tmux sessions before v0.4.12: pull v0.4.12, then in your workspace `agentbox attach` (re-runs `apply_agentbox_tmux_settings` which now also clears the drag bindings). Or one-shot:
+
+```bash
+tmux -L agentbox unbind-key -T root         MouseDrag1Pane
+tmux -L agentbox unbind-key -T copy-mode    MouseDrag1Pane
+tmux -L agentbox unbind-key -T copy-mode-vi MouseDrag1Pane
+tmux -L agentbox unbind-key -T copy-mode    MouseDragEnd1Pane
+tmux -L agentbox unbind-key -T copy-mode-vi MouseDragEnd1Pane
+```
+
 ## [v0.4.11](https://github.com/vshalpnjabi/agentbox/releases/tag/v0.4.11) — 2026-05-29
 
 Three fixes uncovered while re-testing the L4 watcher path on stock 0.0.42.
